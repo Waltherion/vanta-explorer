@@ -785,7 +785,10 @@ fn special_rows() -> Vec<Row> {
                 Some(PathBuf::from(val.replace("$HOME", &home.to_string_lossy())))
             })
             .unwrap_or_else(|| home.join(fallback_name));
-        if !path.is_dir() {
+        // xdg-user-dirs points a folder that does not exist at $HOME itself (Omarchy, for one,
+        // has no Desktop, Public or Templates), and two keys may share a folder: neither is a
+        // row of its own, or Home shows up several times.
+        if !path.is_dir() || out.iter().any(|r| r.path == path) {
             continue;
         }
         out.push(Row {
