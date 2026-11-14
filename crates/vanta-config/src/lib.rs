@@ -541,6 +541,12 @@ pub mod icon_theme {
         (out.status.success() && !v.is_empty()).then_some(v)
     }
 
+    /// The common themes that are installed, best first: somewhere to look for an icon the
+    /// desktop's own theme does not have.
+    pub fn fallbacks() -> Vec<String> {
+        COMMON.iter().filter(|t| installed(t)).map(|t| t.to_string()).collect()
+    }
+
     /// Whether a theme of that name is installed anywhere icon themes are looked for.
     pub fn installed(name: &str) -> bool {
         let mut roots = vec![crate::paths::home().join(".icons"), data_home().join("icons")];

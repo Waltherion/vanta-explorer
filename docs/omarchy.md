@@ -37,6 +37,9 @@ omarchy-theme-refresh
   restart.
 - `omarchy-theme-refresh` writes the file once now, for the theme already in use.
 
+The icons are Omarchy's own (Yaru, in the colour each theme picks), and follow the theme by
+themselves; there is nothing to set up for them.
+
 The font is `monospace`, the one Omarchy's font menu sets. Explorer picks up a new font at the
 next theme switch. To have it change at once, add a hook that nudges Explorer when the font
 changes:

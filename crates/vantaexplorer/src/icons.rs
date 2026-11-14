@@ -1,5 +1,5 @@
-//! Icon pipeline: freedesktop lookup -> resvg rasterization at PHYSICAL pixel size -> egui
-//! texture cache.
+//! Icon pipeline: freedesktop lookup -> resvg rasterization at PHYSICAL pixel size (or, for a
+//! theme drawn in PNG, the bitmap scaled to it) -> egui texture cache.
 //!
 //! Two load-bearing rules:
 //! - Always rasterize at `logical_size * pixels_per_point` (fractional scales such as 1.25
@@ -11,15 +11,23 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Used until the settings have been read, and if they name no theme at all.
-/// Used when the settings name no icon theme: the desktop's own, then hicolor.
+/// Used when the settings name no icon theme: the desktop's own, then the common themes that
+/// are installed, then hicolor. The common ones are there for an icon the desktop's theme does
+/// not have, so a theme with gaps never leaves a file without an icon.
 fn fallback_themes() -> Vec<String> {
     let mut out = vec![vanta_config::icon_theme::desktop()];
-    if out[0] != "hicolor" {
-        out.push("hicolor".into());
+    for t in vanta_config::icon_theme::fallbacks().into_iter().chain(["hicolor".to_string()]) {
+        if !out.contains(&t) {
+            out.push(t);
+        }
     }
     out
 }
+
+/// How often the desktop's icon theme is asked for again, when the settings leave it to the
+/// desktop. A desktop may change it a moment after the colours (Omarchy does, once the new
+/// theme is in place), so the config reload alone would catch the old one.
+const DESKTOP_THEME_CHECK: Duration = Duration::from_secs(2);
 
 pub struct IconCache {
     /// Keyed by (icon name, pixel size, canonical-lookup). The flag belongs in the key:
@@ -33,11 +41,15 @@ pub struct IconCache {
     /// Newest mtime seen across the watched icon files.
     theme_stamp: Option<SystemTime>,
     last_check: Instant,
+    /// The settings name no theme, so `themes` follows the desktop's and is asked for again.
+    follows_desktop: bool,
+    last_desktop_check: Instant,
 }
 
 impl IconCache {
     pub fn new(themes: Vec<String>) -> Self {
-        let themes = if themes.is_empty() { fallback_themes() } else { themes };
+        let follows_desktop = themes.is_empty();
+        let themes = if follows_desktop { fallback_themes() } else { themes };
         Self {
             textures: HashMap::new(),
             mime_db: xdg_mime::SharedMimeInfo::new(),
@@ -45,13 +57,17 @@ impl IconCache {
             theme_stamp: icon_theme_stamp(&themes),
             themes,
             last_check: Instant::now(),
+            follows_desktop,
+            last_desktop_check: Instant::now(),
         }
     }
 
     /// The settings named other themes: look in those from now on, and forget what was drawn
     /// from the old ones.
     pub fn set_themes(&mut self, themes: Vec<String>) {
-        let themes = if themes.is_empty() { fallback_themes() } else { themes };
+        self.follows_desktop = themes.is_empty();
+        self.last_desktop_check = Instant::now();
+        let themes = if self.follows_desktop { fallback_themes() } else { themes };
         if themes != self.themes {
             self.themes = themes;
             self.theme_stamp = icon_theme_stamp(&self.themes);
@@ -78,6 +94,17 @@ impl IconCache {
             return false;
         }
         self.last_check = Instant::now();
+        if self.follows_desktop && self.last_desktop_check.elapsed() >= DESKTOP_THEME_CHECK {
+            self.last_desktop_check = Instant::now();
+            let themes = fallback_themes();
+            if themes != self.themes {
+                log::info!("desktop icon theme is now {}; icon cache dropped", themes[0]);
+                self.themes = themes;
+                self.theme_stamp = icon_theme_stamp(&self.themes);
+                self.textures.clear();
+                return true;
+            }
+        }
         let now = icon_theme_stamp(&self.themes);
         if now == self.theme_stamp {
             return false;
@@ -212,6 +239,9 @@ fn icon_theme_stamp(themes: &[String]) -> Option<SystemTime> {
 
 fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], canonical: bool) -> Option<egui::ColorImage> {
     let path = lookup(themes, name, px, canonical)?;
+    if is_png(&path) {
+        return bitmap(themes, name, &path, px);
+    }
     let svg = std::fs::read_to_string(&path).ok()?;
     // usvg does not resolve CSS currentColor, and breeze icons rely on it, so the theme's text
     // colour is substituted in before the SVG is parsed.
@@ -263,10 +293,96 @@ fn lookup(themes: &[String], name: &str, px: u32, canonical: bool) -> Option<Pat
             .with_size(want)
             .find();
         if let Some(p) = found {
-            if p.extension().is_some_and(|e| e == "svg") {
+            if p.extension().is_some_and(|e| e == "svg") || is_png(&p) {
                 return Some(p);
             }
         }
     }
     None
+}
+
+fn is_png(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+}
+
+/// A theme drawn in PNG rather than SVG (Yaru, the one Omarchy uses): the pixels as they are,
+/// scaled to `px`. A bitmap cannot take the theme's text colour the way an SVG does; a theme
+/// like that comes in the colours it was made in, and a desktop that wants other colours picks
+/// another variant of it, which `poll_theme` notices.
+///
+/// Such themes ship a few fixed sizes (Yaru: 16, 24, 32, 48 and 256), and the lookup may land
+/// on one smaller than wanted. Scaling a 48 up to a 128-pixel grid tile is what makes icons
+/// soft, so a larger one is looked for first and scaled down instead.
+fn bitmap(themes: &[String], name: &str, path: &Path, px: u32) -> Option<egui::ColorImage> {
+    let mut img = image::open(path).ok()?.to_rgba8();
+    if img.width().max(img.height()) < px {
+        let larger = lookup(themes, name, 256, false)
+            .filter(|p| is_png(p))
+            .and_then(|p| image::open(p).ok())
+            .map(|i| i.to_rgba8())
+            .filter(|i| i.width().max(i.height()) > img.width().max(img.height()));
+        if let Some(l) = larger {
+            img = l;
+        }
+    }
+    Some(fit(img, px))
+}
+
+/// Scaled so the longer side is `px`, kept in proportion and centred on a square of `px`.
+fn fit(img: image::RgbaImage, px: u32) -> egui::ColorImage {
+    let (w, h) = img.dimensions();
+    let s = px as f32 / w.max(h).max(1) as f32;
+    let (nw, nh) = (((w as f32 * s).round() as u32).clamp(1, px), ((h as f32 * s).round() as u32).clamp(1, px));
+    let img = if (nw, nh) == (w, h) { img } else { image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3) };
+    let mut square = image::RgbaImage::new(px, px);
+    image::imageops::overlay(&mut square, &img, ((px - nw) / 2) as i64, ((px - nh) / 2) as i64);
+    egui::ColorImage::from_rgba_unmultiplied([px as usize, px as usize], square.as_raw())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(path: &Path, size: u32, rgba: [u8; 4]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        image::RgbaImage::from_pixel(size, size, image::Rgba(rgba)).save(path).unwrap();
+    }
+
+    /// A theme drawn only in PNG, at a small and a large fixed size, the way Yaru is. The icon
+    /// is found at all (it used to be skipped for not being an SVG), comes out at the size asked
+    /// for, and a large tile is cut from the large artwork rather than blown up from the small.
+    #[test]
+    fn a_png_theme_gives_icons_and_the_larger_artwork_for_a_large_tile() {
+        let data = std::env::temp_dir().join(format!("vantaexplorer-pngtheme-{}", std::process::id()));
+        let theme = data.join("icons/PngOnly");
+        std::fs::create_dir_all(&theme).unwrap();
+        std::fs::write(
+            theme.join("index.theme"),
+            "[Icon Theme]\nName=PngOnly\nDirectories=48x48/places,256x256/places\n\n\
+             [48x48/places]\nSize=48\nType=Fixed\n\n[256x256/places]\nSize=256\nType=Fixed\n",
+        )
+        .unwrap();
+        png(&theme.join("48x48/places/folder.png"), 48, [255, 0, 0, 255]);
+        png(&theme.join("256x256/places/folder.png"), 256, [0, 0, 255, 255]);
+        // Read once, by the first lookup in this process; nothing else in these tests looks icons up.
+        std::env::set_var("XDG_DATA_HOME", &data);
+
+        let themes = vec!["PngOnly".to_string()];
+        let small = rasterize(&themes, "folder", 24, [255, 255, 255], false).expect("a PNG icon is used");
+        assert_eq!(small.size, [24, 24]);
+        let large = rasterize(&themes, "folder", 128, [255, 255, 255], false).expect("a PNG icon is used");
+        assert_eq!(large.size, [128, 128]);
+        let mid = large.pixels[64 * 128 + 64];
+        assert_eq!((mid.r(), mid.b()), (0, 255), "the 256 artwork scaled down, not the 48 scaled up");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_bitmap_that_is_not_square_is_centred_on_a_square() {
+        let img = image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 255, 0, 255]));
+        let out = fit(img, 32);
+        assert_eq!(out.size, [32, 32]);
+        assert_eq!(out.pixels[0].a(), 0, "above the picture stays clear");
+        assert_eq!(out.pixels[16 * 32 + 16].g(), 255, "the picture sits in the middle");
+    }
 }
