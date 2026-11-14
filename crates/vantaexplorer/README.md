@@ -97,8 +97,11 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
   removable USB media only**: it requires the device to sit under a USB controller, be
   hot-pluggable, and be absent from `/etc/fstab`, so an internal drive never gets one.
 - **Remote** for FUSE and cloud mounts, **Special Folders** from XDG, **Recent Files**
-  opened through Vanta Explorer as a virtual folder, and your own **Places** sections with rename
-  and reorder.
+  opened through Vanta Explorer as a virtual folder, and your own **Places** sections.
+- **Right-click to arrange it**: move a section or an entry up or down, rename or remove a
+  section of your own, and remove any entry, special folders included. Right-click a folder in
+  the file view and choose **Add to sidebar** to put it in Special Folders or one of your own
+  sections, which is also how a removed special folder comes back.
 
 ### As a file chooser
 

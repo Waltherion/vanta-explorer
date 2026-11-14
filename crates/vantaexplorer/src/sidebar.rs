@@ -23,7 +23,7 @@ pub const DEFAULT_SIDEBAR: &str = r##"// Vanta Explorer, sidebar contents.
 //
 // Built-in sections are referenced by "id" and can be reordered, collapsed or hidden, but
 // not deleted. Add your own by giving a section a "name" and a list of "paths".
-// The +, rename and arrow controls in the UI edit this file for you.
+// "New section", and right-clicking a heading, an entry or a folder, edit this file for you.
 {
   "sections": [
     { "id": "mounted" },
@@ -52,6 +52,11 @@ pub struct Section {
     pub collapsed: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// Special folders taken out of the list. Those come from xdg-user-dirs, which would put
+    /// them back on the next read, so they are remembered here until "Add to sidebar" brings
+    /// one back.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
 }
 
 impl Section {
@@ -115,8 +120,9 @@ impl SidebarConfig {
         }
         let Ok(body) = serde_json::to_string_pretty(self) else { return };
         let text = format!(
-            "// vantaexplorer, sidebar contents. Rewritten by the app when you use the +, rename or\n\
-             // arrow controls. A real file, NOT a theme symlink: it survives theme switches.\n{body}\n"
+            "// Vanta Explorer, sidebar contents. Rewritten by the app when you add, move, rename or\n\
+             // remove something in the sidebar. A real file, NOT a theme symlink: it survives theme\n\
+             // switches.\n{body}\n"
         );
         let _ = std::fs::write(path, text);
     }
@@ -191,6 +197,50 @@ impl Sidebar {
         self.pending_eject.take()
     }
 
+    /// The sections a folder can be added to from the file view's menu: Special Folders and the
+    /// user's own, with what each holds now so the menu can grey out where it already is.
+    pub fn targets(&self) -> Vec<Target> {
+        self.config
+            .sections
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.hidden && (s.id.as_deref() == Some("special") || !s.is_builtin()))
+            .map(|(index, s)| Target {
+                index,
+                title: s.title(),
+                paths: if s.is_builtin() {
+                    self.special_list(s).into_iter().map(|r| r.path).collect()
+                } else {
+                    s.paths.iter().map(|p| expand(p)).collect()
+                },
+            })
+            .collect()
+    }
+
+    /// Puts `path` in section `index`, at the end, or back where it was if it is a special
+    /// folder that was removed.
+    pub fn add(&mut self, index: usize, path: &Path) {
+        let Some(sec) = self.config.sections.get_mut(index) else { return };
+        let p = contract(path);
+        let was_removed = sec.removed.len();
+        sec.removed.retain(|r| expand(r) != path);
+        let changed = sec.removed.len() != was_removed || !sec.paths.iter().any(|q| expand(q) == path);
+        if !sec.paths.iter().any(|q| expand(q) == path) {
+            sec.paths.push(p);
+        }
+        if changed {
+            self.commit();
+        }
+    }
+
+    fn commit(&mut self) {
+        if self.persist {
+            self.config.save();
+            // Adopt our own write so poll() does not treat it as an external edit.
+            self.file_mtime = file_mtime();
+        }
+    }
+
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -221,9 +271,9 @@ impl Sidebar {
         let mut remove: Option<usize> = None;
         let mut add_section = false;
         let mut add_path: Option<usize> = None;
-        let mut path_up: Option<(usize, usize)> = None;
-        let mut path_down: Option<(usize, usize)> = None;
-        let mut path_remove: Option<(usize, usize)> = None;
+        // (section, the entries as shown, which one, -1 up / +1 down)
+        let mut path_move: Option<(usize, Vec<PathBuf>, usize, isize)> = None;
+        let mut path_remove: Option<(usize, PathBuf)> = None;
         let mut commit_rename = false;
         let mut cancel_rename = false;
 
@@ -309,30 +359,30 @@ impl Sidebar {
                             if !section.is_builtin() && resp.double_clicked() {
                                 self.renaming = Some((i, section.title()));
                             }
-                        }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if !section.is_builtin()
-                                    && glyph::button(ui, Glyph::Cross, true, "Remove section", theme.text.gamma_multiply(0.75), theme.accent)
-                                {
-                                    remove = Some(i);
-                                }
-                                if glyph::button(
-                                    ui,
-                                    Glyph::Down,
-                                    pos + 1 < visible.len(),
-                                    "Move down",
-                                    theme.text.gamma_multiply(0.75),
-                                    theme.accent,
-                                ) {
-                                    move_down = Some(i);
-                                }
-                                if glyph::button(ui, Glyph::Up, pos > 0, "Move up", theme.text.gamma_multiply(0.75), theme.accent) {
+                            // Moving, renaming and removing a section live in its right-click
+                            // menu rather than as buttons on every heading.
+                            resp.context_menu(|ui| {
+                                if ui.add_enabled(pos > 0, egui::Button::new("Move up")).clicked() {
                                     move_up = Some(i);
+                                    ui.close();
                                 }
-                            },
-                        );
+                                if ui.add_enabled(pos + 1 < visible.len(), egui::Button::new("Move down")).clicked() {
+                                    move_down = Some(i);
+                                    ui.close();
+                                }
+                                if !section.is_builtin() {
+                                    ui.separator();
+                                    if ui.button("Rename").clicked() {
+                                        self.renaming = Some((i, section.title()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Remove section").clicked() {
+                                        remove = Some(i);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
                     });
 
                     if section.collapsed || section.id.as_deref() == Some("recent") {
@@ -342,21 +392,37 @@ impl Sidebar {
                     let rows = self.rows_for(&section, drives);
                     let n = rows.len();
                     let custom = !section.is_builtin();
+                    let editable = custom || section.id.as_deref() == Some("special");
                     for (ri, row) in rows.iter().enumerate() {
-                        let is_special = section.id.as_deref() == Some("special");
-                        let controls = if custom || is_special {
-                            Some((ri > 0, ri + 1 < n, custom)) // can_remove only if custom
-                        } else {
-                            None
-                        };
-                        match draw_row(ui, row, icons, theme, ppp, controls) {
+                        let (action, resp) = draw_row(ui, row, icons, theme, ppp);
+                        match action {
                             RowAction::Open => clicked = Some(row.path.clone()),
                             RowAction::Eject => self.pending_eject = row.eject.clone(),
-                            RowAction::MoveUp => path_up = Some((i, ri)),
-                            RowAction::MoveDown => path_down = Some((i, ri)),
-                            RowAction::Remove => path_remove = Some((i, ri)),
                             RowAction::None => {}
                         }
+                        if !editable {
+                            continue;
+                        }
+                        let shown = || rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
+                        resp.context_menu(|ui| {
+                            if ui.add_enabled(ri > 0, egui::Button::new("Move up")).clicked() {
+                                path_move = Some((i, shown(), ri, -1));
+                                ui.close();
+                            }
+                            if ui.add_enabled(ri + 1 < n, egui::Button::new("Move down")).clicked() {
+                                path_move = Some((i, shown(), ri, 1));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button("Remove")
+                                .on_hover_text("Right-click a folder and choose \"Add to sidebar\" to bring it back")
+                                .clicked()
+                            {
+                                path_remove = Some((i, row.path.clone()));
+                                ui.close();
+                            }
+                        });
                     }
                     if custom {
                         ui.horizontal(|ui| {
@@ -438,22 +504,15 @@ impl Sidebar {
                 }
             }
         }
-        if let Some((i, ri)) = path_up {
-            if ri > 0 {
-                self.config.sections[i].paths.swap(ri, ri - 1);
-                dirty = true;
+        if let Some((i, shown, ri, delta)) = path_move {
+            if let Some(sec) = self.config.sections.get_mut(i) {
+                dirty |= move_entry(sec, shown, ri, delta);
             }
         }
-        if let Some((i, ri)) = path_down {
-            if ri + 1 < self.config.sections[i].paths.len() {
-                self.config.sections[i].paths.swap(ri, ri + 1);
-                dirty = true;
-            }
-        }
-        if let Some((i, ri)) = path_remove {
-            if ri < self.config.sections[i].paths.len() {
-                self.config.sections[i].paths.remove(ri);
-                dirty = true;
+        if let Some((i, path)) = path_remove {
+            let defaults = self.rows_cache.as_ref().map(|c| c.2.clone()).unwrap_or_default();
+            if let Some(sec) = self.config.sections.get_mut(i) {
+                dirty |= remove_entry(sec, &path, defaults.iter().any(|r| r.path == path));
             }
         }
         if add_section {
@@ -464,10 +523,8 @@ impl Sidebar {
             });
             dirty = true;
         }
-        if dirty && self.persist {
-            self.config.save();
-            // Adopt our own write so poll() does not treat it as an external edit.
-            self.file_mtime = file_mtime();
+        if dirty {
+            self.commit();
         }
         clicked
     }
@@ -495,46 +552,35 @@ impl Sidebar {
                 })
                 .collect(),
             Some("remote") => self.rows_cache.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
-            Some("special") => {
-                let default_rows = self.rows_cache.as_ref().map(|c| c.2.clone()).unwrap_or_default();
-                if section.paths.is_empty() {
-                    default_rows
-                } else {
-                    let mut out = Vec::new();
-                    for p in &section.paths {
-                        let path = expand(p);
-                        if let Some(idx) = default_rows.iter().position(|r| r.path == path) {
-                            out.push(default_rows[idx].clone());
-                        }
-                    }
-                    for row in default_rows {
-                        if !out.iter().any(|r| r.path == row.path) {
-                            out.push(row);
-                        }
-                    }
-                    out
-                }
-            }
+            Some("special") => self.special_list(section),
             Some("recent") => self.recent_rows(),
-            _ => section
-                .paths
-                .iter()
-                .map(|p| {
-                    let path = expand(p);
-                    Row {
-                        label: path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-                        icons: vec!["inode-directory".into()],
-                        path,
-                        usage: None,
-                        indent: INDENT,
-                    eject: None,
-                    }
-                })
-                .collect(),
+            _ => section.paths.iter().map(|p| folder_row(expand(p), INDENT)).collect(),
         }
+    }
+
+    /// Special Folders as shown: in the order the file keeps, the folders xdg-user-dirs names
+    /// that the file does not mention yet at the end, folders the user added among them, and
+    /// none that were removed.
+    fn special_list(&self, section: &Section) -> Vec<Row> {
+        let defaults = self.rows_cache.as_ref().map(|c| c.2.clone()).unwrap_or_default();
+        let removed: Vec<PathBuf> = section.removed.iter().map(|p| expand(p)).collect();
+        let mut out: Vec<Row> = Vec::new();
+        for p in &section.paths {
+            let path = expand(p);
+            if removed.contains(&path) || out.iter().any(|r| r.path == path) {
+                continue;
+            }
+            match defaults.iter().find(|r| r.path == path) {
+                Some(row) => out.push(row.clone()),
+                None => out.push(folder_row(path, INDENT * 2.0)),
+            }
+        }
+        for row in defaults {
+            if !removed.contains(&row.path) && !out.iter().any(|r| r.path == row.path) {
+                out.push(row);
+            }
+        }
+        out
     }
 
     fn recent_rows(&self) -> Vec<Row> {
@@ -543,15 +589,68 @@ impl Sidebar {
 
 }
 
-/// What the user did on an entry row.
+/// A section the file view's "Add to sidebar" menu offers, as `Sidebar::targets` lists them.
+pub struct Target {
+    pub index: usize,
+    pub title: String,
+    /// What the section shows now, to grey out the sections a folder is already in.
+    pub paths: Vec<PathBuf>,
+}
+
+/// A folder the user put in a section: its name, and the plain folder icon.
+fn folder_row(path: PathBuf, indent: f32) -> Row {
+    Row {
+        label: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        icons: vec!["inode-directory".into()],
+        path,
+        usage: None,
+        indent,
+        eject: None,
+    }
+}
+
+/// Moves entry `ri` of `shown` (the section's entries as drawn) one place up or down, and
+/// keeps that order. Removed special folders stay remembered after the shown ones, so one
+/// that is added back can find its place again.
+fn move_entry(sec: &mut Section, mut shown: Vec<PathBuf>, ri: usize, delta: isize) -> bool {
+    let Some(to) = ri.checked_add_signed(delta).filter(|&t| t < shown.len()) else { return false };
+    shown.swap(ri, to);
+    let mut paths: Vec<String> = shown.iter().map(|p| contract(p)).collect();
+    for p in &sec.paths {
+        if sec.removed.iter().any(|r| expand(r) == expand(p)) && !paths.iter().any(|q| expand(q) == expand(p)) {
+            paths.push(p.clone());
+        }
+    }
+    sec.paths = paths;
+    true
+}
+
+/// Takes `path` out of the section. A special folder from xdg-user-dirs (`from_desktop`) would
+/// come straight back, so it is remembered as removed instead; anything the user added is
+/// simply dropped.
+fn remove_entry(sec: &mut Section, path: &Path, from_desktop: bool) -> bool {
+    if sec.id.as_deref() == Some("special") && from_desktop {
+        if sec.removed.iter().any(|r| expand(r) == path) {
+            return false;
+        }
+        sec.removed.push(contract(path));
+        return true;
+    }
+    let before = sec.paths.len();
+    sec.paths.retain(|p| expand(p) != path);
+    sec.paths.len() != before
+}
+
+/// What the user did on an entry row with the left button; the right button's menu is the
+/// caller's, on the response this hands back.
 #[derive(PartialEq)]
 enum RowAction {
     None,
     Open,
     Eject,
-    MoveUp,
-    MoveDown,
-    Remove,
 }
 
 fn draw_row(
@@ -560,16 +659,16 @@ fn draw_row(
     icons: &mut IconCache,
     theme: &crate::browser::Theme,
     ppp: f32,
-    // Some((can_up, can_down, can_remove)) draws reorder/remove controls inline on the row.
-    controls: Option<(bool, bool, bool)>,
-) -> RowAction {
+) -> (RowAction, egui::Response) {
     // Headings inside a section (Today/Yesterday) render as plain labels.
     if row.icons.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(row.indent);
-            ui.label(egui::RichText::new(&row.label).weak().size(11.0));
-        });
-        return RowAction::None;
+        let resp = ui
+            .horizontal(|ui| {
+                ui.add_space(row.indent);
+                ui.label(egui::RichText::new(&row.label).weak().size(11.0));
+            })
+            .response;
+        return (RowAction::None, resp);
     }
 
     let usage_h = if row.usage.is_some() { 16.0 } else { 0.0 };
@@ -623,45 +722,6 @@ fn draw_row(
         text_right -= 18.0;
     }
 
-    if let Some((can_up, can_down, can_remove)) = controls {
-        let mut x = rect.max.x - 16.0;
-        let mut btns = Vec::new();
-        if can_remove {
-            btns.push((Glyph::Cross, true, "Remove"));
-        }
-        btns.push((Glyph::Down, can_down, "Move down"));
-        btns.push((Glyph::Up, can_up, "Move up"));
-
-        for (glyph, enabled, tip) in btns {
-            let btn = egui::Rect::from_min_size(
-                egui::pos2(x - 16.0, rect.min.y + 3.0),
-                egui::vec2(16.0, 16.0),
-            );
-            let r = ui.interact(btn, ui.id().with((&row.label, tip)), egui::Sense::click());
-            let col = if !enabled {
-                theme.text.gamma_multiply(0.3)
-            } else if r.hovered() {
-                theme.accent
-            } else {
-                theme.text.gamma_multiply(0.7)
-            };
-            if enabled && r.hovered() {
-                ui.painter().rect_filled(btn, 2.0, egui::Color32::from_white_alpha(20));
-            }
-            glyph::paint(ui.painter(), btn, glyph, col);
-            let _ = r.clone().on_hover_text(tip);
-            if enabled && r.clicked() {
-                action = match glyph {
-                    Glyph::Cross => RowAction::Remove,
-                    Glyph::Down => RowAction::MoveDown,
-                    _ => RowAction::MoveUp,
-                };
-            }
-            x -= 18.0;
-        }
-        text_right = x;
-    }
-
     // (1) Elide instead of painting past the sidebar edge.
     let text_left = icon_rect.max.x + 6.0;
     let label = crate::text::elide_end(ui, &row.label, (text_right - text_left).max(16.0));
@@ -704,12 +764,12 @@ fn draw_row(
     }
 
     if action != RowAction::None {
-        return action;
+        return (action, resp);
     }
     if resp.clicked() && !row.path.as_os_str().is_empty() {
-        RowAction::Open
+        (RowAction::Open, resp)
     } else {
-        RowAction::None
+        (RowAction::None, resp)
     }
 }
 
@@ -838,4 +898,67 @@ fn expand(s: &str) -> PathBuf {
         return crate::panes::home_dir().join(rest);
     }
     PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn special(paths: &[&str]) -> Section {
+        Section { id: Some("special".into()), paths: paths.iter().map(|p| p.to_string()).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_removed_special_folder_is_remembered_and_keeps_its_place_through_a_move() {
+        let mut sec = special(&["/h", "/h/Documents", "/h/Music", "/h/Videos"]);
+        assert!(remove_entry(&mut sec, Path::new("/h/Music"), true));
+        assert_eq!(sec.removed, ["/h/Music"], "xdg-user-dirs would bring it back, so it is remembered");
+        assert!(!remove_entry(&mut sec, Path::new("/h/Music"), true), "removing it twice changes nothing");
+
+        // As drawn now: Music is gone. Moving Videos up past Documents keeps Music on file.
+        let shown = ["/h", "/h/Documents", "/h/Videos"].map(PathBuf::from).to_vec();
+        assert!(move_entry(&mut sec, shown, 2, -1));
+        assert_eq!(sec.paths, ["/h", "/h/Videos", "/h/Documents", "/h/Music"]);
+        assert!(sec.removed.contains(&"/h/Music".to_string()));
+    }
+
+    #[test]
+    fn a_folder_the_user_added_is_dropped_when_removed() {
+        let mut sec = special(&["/h", "/srv/projects"]);
+        assert!(remove_entry(&mut sec, Path::new("/srv/projects"), false));
+        assert_eq!(sec.paths, ["/h"]);
+        assert!(sec.removed.is_empty());
+
+        let mut own = Section { name: Some("Work".into()), paths: vec!["/a".into(), "/b".into()], ..Default::default() };
+        assert!(remove_entry(&mut own, Path::new("/a"), false));
+        assert_eq!(own.paths, ["/b"]);
+    }
+
+    #[test]
+    fn moving_past_either_end_does_nothing() {
+        let mut sec = special(&["/a", "/b"]);
+        let shown = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        assert!(!move_entry(&mut sec, shown.clone(), 0, -1));
+        assert!(!move_entry(&mut sec, shown, 1, 1));
+        assert_eq!(sec.paths, ["/a", "/b"]);
+    }
+
+    #[test]
+    fn adding_a_removed_special_folder_back_puts_it_where_it_was() {
+        let mut sb = Sidebar {
+            config: SidebarConfig { sections: vec![special(&["/h", "/h/Music", "/h/Videos"])] },
+            pending_eject: None,
+            renaming: None,
+            rows_cache: None,
+            file_mtime: None,
+            last_check: Instant::now(),
+            persist: false,
+        };
+        sb.config.sections[0].removed.push("/h/Music".into());
+        sb.add(0, Path::new("/h/Music"));
+        assert!(sb.config.sections[0].removed.is_empty());
+        assert_eq!(sb.config.sections[0].paths, ["/h", "/h/Music", "/h/Videos"], "back in its old place, not at the end");
+        sb.add(0, Path::new("/srv/new"));
+        assert_eq!(sb.config.sections[0].paths.last().map(String::as_str), Some("/srv/new"));
+    }
 }

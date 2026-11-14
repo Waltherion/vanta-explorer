@@ -42,6 +42,8 @@ pub enum Action {
     /// These files were opened (double-click, Enter, the menu's Open): handed to the program
     /// that opens their kind, or, in the chooser, taken as the choice.
     Activate(Vec<PathBuf>),
+    /// Put this folder in sidebar section `index` (see `sidebar::Sidebar::targets`).
+    AddToSidebar { index: usize, path: PathBuf },
 }
 #[derive(Clone, Default)]
 pub struct DragPayload { 
@@ -78,6 +80,8 @@ pub struct View<'a> {
     /// Set when the window is choosing a file for another program (see `chooser.rs`): one pane,
     /// no tabs, nothing that moves or deletes, and only the entries the filter lets through.
     pub chooser: Option<&'a crate::chooser::State>,
+    /// The sidebar sections a folder can be added to, for "Add to sidebar".
+    pub sidebar_targets: &'a [crate::sidebar::Target],
 }
 
 /// Whether an entry is listed: not hidden (unless asked for), matching what is typed, and let
@@ -1194,6 +1198,9 @@ fn entry_context_menu(
         }
     }
 
+    if entry_is_dir && single {
+        add_to_sidebar_menu(ui, &paths[0], view);
+    }
     if ui
         .button("Copy path")
         .on_hover_text("Absolute path as text (Ctrl+Shift+P)")
@@ -1259,6 +1266,27 @@ fn trash_context_menu(ui: &mut egui::Ui, paths: Vec<PathBuf>, view: &View) {
     }
 }
 
+/// "Add to sidebar", a submenu of Special Folders and the user's own sections. A section the
+/// folder is already in is greyed out. This is also how a special folder that was removed from
+/// the sidebar comes back.
+fn add_to_sidebar_menu(ui: &mut egui::Ui, folder: &std::path::Path, view: &View) {
+    if view.sidebar_targets.is_empty() {
+        return;
+    }
+    ui.menu_button("Add to sidebar", |ui| {
+        for t in view.sidebar_targets {
+            let there = t.paths.iter().any(|p| p == folder);
+            let resp = ui.add_enabled(!there, egui::Button::new(&t.title));
+            if there {
+                resp.on_disabled_hover_text("Already there");
+            } else if resp.clicked() {
+                view.actions.borrow_mut().push(Action::AddToSidebar { index: t.index, path: folder.to_path_buf() });
+                ui.close();
+            }
+        }
+    });
+}
+
 /// Background (empty area) context menu: acts on the folder itself.
 fn folder_context_menu(ui: &mut egui::Ui, tab: &mut crate::panes::Tab, view: &View) {
     let here = tab.path().to_path_buf();
@@ -1298,6 +1326,7 @@ fn folder_context_menu(ui: &mut egui::Ui, tab: &mut crate::panes::Tab, view: &Vi
         ui.close();
     }
     ui.separator();
+    add_to_sidebar_menu(ui, &here, view);
     if ui
         .button("Copy path")
         .on_hover_text("Copy this folder's path to the clipboard")

@@ -1136,6 +1136,7 @@ fn draw(
                 });
                 app_ops.redo.clear();
             }
+            browser::Action::AddToSidebar { index, path } => sidebar.add(index, &path),
             browser::Action::OpenTerminal(dir) => {
                 let dir_s = dir.to_string_lossy().into_owned();
                 let Some((terminal, args)) = settings.terminal_command() else {
@@ -1441,6 +1442,7 @@ fn app_ui(
         ),
     );
 
+    let sidebar_targets = sidebar.targets();
     let view = browser::View {
         theme,
         settings,
@@ -1454,6 +1456,7 @@ fn app_ui(
         modal_open,
         paste_key,
         chooser: chooser.as_ref(),
+        sidebar_targets: &sidebar_targets,
     };
 
     // --- preview panel (right, window-level) ---

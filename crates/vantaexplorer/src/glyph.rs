@@ -10,7 +10,6 @@ pub enum Glyph {
     ChevronRight,
     ChevronLeft,
     Up,
-    Down,
     Cross,
     Plus,
     Reload,
@@ -29,7 +28,7 @@ pub fn paint(p: &egui::Painter, rect: egui::Rect, glyph: Glyph, col: egui::Color
     let tri = |pts: Vec<egui::Pos2>| egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE);
 
     match glyph {
-        Glyph::ChevronDown | Glyph::Down => {
+        Glyph::ChevronDown => {
             p.add(tri(vec![
                 egui::pos2(c.x - r, c.y - r * 0.6),
                 egui::pos2(c.x + r, c.y - r * 0.6),
