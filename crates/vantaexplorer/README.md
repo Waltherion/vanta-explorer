@@ -12,14 +12,14 @@
 
 ## Why
 
-Every file manager I tried shows HDR images and video as washed-out grey. They decode the
+Every file manager I tried shows HDR images and video as washed-out gray. They decode the
 pixels and hand them to a toolkit that assumes 8-bit sRGB, so a PQ photo's highlights are
 simply clipped away. If your wallpapers and footage are HDR, the previews are lying to you.
 
 Vanta Explorer renders HDR content in a scRGB half-float swapchain, underneath the UI rather than
 through it, so a Rec.2020 PQ image looks in the preview the way it looks in a real HDR viewer.
 
-The second reason is theming. Vanta Explorer reloads its colours, font **and folder icons** live when
+The second reason is theming. Vanta Explorer reloads its colors, font **and folder icons** live when
 the desktop theme changes, without restarting and without losing your open tabs.
 
 ## What it does
@@ -32,7 +32,7 @@ the desktop theme changes, without restarting and without losing your open tabs.
   a highlight.
 - **Video, with a seek slider.** Any container ffmpeg reads: mp4, mkv, webm, mov and the
   rest. Drag the slider under the preview to scrub through the file in 1% steps; each stop
-  is decoded on demand, in the video's own colour space.
+  is decoded on demand, in the video's own color space.
 - **Documents.** PDF pages with previous/next, ODF and OOXML thumbnails, SVG drawn on a
   checkerboard so both dark and light artwork read, and syntax-highlighted source for some
   fifty text formats.
@@ -117,8 +117,8 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 
 ### Theming
 
-Colours, font **and folder icons** reload live when the config changes, without restarting
-and without losing your tabs. Icons are re-rasterised from SVG in the theme's text colour.
+Colors, font **and folder icons** reload live when the config changes, without restarting
+and without losing your tabs. Icons are re-rasterised from SVG in the theme's text color.
 Appearance lives in its own file so a theme switcher can overwrite it wholesale; your
 sidebar and settings are kept apart and survive.
 
@@ -126,7 +126,7 @@ sidebar and settings are kept apart and survive.
 
 Wayland only, and it will refuse to start on X11. Developed against Hyprland, where it runs
 without a titlebar; anything else implementing `xdg-shell` should work and gets its decorations,
-though HDR needs a compositor that does colour management. HDR has been verified on NVIDIA only.
+though HDR needs a compositor that does color management. HDR has been verified on NVIDIA only.
 
 Rust 2021, and these system libraries:
 
@@ -172,9 +172,9 @@ The modes are `open`, `open-many`, `folder`, `save` and `save-many`.
 Explorer reads the layered files every Vanta app shares (every key is in `docs/config.md`):
 
 ```
-~/.config/vanta/colors.jsonc            the shared palette: colours and font
+~/.config/vanta/colors.jsonc            the shared palette: colors and font
 ~/.config/vanta/explorer.jsonc          Explorer's own overrides; a theme links this
-~/.config/vanta/explorer.local.jsonc    behaviour: date format, terminal, icon themes
+~/.config/vanta/explorer.local.jsonc    behavior: date format, terminal, icon themes
 ~/.config/vanta/explorer-sidebar.jsonc  your Places sections; never touched by a theme switch
 ```
 

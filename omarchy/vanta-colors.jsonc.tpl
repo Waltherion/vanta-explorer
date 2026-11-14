@@ -1,4 +1,4 @@
-// Vanta colours from the Omarchy theme in use. Omarchy fills in the double-brace values every time
+// Vanta colors from the Omarchy theme in use. Omarchy fills in the double-brace values every time
 // the theme changes and writes the result to ~/.local/state/omarchy/current/theme/, which is
 // the folder Vanta Explorer reads its theme from (see docs/omarchy.md). Edit this file, not
 // the copy Omarchy writes: that one is replaced at the next theme switch.

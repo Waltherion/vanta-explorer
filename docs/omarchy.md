@@ -37,8 +37,24 @@ omarchy-theme-refresh
   restart.
 - `omarchy-theme-refresh` writes the file once now, for the theme already in use.
 
-The icons are Omarchy's own (Yaru, in the colour each theme picks), and follow the theme by
-themselves; there is nothing to set up for them.
+The icons are Omarchy's own and follow the theme by themselves, as in Nautilus. Each theme names
+its icon set in its `icons.theme` file, and not always one in the accent color: Matte Black has
+an orange accent and red folders (`Yaru-red`), Tokyo Night a blue accent and magenta folders.
+
+To pick another set for one theme, put an `icons.theme` of your own in a folder named after that
+theme under `~/.config/omarchy/themes/`. Omarchy lays that folder over its own theme, so this
+changes only the icons, and in Nautilus too:
+
+```bash
+mkdir -p ~/.config/omarchy/themes/matte-black
+echo Yaru > ~/.config/omarchy/themes/matte-black/icons.theme   # Yaru on its own is orange
+omarchy-theme-refresh
+```
+
+The folder name is the theme's name in lowercase with dashes (`ls $OMARCHY_PATH/themes` lists
+them). The sets to choose from are in `ls /usr/share/icons | grep Yaru`: `Yaru` (orange),
+`Yaru-blue`, `Yaru-red`, `Yaru-magenta`, `Yaru-purple`, `Yaru-yellow`, `Yaru-olive`, `Yaru-sage`,
+`Yaru-wartybrown` and more. Undo by deleting the file.
 
 The font is `monospace`, the one Omarchy's font menu sets. Explorer picks up a new font at the
 next theme switch. To have it change at once, add a hook that nudges Explorer when the font
@@ -49,7 +65,7 @@ mkdir -p ~/.config/omarchy/hooks/font-set.d
 printf '#!/bin/bash\ntouch "$HOME/.local/state/vanta/theme"\n' > ~/.config/omarchy/hooks/font-set.d/vantaexplorer
 ```
 
-To change colours or the font for Explorer, edit `~/.config/omarchy/themed/vanta-colors.jsonc.tpl`
+To change colors or the font for Explorer, edit `~/.config/omarchy/themed/vanta-colors.jsonc.tpl`
 and run `omarchy-theme-refresh`. Never edit the copy in `~/.local/state/omarchy/current/theme/`:
 it is replaced at the next switch. The keys are in `docs/config.md`. A file of your own,
 `~/.config/vanta/explorer.jsonc`, wins over the theme for every theme at once (for example a
@@ -81,7 +97,7 @@ Nautilus stays installed. Omarchy uses it in a few places of its own (the Dropbo
 
 **Translucency.** Omarchy has blur turned off, so the template gives Explorer an opaque
 background. With blur turned on in Hyprland, a background with alpha in front (`#d1` before the
-colour, see the comment in the template) makes it translucent, and a window rule makes Hyprland
+color, see the comment in the template) makes it translucent, and a window rule makes Hyprland
 blur behind it, in `~/.config/hypr/hyprland.lua` (or any file it loads):
 
 ```lua

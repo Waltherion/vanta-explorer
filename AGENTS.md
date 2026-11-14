@@ -6,7 +6,7 @@ these before you change anything, in full:
 1. `README.md`: what this is and the install commands.
 2. `docs/omarchy.md`: the whole setup on Omarchy, step by step. On Omarchy, follow it exactly.
 3. `docs/config.md`, the `colors.jsonc` and "Vanta Explorer" sections: the settings, when the
-   person asks for a change in look or behaviour.
+   person asks for a change in look or behavior.
 4. `docs/install.md`, the "Vanta Explorer" section: plain Hyprland without Omarchy.
 
 ## Rules
@@ -20,7 +20,7 @@ these before you change anything, in full:
   Everything you need goes in the person's own files: `~/.config/hypr/bindings.lua`,
   `~/.config/omarchy/themed/`, `~/.config/omarchy/hooks/`, `~/.config/vanta/`.
 - **Never edit `~/.local/state/omarchy/current/theme/vanta-colors.jsonc`.** It is generated.
-  Colour and font changes go in `~/.config/omarchy/themed/vanta-colors.jsonc.tpl`, followed by
+  Color and font changes go in `~/.config/omarchy/themed/vanta-colors.jsonc.tpl`, followed by
   `omarchy-theme-refresh`.
 - **Copy a file before you edit it** (`cp file file.bak-$(date +%Y%m%d)`), and add to
   `bindings.lua` rather than rewriting it.
@@ -39,14 +39,14 @@ Each of these should hold before you tell the person it is done:
 ```bash
 pacman -Q vantaexplorer-git                                  # installed
 cat ~/.local/state/vanta/theme                               # .../.local/state/omarchy/current/theme
-grep -c '"#' ~/.local/state/omarchy/current/theme/vanta-colors.jsonc   # a number above 0: real colours
+grep -c '"#' ~/.local/state/omarchy/current/theme/vanta-colors.jsonc   # a number above 0: real colors
 grep -c '{{' ~/.local/state/omarchy/current/theme/vanta-colors.jsonc   # 0: nothing left unfilled
 xdg-mime query default inode/directory                       # vantaexplorer.desktop
 hyprctl configerrors                                         # no errors
 ```
 
 Then ask the person to press `Super + Shift + F` and to switch Omarchy theme once with the
-Explorer window open: its colours should change within a second.
+Explorer window open: its colors should change within a second.
 
 ## When something is wrong
 
@@ -56,6 +56,6 @@ Explorer window open: its colours should change within a second.
 - **Black or broken window**: `vantaexplorer --probe` prints what Vulkan offers and what was
   picked. A working Vulkan driver is required (`vulkan-radeon`, `vulkan-intel` or the NVIDIA
   driver).
-- **Colours do not follow the theme**: check the four lines above about the theme, then run
+- **Colors do not follow the theme**: check the four lines above about the theme, then run
   `omarchy-theme-refresh`.
 - **More logging**: `RUST_LOG=debug vantaexplorer`.

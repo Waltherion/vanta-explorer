@@ -11,11 +11,11 @@
 ---
 
 - **HDR previews that are actually HDR**: AVIF, JXL, HEIC, PQ PNGs and video, shown as they were
-  mastered instead of as washed-out grey. Everything else (SDR pictures, PDFs, documents, source
+  mastered instead of as washed-out gray. Everything else (SDR pictures, PDFs, documents, source
   code) gets a preview too.
 - **Split panes and tabs**, a sidebar with drives, places and recent files, undo for moves,
   copies, renames and trashing, archives, drag and drop.
-- **Follows your theme live**: colours, font and folder icons change with the desktop theme,
+- **Follows your theme live**: colors, font and folder icons change with the desktop theme,
   without a restart and without losing your tabs.
 
 The full feature list is in [crates/vantaexplorer/README.md](crates/vantaexplorer/README.md).
@@ -35,7 +35,7 @@ makepkg -si
 Update with `git pull && makepkg -si` in the same folder.
 
 Wayland only. Made on Hyprland; other Wayland compositors should work but are not tested. HDR
-needs a compositor with colour management (Hyprland with `cm = "hdr"` on the monitor); on an
+needs a compositor with color management (Hyprland with `cm = "hdr"` on the monitor); on an
 SDR screen it is an ordinary, SDR file manager.
 
 **On Omarchy**: [docs/omarchy.md](docs/omarchy.md) sets it up to follow the Omarchy theme and
@@ -47,7 +47,7 @@ how to make it the file chooser other programs get.
 ## Configure
 
 Settings live in `~/.config/vanta/`. Every key is in [docs/config.md](docs/config.md) (the
-Explorer section, and `colors.jsonc` for colours and font). Changes are picked up within a second.
+Explorer section, and `colors.jsonc` for colors and font). Changes are picked up within a second.
 
 ## Licence
 
