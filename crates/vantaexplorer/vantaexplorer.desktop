@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Vanta Explorer
+GenericName=File Manager
+Comment=File manager for Hyprland with true HDR previews
+Exec=vantaexplorer %f
+Icon=vantaexplorer
+Terminal=false
+Categories=System;FileTools;FileManager;
+Keywords=vantaexplorer;file;manager;files;browser;folder;explorer;hdr;
+MimeType=inode/directory;
+StartupWMClass=vantaexplorer
+StartupNotify=false

@@ -1,0 +1,46 @@
+[package]
+name = "vantaexplorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "File manager for Hyprland with true HDR previews"
+
+[dependencies]
+libc = "0.2"
+vanta-config = { path = "../vanta-config" }
+vanta-gpu = { path = "../vanta-gpu" }
+vanta-ui = { path = "../vanta-ui" }
+vanta-hdr = { path = "../vanta-hdr" }
+anyhow = "1"
+ash = "0.38.0"
+winit = "0.30.13"
+raw-window-handle = "0.6.2"
+# Dragging files OUT of the window: winit has no API for starting a data drag, so we speak
+# wl_data_device directly on winit's own connection. Already in the tree via winit.
+wayland-client = "0.31"
+# The chooser makes itself a child of the window that asked for it (xdg-foreign), so it stays
+# with that window rather than being one more window on the desktop.
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+egui-ash-renderer = "0.13.0"
+log = "0.4.34"
+env_logger = "0.11.11"
+json5 = "1.3.1"
+serde = { version = "1.0.229", features = ["derive"] }
+egui = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = ["wayland", "links", "clipboard"] }
+serde_json = "1.0.151"
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts"] }
+freedesktop-icons = "0.4.0"
+xdg-mime = "0.4.0"
+rustix = { version = "1.1.4", features = ["fs"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+half = "2.7.1"
+sha1 = "0.11.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+poppler-rs = "0.26.0"
+cairo-rs = "0.22.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+glib = "0.22.8"
+trash = "5.2.6"
+notify = "7"

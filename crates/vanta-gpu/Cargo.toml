@@ -1,0 +1,11 @@
+[package]
+name = "vanta-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raw ash Vulkan building blocks shared by the vanta apps: scRGB/sRGB swapchains with bounded waits, textures with mip chains, host-mapped buffers."
+
+[dependencies]
+anyhow = "1"
+ash = "0.38"
+half = "2"

@@ -1,0 +1,14 @@
+[package]
+name = "vantaportal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Makes Vanta Explorer the file chooser other programs get, through xdg-desktop-portal"
+
+[dependencies]
+# Waiting for the chooser to close happens off the bus thread, so a second request, or the
+# program taking its first one back, is still heard.
+blocking = "1"
+libc = "0.2"
+serde_json = "1.0.151"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }

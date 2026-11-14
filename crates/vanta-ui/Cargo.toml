@@ -1,0 +1,11 @@
+[package]
+name = "vanta-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The look the vanta apps share: the rolling colour band, theme colours, fonts, and the scale a layout derives its sizes from."
+
+[dependencies]
+egui = "0.36"
+serde_json = "1"
+vanta-config = { path = "../vanta-config" }
