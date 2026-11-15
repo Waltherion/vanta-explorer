@@ -64,6 +64,8 @@ pub struct View<'a> {
     pub thumbs: &'a std::cell::RefCell<crate::thumbs::Thumbs>,
     pub actions: &'a std::cell::RefCell<Vec<Action>>,
     pub clipboard_filled: bool,
+    /// Files cut to the clipboard, drawn faded until they are pasted.
+    pub cut: &'a std::collections::HashSet<std::path::PathBuf>,
     pub dir_size: &'a crate::dir_size::DirSize,
     /// Ctrl+V was pressed, detected on the raw winit event.
     ///
@@ -812,6 +814,8 @@ struct Cols {
 }
 
 const MIN_NAME_W: f32 = 60.0;
+/// How much of a cut file is drawn until it is pasted.
+const CUT_ALPHA: f32 = 0.4;
 const MIN_SIZE_W: f32 = 40.0;
 const MIN_MODIFIED_W: f32 = 40.0;
 /// The name keeps at least this much before Modified is shown at all: names cut to a few
@@ -2002,6 +2006,8 @@ fn show_rows_view(
                     egui::pos2(cols.name_left, rect.min.y + (row_h - icon_sz) / 2.0),
                     egui::vec2(icon_sz, icon_sz),
                 );
+                // Cut, waiting to be pasted: faded, as other file managers show it.
+                let ghost = if view.cut.contains(&entry.path) { CUT_ALPHA } else { 1.0 };
                 if let Some(tex) = icons.get_for_entry(
                     ui.ctx(),
                     &entry.path,
@@ -2014,11 +2020,11 @@ fn show_rows_view(
                         tex,
                         icon_rect,
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
+                        egui::Color32::WHITE.gamma_multiply(ghost),
                     );
                 }
 
-                let text_col = if entry.hidden { theme.text.gamma_multiply(0.6) } else { theme.text };
+                let text_col = if entry.hidden { theme.text.gamma_multiply(0.6) } else { theme.text }.gamma_multiply(ghost);
                 let font = egui::TextStyle::Body.resolve(ui.style());
                 let name_left = icon_rect.max.x + 6.0;
                 ui.painter().text(
@@ -2224,8 +2230,13 @@ fn show_rows_view(
     if bg.hovered() {
         if ui.input(|i| i.pointer.any_released()) {
             if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
-                let copy = ui.input(|i| i.modifiers.ctrl);
-                view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: tab.path().to_path_buf(), copy });
+                // A right-button drag asks, on empty space as on a folder.
+                if payload.secondary {
+                    view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: tab.path().to_path_buf() });
+                } else {
+                    let copy = ui.input(|i| i.modifiers.ctrl);
+                    view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: tab.path().to_path_buf(), copy });
+                }
             }
         }
         
@@ -2419,6 +2430,8 @@ fn show_grid(
                             egui::vec2(zoom, zoom),
                         );
 
+                        // Cut, waiting to be pasted: faded, as other file managers show it.
+                        let tint = egui::Color32::WHITE.gamma_multiply(if view.cut.contains(&entry.path) { CUT_ALPHA } else { 1.0 });
                         // A real thumbnail when we can make one, otherwise the MIME icon.
                         let mut drew_thumb = false;
                         // Folder preview: a collage of up to four images from inside the
@@ -2447,7 +2460,7 @@ fn show_grid(
                                     ppp,
                                     theme.icon_tint,
                                 ) {
-                                    ui.painter().image(tex, img_rect, uv, egui::Color32::WHITE);
+                                    ui.painter().image(tex, img_rect, uv, tint);
                                 }
 
                                 // Keep the tiles well inside the folder body. The icon's own
@@ -2481,13 +2494,13 @@ fn show_grid(
                                     ui.painter().rect_filled(
                                         fitted.expand(border),
                                         0.0,
-                                        egui::Color32::WHITE,
+                                        tint,
                                     );
                                     ui.painter().image(
                                         tex.id(),
                                         fitted,
                                         uv,
-                                        egui::Color32::WHITE,
+                                        tint,
                                     );
                                 }
                                 drew_thumb = true;
@@ -2501,7 +2514,7 @@ fn show_grid(
                                 let size = tex.size_vec2();
                                 let fitted =
                                     crate::preview::fit(img_rect, size.x as u32, size.y as u32);
-                                ui.painter().image(tex.id(), fitted, uv, egui::Color32::WHITE);
+                                ui.painter().image(tex.id(), fitted, uv, tint);
                                 drew_thumb = true;
                             }
                         }
@@ -2514,7 +2527,7 @@ fn show_grid(
                                 ppp,
                                 theme.icon_tint,
                             ) {
-                                ui.painter().image(tex, img_rect, uv, egui::Color32::WHITE);
+                                ui.painter().image(tex, img_rect, uv, tint);
                             }
                         }
 
@@ -2522,7 +2535,8 @@ fn show_grid(
                             theme.text.gamma_multiply(0.6)
                         } else {
                             theme.text
-                        };
+                        }
+                        .gamma_multiply(tint.a() as f32 / 255.0);
                         ui.painter().text(
                             egui::pos2(rect.center().x, rect.max.y - label_h * 0.5),
                             egui::Align2::CENTER_CENTER,
@@ -2679,8 +2693,13 @@ fn show_grid(
     if bg.hovered() {
         if ui.input(|i| i.pointer.any_released()) {
             if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
-                let copy = ui.input(|i| i.modifiers.ctrl);
-                view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: tab.path().to_path_buf(), copy });
+                // A right-button drag asks, on empty space as on a folder.
+                if payload.secondary {
+                    view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: tab.path().to_path_buf() });
+                } else {
+                    let copy = ui.input(|i| i.modifiers.ctrl);
+                    view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: tab.path().to_path_buf(), copy });
+                }
             }
         }
         

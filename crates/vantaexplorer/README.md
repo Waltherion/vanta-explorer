@@ -79,13 +79,16 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 ### Working with files
 
 - Copy, cut, paste, trash, rename and new folder, with progress, cancel and conflict prompts.
+  Copied and cut files go on the system clipboard the way Nautilus and Dolphin put them
+  there, so they paste between Explorer windows and to and from those file managers. Cut
+  files are drawn faded until they are pasted.
 - **Undo and redo**, `Ctrl+Z` / `Ctrl+Y`, for moves, copies, renames and trashing. Undo of a
   copy trashes the copies rather than deleting them, and an overwrite trashes the displaced
   file first, so undo can put it back. Permanent deletion is the one thing undo cannot
   reverse, so it is the one thing that asks first.
-- **Drag files out** to other applications over `wl_data_device`, as `text/uri-list` and
-  plain text. Within Vanta Explorer a drag moves, Ctrl+drag copies, and a right-button drag
-  asks which.
+- **Drag and drop** between panes, between Explorer windows, and to and from other
+  applications over `wl_data_device` (`text/uri-list` and plain text). A drag moves, Ctrl+drag
+  copies, and a right-button drag asks which, also from one window to another.
 - **Archives**: extract here, extract to a folder, or compress a selection to tar.zst, tar.gz,
   zip or 7z, through libarchive. Extraction never overwrites, and undo trashes exactly what
   the archive added.

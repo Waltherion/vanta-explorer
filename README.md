@@ -14,7 +14,8 @@
   mastered instead of as washed-out gray. Everything else (SDR pictures, PDFs, documents, source
   code) gets a preview too.
 - **Split panes and tabs**, a sidebar with drives, places and recent files, undo for moves,
-  copies, renames and trashing, archives, drag and drop.
+  copies, renames and trashing, archives, drag and drop and copy and paste between windows
+  and with other file managers.
 - **Follows your theme live**: colors, font and folder icons change with the desktop theme,
   without a restart and without losing your tabs. It comes with its own icons (from KDE's
   Breeze), with the folders in your theme's accent color.

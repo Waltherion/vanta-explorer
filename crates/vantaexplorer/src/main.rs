@@ -305,9 +305,23 @@ struct Gfx {
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     hdr: hdrmon::HdrMonitor,
-    /// Dragging files out to other apps. None if the compositor lacks the globals, the app
-    /// works fine without it, you just cannot drag out. Drops before `window`, like the rest.
+    /// Dragging files out to other apps, and taking drops from them. None if the compositor
+    /// lacks the globals, the app works fine without it, you just cannot drag in or out.
+    /// Drops before `window`, like the rest.
     dnd: Option<dnd::Dnd>,
+    /// A drag from another window is over ours (see `feed_incoming_drag`).
+    incoming_drag: bool,
+    /// The drag payload egui holds was put there for that drag, not by a drag between panes.
+    incoming_payload: bool,
+    /// A drop was handed to egui last frame: whatever nothing took is cleared next frame.
+    drop_cleanup: bool,
+    /// The modifiers to give back after a drop that had to pretend Ctrl was held.
+    restore_modifiers: Option<egui::Modifiers>,
+    /// Clipboard text read at Ctrl+V, handed to egui as a paste at the next frame.
+    pending_paste: Option<String>,
+    /// A drag of ours went to the compositor while this button was down: egui is told it was
+    /// let go, away from the window.
+    release_after_drag: Option<egui::PointerButton>,
     window: Arc<Window>,
 }
 
@@ -420,6 +434,9 @@ impl ApplicationHandler for App {
                 if is_v {
                     self.paste_key = true;
                     self.needs_draw = true;
+                    // Text for a text field. egui-winit's own clipboard is off (see dnd.rs), so
+                    // the paste event is ours to make.
+                    gfx.pending_paste = gfx.dnd.as_mut().and_then(|d| d.clipboard()).filter(|t| !t.is_empty());
                 }
             }
             _ => {}
@@ -460,7 +477,7 @@ impl ApplicationHandler for App {
                     });
                     if let Some(payload) = payload {
                         if let Some(d) = &mut gfx.dnd {
-                            d.start(&payload.source_paths);
+                            d.start(&payload.source_paths, payload.secondary);
                             if d.in_flight() {
                                 // The gesture belongs to the compositor now. Drop our own
                                 // copy, or a later release inside the window would fire a
@@ -470,6 +487,15 @@ impl ApplicationHandler for App {
                                         egui::Id::new("dnd"),
                                     )
                                 });
+                                // The release of the button goes to the compositor, never to
+                                // us: egui would hold it down for good, and with a button held
+                                // it hovers nothing, so no later drop could land here.
+                                gfx.release_after_drag = Some(if payload.secondary {
+                                    egui::PointerButton::Secondary
+                                } else {
+                                    egui::PointerButton::Primary
+                                });
+                                self.needs_draw = true;
                             }
                         }
                     }
@@ -699,8 +725,11 @@ impl ApplicationHandler for App {
                 }
             }
         }
+        let mut dnd_waiting = false;
         if let Some(d) = &mut gfx.dnd {
-            d.poll();
+            d.set_accepting(self.chooser.is_none());
+            dirty |= d.poll();
+            dnd_waiting = d.waiting();
         }
         dirty |= self.thumbs.borrow_mut().poll(&gfx.egui_ctx);
 
@@ -802,7 +831,7 @@ impl ApplicationHandler for App {
             .panes
             .iter()
             .any(|p| p.tabs.iter().any(|t| t.rx.is_some()));
-        let floor = if streaming {
+        let floor = if streaming || dnd_waiting {
             Duration::from_millis(8)
         } else {
             Duration::from_millis(100)
@@ -900,6 +929,17 @@ impl App {
             return Err(anyhow!("__probe_done__"));
         }
 
+        // Best-effort: no drag and drop is a missing feature, not a reason to fail startup.
+        // Made BEFORE egui-winit's state: Hyprland gives drags and the clipboard to the first
+        // data device a program makes, and egui-winit may make one of its own (see dnd.rs).
+        let dnd = match wayland_handles(&window).and_then(|(d, s)| dnd::Dnd::new(d, s)) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                log::warn!("drag and drop unavailable: {e:#}");
+                None
+            }
+        };
+
         let egui_ctx = egui::Context::default();
         // Ctrl+plus/minus/0 zoom the icons (browser.rs), not the whole interface.
         egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -934,15 +974,6 @@ impl App {
             }
         }
 
-        // Best-effort: no drag-out is a missing feature, not a reason to fail startup.
-        let dnd = match wayland_handles(&window).and_then(|(d, s)| dnd::Dnd::new(d, s)) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                log::warn!("drag-out unavailable: {e:#}");
-                None
-            }
-        };
-
         Ok(Gfx {
             window,
             renderer,
@@ -951,7 +982,80 @@ impl App {
             egui_renderer,
             hdr,
             dnd,
+            incoming_drag: false,
+            incoming_payload: false,
+            drop_cleanup: false,
+            restore_modifiers: None,
+            pending_paste: None,
+            release_after_drag: None,
         })
+    }
+}
+
+/// A drag from another window over ours, handed to egui as if it were a drag between panes:
+/// its paths as the drag payload, the pointer where the drag is, and on the drop a release
+/// there. Folders light up under it, the "Move/Copy" note follows it, Ctrl copies, and the drop
+/// lands in the same code. While the compositor runs a drag, winit sees no pointer events of
+/// its own, so these are the only ones egui gets.
+fn feed_incoming_drag(gfx: &mut Gfx, raw: &mut egui::RawInput) {
+    let Some(d) = &mut gfx.dnd else { return };
+    let id = egui::Id::new("dnd");
+    // Surface-local logical pixels to egui points.
+    let scale = gfx.window.scale_factor() as f32 / gfx.egui_ctx.pixels_per_point();
+    let point = |(x, y): (f64, f64)| egui::pos2(x as f32 * scale, y as f32 * scale);
+
+    if let Some(button) = gfx.release_after_drag.take() {
+        let away = egui::pos2(-1.0, -1.0);
+        let modifiers = gfx.egui_ctx.input(|i| i.modifiers);
+        raw.events.push(egui::Event::PointerMoved(away));
+        raw.events.push(egui::Event::PointerButton { pos: away, button, pressed: false, modifiers });
+        raw.events.push(egui::Event::PointerGone);
+    }
+
+    if std::mem::take(&mut gfx.drop_cleanup) {
+        gfx.egui_ctx.memory_mut(|m| m.data.remove_temp::<browser::DragPayload>(id));
+        raw.events.push(egui::Event::PointerGone);
+        if let Some(m) = gfx.restore_modifiers.take() {
+            raw.events.push(egui::Event::ModifiersChanged(m));
+        }
+    }
+
+    if let Some(drop) = d.take_drop() {
+        gfx.incoming_drag = false;
+        gfx.incoming_payload = false;
+        gfx.drop_cleanup = true;
+        if drop.paths.is_empty() {
+            return;
+        }
+        let pos = point(drop.pos);
+        gfx.egui_ctx.memory_mut(|m| m.data.insert_temp(id, browser::DragPayload { source_paths: drop.paths, secondary: drop.ask }));
+        // A source that allows no move gets a copy, as Ctrl would ask for.
+        let mut modifiers = gfx.egui_ctx.input(|i| i.modifiers);
+        if drop.copy_only && !modifiers.ctrl {
+            gfx.restore_modifiers = Some(modifiers);
+            modifiers.ctrl = true;
+            modifiers.command = true;
+            raw.events.push(egui::Event::ModifiersChanged(modifiers));
+        }
+        raw.events.push(egui::Event::PointerMoved(pos));
+        raw.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers });
+        return;
+    }
+
+    if let Some(over) = d.incoming() {
+        gfx.incoming_drag = true;
+        raw.events.push(egui::Event::PointerMoved(point(over.pos)));
+        let has_payload = gfx.egui_ctx.memory(|m| m.data.get_temp::<browser::DragPayload>(id).is_some());
+        if let Some(paths) = over.paths.filter(|p| !p.is_empty() && !has_payload) {
+            gfx.egui_ctx.memory_mut(|m| m.data.insert_temp(id, browser::DragPayload { source_paths: paths, secondary: over.ask }));
+            gfx.incoming_payload = true;
+        }
+    } else if std::mem::take(&mut gfx.incoming_drag) {
+        // It left without dropping.
+        if std::mem::take(&mut gfx.incoming_payload) {
+            gfx.egui_ctx.memory_mut(|m| m.data.remove_temp::<browser::DragPayload>(id));
+        }
+        raw.events.push(egui::Event::PointerGone);
     }
 }
 
@@ -997,7 +1101,11 @@ fn draw(
     paste_key: &mut bool,
     chooser: &mut Option<chooser::State>,
 ) -> Result<Duration> {
-    let raw_input = gfx.egui_winit.take_egui_input(&gfx.window);
+    let mut raw_input = gfx.egui_winit.take_egui_input(&gfx.window);
+    feed_incoming_drag(gfx, &mut raw_input);
+    if let Some(text) = gfx.pending_paste.take() {
+        raw_input.events.push(egui::Event::Paste(text));
+    }
     let hdr_sc = gfx.renderer.hdr_active;
     let hdr_mon = gfx.hdr.is_hdr();
 
@@ -1017,7 +1125,20 @@ fn draw(
     let hdr_rect = std::cell::Cell::new(None);
     let want_preview = std::cell::Cell::new(None);
     let actions = std::cell::RefCell::new(Vec::new());
-    let clipboard_filled = app_ops.clipboard.is_some();
+    // Files on the system clipboard, from any window or file manager; our own state only when
+    // there is no Wayland clipboard to use.
+    let clipboard_filled = match gfx.dnd.as_mut() {
+        Some(d) => d.clipboard_has_files(),
+        None => app_ops.clipboard.is_some(),
+    };
+    // Files put on the clipboard this frame: their paths go with them as text, so the "copy
+    // the paths" text the browser asks for alongside must not replace them.
+    let mut files_on_clipboard = false;
+    // Cut files are drawn faded, in every window, until they are pasted.
+    let cut_paths: std::collections::HashSet<std::path::PathBuf> = match gfx.dnd.as_mut() {
+        Some(d) => d.cut_files().into_iter().collect(),
+        None => app_ops.clipboard.iter().filter(|c| c.1).flat_map(|c| c.0.clone()).collect(),
+    };
     let mut output = gfx.egui_ctx.run_ui(raw_input, |root| {
         app_ui(
             root,
@@ -1031,6 +1152,7 @@ fn draw(
             thumbs,
             &actions,
             clipboard_filled,
+            &cut_paths,
             app_ops,
             dir_size,
             &hdr_rect,
@@ -1071,17 +1193,31 @@ fn draw(
                 }
             }
             browser::Action::SetClipboard { paths, cut } => {
+                if let Some(d) = &mut gfx.dnd {
+                    d.set_clipboard_files(&paths, cut);
+                    files_on_clipboard = true;
+                }
                 app_ops.clipboard = Some((paths, cut));
             }
             browser::Action::Paste { dest } => {
-                if let Some((paths, cut)) = app_ops.clipboard.clone() {
+                // The system clipboard, so files copied in another window (or in Nautilus or
+                // Dolphin) paste here too.
+                let files = match gfx.dnd.as_mut() {
+                    Some(d) => d.clipboard_files(),
+                    None => app_ops.clipboard.clone(),
+                };
+                if let Some((paths, cut)) = files {
                     app_ops.ops.submit(fileops::Request::new(if cut {
                             fileops::OpKind::Move
                         } else {
                             fileops::OpKind::Copy
                         }, paths, Some(dest)));
                     if cut {
-                        app_ops.clipboard = None; // a cut pastes once
+                        // A cut pastes once.
+                        app_ops.clipboard = None;
+                        if let Some(d) = &mut gfx.dnd {
+                            d.clear_clipboard();
+                        }
                     }
                 }
             }
@@ -1201,6 +1337,18 @@ fn draw(
         .map(|v| v.repaint_delay)
         .unwrap_or(Duration::MAX);
 
+    // Copied text goes on the system clipboard through our own data device (see dnd.rs).
+    if let Some(d) = &mut gfx.dnd {
+        output.platform_output.commands.retain(|c| match c {
+            egui::OutputCommand::CopyText(text) => {
+                if !files_on_clipboard {
+                    d.set_clipboard(text.clone());
+                }
+                false
+            }
+            _ => true,
+        });
+    }
     gfx.egui_winit
         .handle_platform_output(&gfx.window, output.platform_output);
 
@@ -1269,6 +1417,7 @@ fn app_ui(
     thumbs: &std::cell::RefCell<thumbs::Thumbs>,
     actions_out: &std::cell::RefCell<Vec<browser::Action>>,
     clipboard_filled_flag: bool,
+    cut_paths: &std::collections::HashSet<std::path::PathBuf>,
     app_ops: &mut OpsState,
     dir_size: &crate::dir_size::DirSize,
     hdr_rect: &std::cell::Cell<Option<egui::Rect>>,
@@ -1455,6 +1604,7 @@ fn app_ui(
         thumbs,
         actions: actions_out,
         clipboard_filled: clipboard_filled_flag,
+        cut: cut_paths,
         dir_size,
         modal_open,
         paste_key,
