@@ -15,7 +15,9 @@ makepkg -si
 `makepkg` fetches the build tools it needs (Rust, shaderc and so on), builds, runs the tests and
 installs the package `vantaexplorer-git`. The first build takes a few minutes.
 
-To update later: the same `cd`, then `git pull && makepkg -si`.
+To update later: `~/.local/src/vanta-explorer/update.sh`. Not `git pull` on its own: makepkg
+writes the version it built into `PKGBUILD`, so git sees that file as changed and refuses to
+pull. The script puts it back, pulls and builds.
 
 ## 2. Follow the Omarchy theme
 

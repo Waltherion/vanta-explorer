@@ -1,3 +1,9 @@
 /target
 /CLAUDE_SYNC.md
 __pycache__/
+
+# makepkg, run in this folder
+/src/
+/pkg/
+/vantaexplorer-git/
+/*.pkg.tar.*

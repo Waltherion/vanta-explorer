@@ -34,7 +34,9 @@ cd ~/.local/src/vanta-explorer
 makepkg -si
 ```
 
-Update with `git pull && makepkg -si` in the same folder.
+Update with `~/.local/src/vanta-explorer/update.sh`. A plain `git pull` stops after the first
+build, because makepkg writes the version it built into `PKGBUILD`; the script puts that file
+back, pulls, and builds.
 
 Wayland only. Made on Hyprland; other Wayland compositors should work but are not tested. HDR
 needs a compositor with color management (Hyprland with `cm = "hdr"` on the monitor); on an

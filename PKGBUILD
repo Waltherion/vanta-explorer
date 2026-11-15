@@ -1,7 +1,7 @@
 # Maintainer: Waltherion (https://github.com/Waltherion)
 
 # Vanta Explorer on its own, built from the latest commit of its repository.
-# Install: clone the repository, then `makepkg -si` in it. Update: `git pull`, then the same.
+# Install: clone the repository, then `makepkg -si` in it. Update: `./update.sh` (see the README).
 pkgname=vantaexplorer-git
 pkgver=1.0.0
 pkgrel=1

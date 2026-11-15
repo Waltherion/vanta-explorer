@@ -57,7 +57,8 @@ Explorer window open: its colors should change within a second.
 
 - **It does not start**: run `vantaexplorer` in a terminal and read what it prints. Errors about
   a missing `.so` library mean a system library was upgraded after the build: rebuild with
-  `git pull && makepkg -si` in the repository folder.
+  `./update.sh` in the repository folder (also to update; see the README for why not a plain
+  `git pull`).
 - **Black or broken window**: `vantaexplorer --probe` prints what Vulkan offers and what was
   picked. A working Vulkan driver is required (`vulkan-radeon`, `vulkan-intel` or the NVIDIA
   driver).
