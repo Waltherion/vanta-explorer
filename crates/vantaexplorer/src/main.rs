@@ -1653,18 +1653,22 @@ fn status_bar(
             toggle_view = true;
         }
         ui.separator();
-        // Drive usage for the active path: used / total (percent).
+        // Drive usage for the active path: used / total (percent). In a narrow window the
+        // longest form that fits the room left beside the item count, never drawn over it.
         if let Some(m) = drives.mount_for(ws.active_pane().tab_ref().path()) {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{}: {} / {} ({:.0}%)",
-                    m.display_name(),
-                    model::human_size(m.used),
-                    model::human_size(m.total),
-                    m.percent_used()
-                ))
-                .color(theme.text.gamma_multiply(0.8)),
-            );
+            let (used, total, pct) = (model::human_size(m.used), model::human_size(m.total), m.percent_used());
+            let forms = [
+                format!("{}: {used} / {total} ({pct:.0}%)", m.display_name()),
+                format!("{used} / {total} ({pct:.0}%)"),
+                format!("{pct:.0}% used"),
+            ];
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let room = ui.available_width() - ui.spacing().item_spacing.x;
+            let fits = |t: &String| ui.ctx().fonts_mut(|f| f.layout_no_wrap(t.clone(), font.clone(), egui::Color32::WHITE)).size().x <= room;
+            if let Some(text) = forms.iter().find(|t| fits(t)) {
+                ui.label(egui::RichText::new(text).color(theme.text.gamma_multiply(0.8)))
+                    .on_hover_text(&forms[0]);
+            }
         }
     });
     if toggle_view {

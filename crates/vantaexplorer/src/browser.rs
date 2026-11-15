@@ -455,6 +455,9 @@ fn show_pane(
             }
 
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // Whatever does not fit is cut off here rather than drawn under the Hidden
+                // button.
+                ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                 let tab = pane.tab();
                 if let Some(edit) = &mut tab.path_edit {
                     // Exactly the room there is: wider, the end of a long path hid under the
@@ -543,6 +546,7 @@ fn show_pane(
                         .sum();
 
                     let mut first = 0usize;
+                    let mut last_label = labels.last().cloned().unwrap_or_default();
                     if full > avail && !labels.is_empty() {
                         // Everything shown now follows the "..." marker, so every kept
                         // segment carries a chevron.
@@ -558,6 +562,13 @@ fn show_pane(
                             }
                             used += w;
                             first = i;
+                        }
+                        // The last component alone is too long for the room (a narrow pane,
+                        // a wide font): shortened to fit, so it never reaches under Hidden.
+                        let n = labels.len();
+                        let room = if n > 1 { budget - chevron } else { avail } - pad;
+                        if first == n - 1 && text_w(&last_label) > room {
+                            last_label = crate::text::elide_end(ui, &last_label, room.max(0.0));
                         }
                     }
 
@@ -575,7 +586,7 @@ fn show_pane(
                     }
 
                     for (i, comp) in comps.iter().enumerate().skip(first) {
-                        let label = labels[i].clone();
+                        let label = if i + 1 == labels.len() { last_label.clone() } else { labels[i].clone() };
                         if i > 0 {
                             let (r, _) = ui.allocate_exact_size(
                                 egui::vec2(10.0, 14.0),
@@ -803,9 +814,33 @@ struct Cols {
 const MIN_NAME_W: f32 = 60.0;
 const MIN_SIZE_W: f32 = 40.0;
 const MIN_MODIFIED_W: f32 = 40.0;
+/// The name keeps at least this much before Modified is shown at all: names cut to a few
+/// letters are worth less than the dates.
+const NAME_BEFORE_MODIFIED: f32 = 160.0;
+
+/// What the Size and Modified columns need to show their text whole, measured in the font in
+/// use. Fixed minimums were made for a narrow font: in a wide one (a monospace one, say) a
+/// squeezed pane showed sizes as "…KiB" and dates as "202…".
+#[derive(Clone, Copy)]
+struct ColNeed {
+    size: f32,
+    modified: f32,
+}
+
+impl ColNeed {
+    fn measure(ui: &egui::Ui, date_format: &str) -> Self {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let w = |t: String| ui.ctx().fonts_mut(|f| f.layout_no_wrap(t, font.clone(), egui::Color32::WHITE)).size().x;
+        // The padding the rows draw the text with (see the row painting), plus a pixel.
+        Self {
+            size: (w("1023.9 MiB".into()) + 9.0).max(MIN_SIZE_W),
+            modified: (w(format_mtime(Some(std::time::SystemTime::now()), date_format)) + 5.0).max(MIN_MODIFIED_W),
+        }
+    }
+}
 
 impl Cols {
-    fn new(rect: egui::Rect, name_w: f32, size_w: f32) -> Self {
+    fn new(rect: egui::Rect, name_w: f32, size_w: f32, need: ColNeed) -> Self {
         let name_left = rect.min.x + 4.0;
         let right = rect.max.x - 8.0;
         let avail = right - name_left;
@@ -815,8 +850,8 @@ impl Cols {
         // the minimums anyway, which pushed Size and Modified PAST the pane's right edge,
         // where they painted on top of the neighbouring pane. Drop Modified first, then Size.
         // Name is never dropped: a file list without names is useless.
-        let show_modified = avail >= MIN_NAME_W + MIN_SIZE_W + MIN_MODIFIED_W;
-        let show_size = avail >= MIN_NAME_W + MIN_SIZE_W;
+        let show_modified = avail >= NAME_BEFORE_MODIFIED + need.size + need.modified;
+        let show_size = avail >= MIN_NAME_W + need.size;
 
         if !show_size {
             return Self {
@@ -833,10 +868,10 @@ impl Cols {
         }
 
         // Keep the pair inside the pane however narrow it gets.
-        let reserved = if show_modified { MIN_SIZE_W + MIN_MODIFIED_W } else { MIN_SIZE_W };
+        let reserved = if show_modified { need.size + need.modified } else { need.size };
         let name_w = name_w.clamp(MIN_NAME_W, (avail - reserved).max(MIN_NAME_W));
-        let size_room = if show_modified { avail - name_w - MIN_MODIFIED_W } else { avail - name_w };
-        let size_w = size_w.clamp(MIN_SIZE_W, size_room.max(MIN_SIZE_W));
+        let size_room = if show_modified { avail - name_w - need.modified } else { avail - name_w };
+        let size_w = size_w.clamp(need.size, size_room.max(need.size));
 
         let size_left = name_left + name_w;
         let modified_left = size_left + size_w;
@@ -1705,12 +1740,13 @@ fn show_rows_view(
         base.to_string()
     };
     let mut resort: Option<SortKey> = None;
+    let need = ColNeed::measure(ui, &settings.date_format);
     {
         let (hrect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), HEADER_H),
             egui::Sense::hover(),
         );
-        let cols = Cols::new(hrect, pane_col_name, pane_col_size);
+        let cols = Cols::new(hrect, pane_col_name, pane_col_size, need);
         let spec = tab.listing.sort;
         let font = egui::TextStyle::Body.resolve(ui.style());
         let col = theme.text.gamma_multiply(0.7);
@@ -1791,11 +1827,11 @@ fn show_rows_view(
                 let d = hr.drag_delta().x;
                 let avail = (cols.right - cols.name_left).max(MIN_NAME_W);
                 if which == 0 {
-                    let max = (avail - col_drag.1 - MIN_MODIFIED_W).max(MIN_NAME_W);
+                    let max = (avail - col_drag.1 - need.modified).max(MIN_NAME_W);
                     col_drag.0 = (cols.name_w + d).clamp(MIN_NAME_W, max);
                 } else {
-                    let max = (avail - col_drag.0 - MIN_MODIFIED_W).max(MIN_SIZE_W);
-                    col_drag.1 = (cols.size_w + d).clamp(MIN_SIZE_W, max);
+                    let max = (avail - col_drag.0 - need.modified).max(need.size);
+                    col_drag.1 = (cols.size_w + d).clamp(need.size, max);
                 }
             }
         }
@@ -1918,7 +1954,7 @@ fn show_rows_view(
             //
             // Every row shares the same x-extent, so the boundary is computed once here
             // rather than per row.
-            let split_x = Cols::new(ui.available_rect_before_wrap(), pane_col_name, pane_col_size).size_left;
+            let split_x = Cols::new(ui.available_rect_before_wrap(), pane_col_name, pane_col_size, need).size_left;
             // While the button is down, judge by where the press STARTED. Using the live
             // hover position would flip the sense mid-drag as the cursor crossed into the
             // Size column, cancelling a drag-and-drop halfway through.
@@ -1961,7 +1997,7 @@ fn show_rows_view(
                 }
 
                 // icon + name | size | modified, same Cols geometry as the header
-                let cols = Cols::new(rect, pane_col_name, pane_col_size);
+                let cols = Cols::new(rect, pane_col_name, pane_col_size, need);
                 let icon_rect = egui::Rect::from_min_size(
                     egui::pos2(cols.name_left, rect.min.y + (row_h - icon_sz) / 2.0),
                     egui::vec2(icon_sz, icon_sz),
@@ -2926,8 +2962,11 @@ mod tests {
     fn cols_for(width: f32) -> Cols {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 20.0));
         // Deliberately absurd stored widths: the pane, not the saved preference, must win.
-        Cols::new(rect, 420.0, 90.0)
+        Cols::new(rect, 420.0, 90.0, NEED)
     }
+
+    /// What a narrow font needs: the old fixed minimums.
+    const NEED: ColNeed = ColNeed { size: MIN_SIZE_W, modified: MIN_MODIFIED_W };
 
     /// The bug this guards: with four panes beside a wide preview panel each pane fell to
     /// ~80px, the forced minimums pushed Modified past the pane's right edge, and it painted
@@ -2975,5 +3014,22 @@ mod tests {
         assert!(!c.show_modified);
         assert_eq!(c.modified_left, c.right);
         assert_eq!(c.modified_w, 0.0);
+    }
+
+    /// A wide font: Size gets the room its text needs rather than being squeezed to "…KiB",
+    /// and Modified gives way before the names are cut to a few letters.
+    #[test]
+    fn a_wide_font_keeps_sizes_whole_and_drops_dates_first() {
+        let need = ColNeed { size: 90.0, modified: 150.0 };
+        let rect = |w: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, 20.0));
+
+        let c = Cols::new(rect(350.0), 420.0, 40.0, need);
+        assert!(c.show_size && !c.show_modified);
+        assert!(c.size_w >= need.size);
+        assert!(c.name_w >= NAME_BEFORE_MODIFIED);
+
+        let c = Cols::new(rect(600.0), 420.0, 40.0, need);
+        assert!(c.show_size && c.show_modified);
+        assert!(c.size_w >= need.size && c.modified_w >= need.modified);
     }
 }
