@@ -10,6 +10,7 @@ mod browser;
 mod chooser;
 mod config;
 mod dir_size;
+mod help;
 mod dnd;
 mod docs;
 mod drives;
@@ -1427,7 +1428,9 @@ fn app_ui(
 ) {
     // Any modal up? Computed before anything reads the keyboard, so dialogs and panes cannot
     // both act on the same keystroke.
-    let modal_open = app_ops.pending_delete.is_some()
+    help::handle_key(root.ctx());
+    let modal_open = help::is_open(root.ctx())
+        || app_ops.pending_delete.is_some()
         || app_ops.pending_conflict.is_some()
         || app_ops.open_with.is_some()
         || chooser.as_ref().is_some_and(|c| c.replace.is_some());
@@ -1701,6 +1704,7 @@ fn app_ui(
     }
 
     ops_windows(root.ctx(), app_ops, theme);
+    help::show(root.ctx(), theme, &settings.date_format);
     if let Some(c) = chooser.as_mut() {
         c.show_replace(root.ctx(), theme);
     }

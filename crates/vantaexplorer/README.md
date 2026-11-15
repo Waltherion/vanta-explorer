@@ -93,6 +93,8 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
   zip or 7z, through libarchive. Extraction never overwrites, and undo trashes exactly what
   the archive added.
 - **Copy path** as text (`Ctrl+Shift+P`), and **Open with**, including "always open with".
+- **F1** lists every keyboard shortcut, and shows which commit this build is and when it was
+  built.
 
 ### Sidebar
 
