@@ -29,6 +29,9 @@ these before you change anything, in full:
 - **Do not set up the file chooser** (`portals.conf`, `vantaportal`) unless the person asks for
   it. It is the newest and least tested part.
 - **Do not remove Nautilus.** Omarchy uses it in places of its own.
+- **Leave the icons alone** unless the person asks. Explorer brings its own and paints the
+  folders in the theme's accent by itself. Do not set `"iconThemes"`, install icon themes or
+  make one: the guide's "Omarchy's icons instead" section is the way to other icons.
 - `makepkg -si` asks for the sudo password in the terminal. Let the person type it; never ask
   them to paste it to you.
 
@@ -43,6 +46,8 @@ grep -c '"#' ~/.local/state/omarchy/current/theme/vanta-colors.jsonc   # a numbe
 grep -c '{{' ~/.local/state/omarchy/current/theme/vanta-colors.jsonc   # 0: nothing left unfilled
 xdg-mime query default inode/directory                       # vantaexplorer.desktop
 hyprctl configerrors                                         # no errors
+grep -s '^ *"iconThemes"' ~/.config/vanta/explorer.local.jsonc  # nothing, unless asked for
+ls /usr/share/icons/vantaexplorer/index.theme               # Explorer's own icons are there
 ```
 
 Then ask the person to press `Super + Shift + F` and to switch Omarchy theme once with the

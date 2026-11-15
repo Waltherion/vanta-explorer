@@ -11,10 +11,36 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Used when the settings name no icon theme: the desktop's own, then the common themes that
-/// are installed, then hicolor. The common ones are there for an icon the desktop's theme does
-/// not have, so a theme with gaps never leaves a file without an icon.
-fn fallback_themes() -> Vec<String> {
+/// Explorer's own icons: the folders, file types and drives of Breeze Dark, installed with it as
+/// an icon theme of this name. Its folders are painted in the folder color (`paint_accent`).
+pub const OWN_THEME: &str = "vantaexplorer";
+
+/// The entry in the `iconThemes` setting that stands for the desktop's own icon theme.
+const DESKTOP: &str = "desktop";
+
+/// The themes to look in, from the `iconThemes` setting, and whether one of them is the
+/// desktop's (which can change while Explorer runs). Empty means Explorer's own icons, with the
+/// desktop's theme behind them for anything they do not have. Without its own icons installed
+/// (run from a build tree), that leaves the desktop's.
+fn resolve(setting: &[String]) -> (Vec<String>, bool) {
+    let default = [OWN_THEME.to_string(), DESKTOP.to_string()];
+    let names = if setting.is_empty() { &default[..] } else { setting };
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        let expanded = if name == DESKTOP { desktop_themes() } else { vec![name.clone()] };
+        for t in expanded {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    (out, names.iter().any(|n| n == DESKTOP))
+}
+
+/// The desktop's own theme, then the common themes that are installed, then hicolor. The common
+/// ones are there for an icon the desktop's theme does not have, so a theme with gaps never
+/// leaves a file without an icon.
+fn desktop_themes() -> Vec<String> {
     let mut out = vec![vanta_config::icon_theme::desktop()];
     for t in vanta_config::icon_theme::fallbacks().into_iter().chain(["hicolor".to_string()]) {
         if !out.contains(&t) {
@@ -41,15 +67,18 @@ pub struct IconCache {
     /// Newest mtime seen across the watched icon files.
     theme_stamp: Option<SystemTime>,
     last_check: Instant,
-    /// The settings name no theme, so `themes` follows the desktop's and is asked for again.
+    /// The settings include the desktop's theme, which is asked for again now and then.
     follows_desktop: bool,
     last_desktop_check: Instant,
+    /// The `iconThemes` setting as written, to resolve again when the desktop's theme changes.
+    setting: Vec<String>,
+    /// What the folders in Explorer's own icons are painted, as "#rrggbb".
+    folder_color: String,
 }
 
 impl IconCache {
-    pub fn new(themes: Vec<String>) -> Self {
-        let follows_desktop = themes.is_empty();
-        let themes = if follows_desktop { fallback_themes() } else { themes };
+    pub fn new(setting: Vec<String>, folder_color: [u8; 3]) -> Self {
+        let (themes, follows_desktop) = resolve(&setting);
         Self {
             textures: HashMap::new(),
             mime_db: xdg_mime::SharedMimeInfo::new(),
@@ -59,15 +88,27 @@ impl IconCache {
             last_check: Instant::now(),
             follows_desktop,
             last_desktop_check: Instant::now(),
+            setting,
+            folder_color: hex(folder_color),
+        }
+    }
+
+    /// A new folder color: what was drawn in the old one is stale.
+    pub fn set_folder_color(&mut self, color: [u8; 3]) {
+        let color = hex(color);
+        if color != self.folder_color {
+            self.folder_color = color;
+            self.clear();
         }
     }
 
     /// The settings named other themes: look in those from now on, and forget what was drawn
     /// from the old ones.
-    pub fn set_themes(&mut self, themes: Vec<String>) {
-        self.follows_desktop = themes.is_empty();
+    pub fn set_themes(&mut self, setting: Vec<String>) {
+        let (themes, follows_desktop) = resolve(&setting);
+        self.setting = setting;
+        self.follows_desktop = follows_desktop;
         self.last_desktop_check = Instant::now();
-        let themes = if self.follows_desktop { fallback_themes() } else { themes };
         if themes != self.themes {
             self.themes = themes;
             self.theme_stamp = icon_theme_stamp(&self.themes);
@@ -96,9 +137,9 @@ impl IconCache {
         self.last_check = Instant::now();
         if self.follows_desktop && self.last_desktop_check.elapsed() >= DESKTOP_THEME_CHECK {
             self.last_desktop_check = Instant::now();
-            let themes = fallback_themes();
+            let (themes, _) = resolve(&self.setting);
             if themes != self.themes {
-                log::info!("desktop icon theme is now {}; icon cache dropped", themes[0]);
+                log::info!("icon themes are now {}; icon cache dropped", themes.join(", "));
                 self.themes = themes;
                 self.theme_stamp = icon_theme_stamp(&self.themes);
                 self.textures.clear();
@@ -164,7 +205,7 @@ impl IconCache {
             return cached.as_ref().map(|h| h.id());
         }
 
-        let handle = rasterize(&self.themes, name, px, tint, canonical).map(|img| {
+        let handle = rasterize(&self.themes, name, px, tint, &self.folder_color, canonical).map(|img| {
             ctx.load_texture(
                 format!("icon:{name}:{px}"),
                 img,
@@ -237,16 +278,16 @@ fn icon_theme_stamp(themes: &[String]) -> Option<SystemTime> {
         .max()
 }
 
-fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], canonical: bool) -> Option<egui::ColorImage> {
+fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], folder: &str, canonical: bool) -> Option<egui::ColorImage> {
     let path = lookup(themes, name, px, canonical)?;
     if is_png(&path) {
         return bitmap(themes, name, &path, px);
     }
     let svg = std::fs::read_to_string(&path).ok()?;
+    let svg = if from_own_theme(&path) { paint_own(&svg, &path, folder) } else { svg };
     // usvg does not resolve CSS currentColor, and breeze icons rely on it, so the theme's text
-    // colour is substituted in before the SVG is parsed.
-    let tint_hex = format!("#{:02x}{:02x}{:02x}", tint[0], tint[1], tint[2]);
-    let svg = svg.replace("currentColor", &tint_hex);
+    // color is substituted in before the SVG is parsed.
+    let svg = svg.replace("currentColor", &hex(tint));
 
     let opts = resvg::usvg::Options {
         resources_dir: path.parent().map(|p| p.to_path_buf()),
@@ -299,6 +340,59 @@ fn lookup(themes: &[String], name: &str, px: u32, canonical: bool) -> Option<Pat
         }
     }
     None
+}
+
+fn hex(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// Whether an icon file is one of Explorer's own, wherever the theme is installed.
+fn from_own_theme(path: &Path) -> bool {
+    path.components().collect::<Vec<_>>().windows(2).any(|w| w[0].as_os_str() == "icons" && w[1].as_os_str() == OWN_THEME)
+}
+
+/// The white Breeze Dark draws the symbol on a colored folder in (Documents, Music, ...).
+const ON_FOLDER: &str = "#fcfcfc";
+
+/// Explorer's own icons in the folder color. Breeze marks the colored part of an icon (the body
+/// of a folder) with the class `ColorScheme-Accent` and fills it with `currentColor`, which KDE
+/// replaces with the desktop's accent. The same is done here with `folder`, element by element,
+/// and the symbol on such a folder stays white as Breeze has it. The small one-color folders
+/// (the sidebar's) have no colored part: they are drawn in the folder color as a whole. Anything
+/// else keeps `currentColor`, which becomes the text color, as in any other theme.
+fn paint_own(svg: &str, path: &Path, folder: &str) -> String {
+    if svg.contains("ColorScheme-Accent") {
+        return paint_tags(svg, |tag| {
+            if tag.contains("ColorScheme-Accent") {
+                Some(folder)
+            } else if tag.contains("ColorScheme-Text") {
+                Some(ON_FOLDER)
+            } else {
+                None
+            }
+        });
+    }
+    // The file the name links to: file types such as inode-directory are links into places.
+    let place = std::fs::canonicalize(path).is_ok_and(|p| p.parent().and_then(Path::parent).is_some_and(|c| c.ends_with("places")));
+    if place { svg.replace("currentColor", folder) } else { svg.to_string() }
+}
+
+/// `currentColor` replaced, element by element, with what `pick` gives for the element's tag.
+fn paint_tags<'a>(svg: &str, pick: impl Fn(&str) -> Option<&'a str>) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find('>').map_or(rest.len(), |e| start + e + 1);
+        let tag = &rest[start..end];
+        match pick(tag) {
+            Some(color) => out.push_str(&tag.replace("currentColor", color)),
+            None => out.push_str(tag),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_png(p: &Path) -> bool {
@@ -368,9 +462,9 @@ mod tests {
         std::env::set_var("XDG_DATA_HOME", &data);
 
         let themes = vec!["PngOnly".to_string()];
-        let small = rasterize(&themes, "folder", 24, [255, 255, 255], false).expect("a PNG icon is used");
+        let small = rasterize(&themes, "folder", 24, [255, 255, 255], "#ffffff", false).expect("a PNG icon is used");
         assert_eq!(small.size, [24, 24]);
-        let large = rasterize(&themes, "folder", 128, [255, 255, 255], false).expect("a PNG icon is used");
+        let large = rasterize(&themes, "folder", 128, [255, 255, 255], "#ffffff", false).expect("a PNG icon is used");
         assert_eq!(large.size, [128, 128]);
         let mid = large.pixels[64 * 128 + 64];
         assert_eq!((mid.r(), mid.b()), (0, 255), "the 256 artwork scaled down, not the 48 scaled up");
@@ -384,5 +478,57 @@ mod tests {
         assert_eq!(out.size, [32, 32]);
         assert_eq!(out.pixels[0].a(), 0, "above the picture stays clear");
         assert_eq!(out.pixels[16 * 32 + 16].g(), 255, "the picture sits in the middle");
+    }
+
+    /// No setting: Explorer's own icons first, the desktop's behind them, and the desktop's is
+    /// followed. A list of names is used as written; "desktop" in it stands for the desktop's.
+    #[test]
+    fn the_setting_resolves_to_own_icons_then_the_desktops() {
+        let (themes, follows) = resolve(&[]);
+        assert_eq!(themes[0], OWN_THEME);
+        assert!(themes.len() > 1 && themes.last().unwrap() == "hicolor");
+        assert!(follows);
+
+        let mine = vec!["breeze-dark-walther".to_string(), "hicolor".to_string()];
+        assert_eq!(resolve(&mine), (mine.clone(), false));
+
+        let (themes, follows) = resolve(&["desktop".to_string()]);
+        assert!(!themes.contains(&OWN_THEME.to_string()));
+        assert!(follows);
+    }
+
+    /// A Breeze folder: the body takes the folder color, the symbol on it stays white, and a
+    /// part without a class is left alone.
+    #[test]
+    fn a_folder_body_is_painted_and_its_symbol_stays_white() {
+        let svg = r#"<svg><path style="fill:currentColor" class="ColorScheme-Accent"/><path style="fill-opacity:0.33"/><path class="ColorScheme-Text" style="fill:currentColor"/></svg>"#;
+        let out = paint_own(svg, Path::new("/nowhere/folder.svg"), "#e68e0d");
+        assert_eq!(
+            out,
+            r##"<svg><path style="fill:#e68e0d" class="ColorScheme-Accent"/><path style="fill-opacity:0.33"/><path class="ColorScheme-Text" style="fill:#fcfcfc"/></svg>"##
+        );
+    }
+
+    /// A small one-color folder (the sidebar's) is drawn in the folder color as a whole, also
+    /// when it is reached through a file type that links to it; a file type of its own is not.
+    #[test]
+    fn small_folders_take_the_folder_color_and_file_types_do_not() {
+        let dir = std::env::temp_dir().join(format!("vx-own-{}", std::process::id()));
+        let theme = dir.join("icons").join(OWN_THEME);
+        let svg = r#"<svg><path class="ColorScheme-Text" style="fill:currentColor"/></svg>"#;
+        for rel in ["places/22/folder.svg", "mimetypes/22/text-plain.svg"] {
+            std::fs::create_dir_all(theme.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(theme.join(rel), svg).unwrap();
+        }
+        let link = theme.join("mimetypes/22/inode-directory.svg");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("../../places/22/folder.svg", &link).unwrap();
+
+        assert!(from_own_theme(&link));
+        assert!(!from_own_theme(Path::new("/usr/share/icons/breeze-dark/places/22/folder.svg")));
+        assert!(paint_own(svg, &theme.join("places/22/folder.svg"), "#7aa2f7").contains("#7aa2f7"));
+        assert!(paint_own(svg, &link, "#7aa2f7").contains("#7aa2f7"));
+        assert_eq!(paint_own(svg, &theme.join("mimetypes/22/text-plain.svg"), "#7aa2f7"), svg);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

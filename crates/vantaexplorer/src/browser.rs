@@ -94,13 +94,16 @@ pub struct Theme {
     pub accent: egui::Color32,
     pub text: egui::Color32,
     pub icon_tint: [u8; 3],
+    /// The folders in Explorer's own icons.
+    pub folder: [u8; 3],
 }
 
 impl Theme {
     pub fn from_config(cfg: &Config) -> Self {
         let text = parse32(&cfg.text).unwrap_or(egui::Color32::WHITE);
         let accent = parse32(&cfg.accent).unwrap_or(text);
-        Self { accent, text, icon_tint: [text.r(), text.g(), text.b()] }
+        let folder = parse32(&cfg.folder).unwrap_or(accent);
+        Self { accent, text, icon_tint: [text.r(), text.g(), text.b()], folder: [folder.r(), folder.g(), folder.b()] }
     }
 }
 

@@ -8,7 +8,7 @@ pkgrel=1
 pkgdesc="File manager for Hyprland with true HDR previews"
 arch=(x86_64)
 url="https://github.com/Waltherion/vanta-explorer"
-license=(GPL-3.0-or-later)
+license=(GPL-3.0-or-later LGPL-3.0-or-later)
 # The release profile keeps line tables for backtraces; a debug package is not worth building.
 options=(!debug)
 depends=(
@@ -86,6 +86,11 @@ package() {
     "$pkgdir/usr/share/xdg-desktop-portal/portals/vanta.portal"
   install -Dm644 crates/vantaexplorer/org.freedesktop.impl.portal.desktop.vanta.service \
     "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.vanta.service"
+
+  # Its own icons: the folders, file types and drives of KDE's Breeze (LGPL-3.0-or-later, see
+  # the README there), as an icon theme of their own. -d keeps the links between them.
+  cp -dr --no-preserve=ownership crates/vantaexplorer/assets/icon-theme/vantaexplorer \
+    "$pkgdir/usr/share/icons/"
 
   install -Dm644 README.md docs/config.md docs/install.md docs/omarchy.md \
     -t "$pkgdir/usr/share/doc/vantaexplorer"

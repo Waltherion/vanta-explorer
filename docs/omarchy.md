@@ -37,9 +37,27 @@ omarchy-theme-refresh
   restart.
 - `omarchy-theme-refresh` writes the file once now, for the theme already in use.
 
-The icons are Omarchy's own and follow the theme by themselves, as in Nautilus. Each theme names
-its icon set in its `icons.theme` file, and not always one in the accent color: Matte Black has
-an orange accent and red folders (`Yaru-red`), Tokyo Night a blue accent and magenta folders.
+Explorer comes with its own icons (KDE's Breeze) and paints the folders in the theme's accent, so
+they follow every theme switch with the colors; there is nothing to set up for them. Nautilus
+keeps Omarchy's icons. If `~/.config/vanta/explorer.local.jsonc` has an `"iconThemes"` line from
+an earlier setup, remove it, or Explorer keeps using the themes named there.
+
+For folders in another color than the accent, add `"folder": "{{ accent }}"` (or another color
+name from `colors.toml`, or a fixed `"#rrggbb"`) to the `color` block of
+`~/.config/omarchy/themed/vanta-colors.jsonc.tpl`, then run `omarchy-theme-refresh`.
+
+### Omarchy's icons instead
+
+To have Explorer use the same icons as Nautilus, set this in
+`~/.config/vanta/explorer.local.jsonc`:
+
+```jsonc
+  "iconThemes": ["desktop"],
+```
+
+Those are Omarchy's own (Yaru) and follow the theme too. Each theme names its icon set in its
+`icons.theme` file, and not always one in the accent color: Matte Black has an orange accent and
+red folders (`Yaru-red`), Tokyo Night a blue accent and magenta folders.
 
 To pick another set for one theme, put an `icons.theme` of your own in a folder named after that
 theme under `~/.config/omarchy/themes/`. Omarchy lays that folder over its own theme, so this

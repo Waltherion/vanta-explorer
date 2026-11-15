@@ -33,6 +33,8 @@ pub const DEFAULT_CONFIG: &str = r##"// Vanta Explorer (JSONC: comments and trai
   //   "background": "#d1000000",
   //   "text": "#bd97f7",
   //   "accent": "#bd97f7",
+  //   // The folders in Explorer's own icons. Unset: the accent.
+  //   "folder": "#bd97f7",
   // },
   // Resolved through fontconfig; "sans-serif" asks for the system's own.
   // "font": {
@@ -66,10 +68,12 @@ pub const DEFAULT_LOCAL: &str = r##"// Vanta Explorer, this machine only: kept w
   // "terminal": "",
   // "terminalArgs": [],
 
-  // Icon themes to look in, best first. The last one should stay "hicolor", which every
-  // desktop ships. Empty: the desktop's own theme (GTK, KDE or GNOME setting), then hicolor.
-  // A theme that is repainted in place (some desktops recolour their icons when the look
-  // changes) is picked up live: the icons are re-read when their files change.
+  // Icon themes to look in, best first. Empty: Explorer's own icons (Breeze, with folders in
+  // the accent or color.folder), then the desktop's theme for anything they lack.
+  // "desktop" stands for the desktop's own theme (GTK, KDE or GNOME setting), followed when it
+  // changes: ["desktop"] uses the desktop's icons only. Name a theme yourself and the last one
+  // should stay "hicolor", which every desktop ships. A theme that is repainted in place (some
+  // desktops recolor their icons when the look changes) is picked up live.
   // "iconThemes": [],
 }
 "##;
@@ -116,6 +120,8 @@ pub struct Config {
     pub background: String,
     pub text: String,
     pub accent: String,
+    /// `color.folder`, else the accent: the folders in Explorer's own icons.
+    pub folder: String,
     pub font: Font,
     pub ui: Ui,
 }
@@ -154,6 +160,11 @@ impl Config {
             background: hex(p.color.background),
             text: hex(p.color.text),
             accent: hex(p.color.accent),
+            folder: root
+                .pointer("/color/folder")
+                .and_then(|v| v.as_str())
+                .and_then(Color::parse)
+                .map_or_else(|| hex(p.color.accent), hex),
             font: Font { family: p.font.family, size: p.font.size },
             ui,
         }

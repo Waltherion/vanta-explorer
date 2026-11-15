@@ -118,7 +118,9 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 ### Theming
 
 Colors, font **and folder icons** reload live when the config changes, without restarting
-and without losing your tabs. Icons are re-rasterised from SVG in the theme's text color.
+and without losing your tabs. Explorer comes with its own icons, the folders, file types and
+drives of KDE's Breeze, and paints the folders in the theme's accent (or `color.folder`) as it
+draws them. `"iconThemes": ["desktop"]` uses the desktop's icon theme instead.
 Appearance lives in its own file so a theme switcher can overwrite it wholesale; your
 sidebar and settings are kept apart and survive.
 
@@ -191,4 +193,5 @@ In daily use by its author since August 2026. Packaged for Arch Linux as a PKGBU
 
 ## Licence
 
-GPL-3.0. See [LICENSE](../../LICENSE).
+GPL-3.0. See [LICENSE](../../LICENSE). The icons in `assets/icon-theme` are from KDE's
+[Breeze](https://invent.kde.org/frameworks/breeze-icons), LGPL-3.0-or-later.

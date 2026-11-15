@@ -1,0 +1,8 @@
+These icons are from Breeze, KDE's icon theme (breeze-icons 6.31.0-1.1, the breeze-dark
+variant): https://invent.kde.org/frameworks/breeze-icons
+
+Breeze is licensed under the GNU Lesser General Public License, version 3 or later; the text is
+in COPYING. Only the folders, file types and drives are included, unchanged. Vanta Explorer
+paints the folders in a color of its own when it draws them; the files here are not modified.
+
+Copied by scripts/vendor-breeze-icons.py in the Vanta repository.

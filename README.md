@@ -16,7 +16,8 @@
 - **Split panes and tabs**, a sidebar with drives, places and recent files, undo for moves,
   copies, renames and trashing, archives, drag and drop.
 - **Follows your theme live**: colors, font and folder icons change with the desktop theme,
-  without a restart and without losing your tabs.
+  without a restart and without losing your tabs. It comes with its own icons (from KDE's
+  Breeze), with the folders in your theme's accent color.
 
 The full feature list is in [crates/vantaexplorer/README.md](crates/vantaexplorer/README.md).
 
@@ -52,3 +53,7 @@ Explorer section, and `colors.jsonc` for colors and font). Changes are picked up
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+The icons in `crates/vantaexplorer/assets/icon-theme` are from KDE's
+[Breeze](https://invent.kde.org/frameworks/breeze-icons) and keep its license,
+LGPL-3.0-or-later (see the README and COPYING there).

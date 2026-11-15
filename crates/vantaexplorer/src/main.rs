@@ -147,13 +147,15 @@ fn main() -> Result<()> {
         Some((state, remembered)) => (Some(state), remembered),
         None => (None, chooser::Prefs::default()),
     };
+    let theme = browser::Theme::from_config(&cfg);
+    let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
     let mut app = App {
         probe,
         state: None,
-        theme: browser::Theme::from_config(&cfg),
+        theme,
         cfg,
         watcher: config::Watcher::new(),
-        icons: icons::IconCache::new(prefs.icon_themes.clone()),
+        icons,
         settings: prefs,
         ws,
         drives: drives::Drives::new(),
@@ -598,6 +600,7 @@ impl ApplicationHandler for App {
         if let Some((cfg, s)) = self.watcher.poll() {
             self.theme = browser::Theme::from_config(&cfg);
             self.icons.clear(); // repainted per-theme SVGs get re-read
+            self.icons.set_folder_color(self.theme.folder);
             apply_font(&gfx.egui_ctx, &cfg, &mut self.font_family);
             self.cfg = cfg;
             // A different icon theme means everything drawn from the old one is stale.
