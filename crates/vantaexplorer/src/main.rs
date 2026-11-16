@@ -1677,15 +1677,23 @@ fn app_ui(
         root.ctx().memory_mut(|m| m.data.remove_temp::<browser::DragPayload>(egui::Id::new("dnd")));
     }
     
+    // Where the drop would land, named by whatever is under the pointer this frame.
+    let target = root.ctx().data_mut(|d| d.remove_temp::<std::path::PathBuf>(egui::Id::new(browser::DROP_TARGET)));
     if let Some(payload) = root.ctx().memory(|m| m.data.get_temp::<browser::DragPayload>(egui::Id::new("dnd"))) {
         if let Some(pos) = root.ctx().pointer_interact_pos() {
             let copy = root.input(|i| i.modifiers.ctrl);
+            let n = payload.source_paths.len();
+            let items = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
+            let to = target
+                .as_ref()
+                .map(|t| format!(" to {}", t.file_name().map_or_else(|| t.to_string_lossy().into_owned(), |f| f.to_string_lossy().into_owned())))
+                .unwrap_or_default();
             let text = if payload.secondary {
-                format!("☰ Options for {} item(s)", payload.source_paths.len())
+                format!("☰ Options for {items}{to}")
             } else if copy {
-                format!("➕ Copy {} item(s)", payload.source_paths.len())
+                format!("➕ Copy {items}{to}")
             } else {
-                format!("↗ Move {} item(s)", payload.source_paths.len())
+                format!("↗ Move {items}{to}")
             };
             
             egui::Area::new(egui::Id::new("drag_tooltip"))

@@ -1077,6 +1077,11 @@ fn copy_file(
         return Ok(());
     }
 
+    if let Some(what) = special_kind(&meta.file_type()) {
+        let name = src.file_name().unwrap_or(src.as_os_str()).to_string_lossy();
+        return Err(format!("{name} is {what}, not a file with contents, so it cannot be copied"));
+    }
+
     let mut r = std::fs::File::open(src).map_err(|e| e.to_string())?;
     let mut w = std::fs::File::create(dst).map_err(|e| e.to_string())?;
     let mut done = 0u64;
@@ -1112,6 +1117,22 @@ fn copy_file(
     // Permissions carry over; timestamps deliberately do not (a copy is a new file).
     let _ = std::fs::set_permissions(dst, meta.permissions());
     Ok(())
+}
+
+/// What a directory entry is when it holds no data: a socket or pipe a running program talks
+/// through, or a device. Opening one fails (a socket), waits forever for a writer (a pipe), or
+/// reads the device itself, so none of them is copied.
+fn special_kind(t: &std::fs::FileType) -> Option<&'static str> {
+    use std::os::unix::fs::FileTypeExt;
+    if t.is_socket() {
+        Some("a socket, where a running program takes connections")
+    } else if t.is_fifo() {
+        Some("a pipe, where running programs pass data")
+    } else if t.is_char_device() || t.is_block_device() {
+        Some("a device")
+    } else {
+        None
+    }
 }
 
 enum InKernel {

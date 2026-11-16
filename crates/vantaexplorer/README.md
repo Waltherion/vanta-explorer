@@ -88,7 +88,10 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
   reverse, so it is the one thing that asks first.
 - **Drag and drop** between panes, between Explorer windows, and to and from other
   applications over `wl_data_device` (`text/uri-list` and plain text). A drag moves, Ctrl+drag
-  copies, and a right-button drag asks which, also from one window to another.
+  copies, and a right-button drag asks which, also from one window to another. In the list,
+  a drop on a folder's name goes into it and a drop in the Size or Modified column goes into
+  the folder shown (the pane is outlined to say so); every folder in the path bar takes drops
+  too. The note by the pointer names where the drop will land.
 - **Archives**: extract here, extract to a folder, or compress a selection to tar.zst, tar.gz,
   zip or 7z, through libarchive. Extraction never overwrites, and undo trashes exactly what
   the archive added.

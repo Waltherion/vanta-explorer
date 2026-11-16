@@ -85,15 +85,18 @@ pub fn show(ctx: &egui::Context, theme: &crate::browser::Theme, date_format: &st
     }
     let resp = egui::Modal::new(egui::Id::new("help")).show(ctx, |ui| {
         ui.set_max_width(560.0);
+        // The window is drawn in egui's own (dark) style, like every menu, whatever the theme;
+        // the theme's text color would be dark on it with a light theme.
+        let text = ui.visuals().strong_text_color();
         ui.heading(egui::RichText::new("Vanta Explorer").color(theme.accent));
         let mut version = format!("{} (commit {COMMIT}", env!("CARGO_PKG_VERSION"));
         if let Some(t) = when(COMMIT_TIME, date_format) {
             version.push_str(&format!(", from {t}"));
         }
         version.push(')');
-        ui.label(egui::RichText::new(version).color(theme.text.gamma_multiply(0.7)));
+        ui.label(egui::RichText::new(version).color(text.gamma_multiply(0.7)));
         if let Some(t) = when(BUILT, date_format) {
-            ui.label(egui::RichText::new(format!("Built and installed {t}")).color(theme.text.gamma_multiply(0.7)));
+            ui.label(egui::RichText::new(format!("Built and installed {t}")).color(text.gamma_multiply(0.7)));
         }
         ui.add_space(8.0);
         egui::ScrollArea::vertical().max_height(ctx.content_rect().height() * 0.7).show(ui, |ui| {
@@ -102,15 +105,15 @@ pub fn show(ctx: &egui::Context, theme: &crate::browser::Theme, date_format: &st
                 ui.label(egui::RichText::new(*title).color(theme.accent).strong());
                 egui::Grid::new(title).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                     for (key, what) in *keys {
-                        ui.label(egui::RichText::new(*key).color(theme.text));
-                        ui.label(egui::RichText::new(*what).color(theme.text.gamma_multiply(0.75)));
+                        ui.label(egui::RichText::new(*key).color(text));
+                        ui.label(egui::RichText::new(*what).color(text.gamma_multiply(0.75)));
                         ui.end_row();
                     }
                 });
             }
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("F1 or Escape closes this.").color(theme.text.gamma_multiply(0.5)));
+        ui.label(egui::RichText::new("F1 or Escape closes this.").color(text.gamma_multiply(0.5)));
     });
     if resp.should_close() {
         ctx.data_mut(|d| d.insert_temp(egui::Id::new(OPEN), false));

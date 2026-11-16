@@ -51,6 +51,31 @@ pub struct DragPayload {
     pub secondary: bool,
 }
 
+/// Whether a drag (between panes, or from another window) is in progress.
+fn dragging(ui: &egui::Ui) -> bool {
+    ui.ctx().memory(|m| m.data.get_temp::<DragPayload>(egui::Id::new("dnd")).is_some())
+}
+
+/// The folder a drop would land in right now, for the note that follows the pointer. Set by
+/// whatever is under the pointer this frame; read and cleared by the overlay.
+pub const DROP_TARGET: &str = "dnd-target";
+
+fn mark_drop_target(ui: &egui::Ui, dest: &std::path::Path) {
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(DROP_TARGET), dest.to_path_buf()));
+}
+
+/// The drag ends here: into `dest`, or, from the right button, a menu asking Copy or Move.
+fn drop_into(ui: &egui::Ui, view: &View, dest: &std::path::Path) {
+    if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
+        if payload.secondary {
+            view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: dest.to_path_buf() });
+        } else {
+            let copy = ui.input(|i| i.modifiers.ctrl);
+            view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: dest.to_path_buf(), copy });
+        }
+    }
+}
+
 /// Read-only presentation context handed down the pane tree.
 pub struct View<'a> {
     pub theme: &'a Theme,
@@ -601,8 +626,18 @@ fn show_pane(
                                 theme.text.gamma_multiply(0.45),
                             );
                         }
-                        if ui.selectable_label(false, label).clicked() {
+                        let seg = ui.selectable_label(false, label);
+                        if seg.clicked() {
                             navigate = Some(comp.clone());
+                        }
+                        // Each folder in the path is a drop target too: the one shown here, or
+                        // any above it, also when the pane is full of subfolders.
+                        if dragging(ui) && seg.contains_pointer() {
+                            ui.painter().rect_filled(seg.rect, 3.0, theme.accent.gamma_multiply(0.5));
+                            mark_drop_target(ui, comp);
+                            if ui.input(|i| i.pointer.any_released()) {
+                                drop_into(ui, view, comp);
+                            }
                         }
                     }
                     // Click in the empty rest of the row -> editable path field.
@@ -1923,6 +1958,9 @@ fn show_rows_view(
     );
     // Set by a right-click in a row's Size or Modified column, which opens the folder menu.
     let mut folder_menu_from_row = false;
+    // A drag is over a row's Size or Modified column: the drop goes into this folder, which is
+    // outlined to say so.
+    let mut drop_here = false;
 
     let ppp = ui.ctx().pixels_per_point();
     let mut area = egui::ScrollArea::vertical()
@@ -2087,21 +2125,28 @@ fn show_rows_view(
                     ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("dnd"), DragPayload { source_paths: paths, secondary }));
                 }
 
-                let is_drag = ui.ctx().memory(|m| m.data.get_temp::<DragPayload>(egui::Id::new("dnd")).is_some());
-                if is_drag && hovered && entry_is_dir {
-                    ui.painter().rect_filled(rect, 2.0, theme.accent.gamma_multiply(0.5));
-                }
-                if hovered && ui.input(|i| i.pointer.any_released())
-                    && entry_is_dir {
-                        if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
-                            if payload.secondary {
-                                view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: entry_path.clone() });
-                            } else {
-                                let copy = ui.input(|i| i.modifiers.ctrl);
-                                view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: entry_path.clone(), copy });
-                            }
+                // A drop on a folder's NAME goes into it; in the Size and Modified columns it
+                // goes into the folder this pane shows, the same split as for right-clicks. A
+                // list full of folders would otherwise leave nowhere to drop "here".
+                if dragging(ui) && hovered {
+                    let on_name = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| p.x < split_x);
+                    let into_row = entry_is_dir && on_name;
+                    // On a file's name nothing happens, as before.
+                    let into_here = !on_name;
+                    if into_row {
+                        ui.painter().rect_filled(rect, 2.0, theme.accent.gamma_multiply(0.5));
+                        mark_drop_target(ui, &entry_path);
+                    } else if into_here {
+                        drop_here = true;
+                    }
+                    if ui.input(|i| i.pointer.any_released()) {
+                        if into_row {
+                            drop_into(ui, view, &entry_path);
+                        } else if into_here {
+                            drop_into(ui, view, tab.path());
                         }
                     }
+                }
 
                 // --- interactions ---
                 // A right-click in the Size or Modified column opens the FOLDER menu. In a
@@ -2227,17 +2272,15 @@ fn show_rows_view(
         }
     }
 
+    // The folder shown here is the target: outlined, so it is never a guess whether the drop
+    // goes into it or into the folder under the pointer.
+    if drop_here || (dragging(ui) && bg.hovered()) {
+        mark_drop_target(ui, tab.path());
+        ui.painter().rect_stroke(bg.rect.shrink(1.0), 3.0, egui::Stroke::new(2.0, theme.accent), egui::StrokeKind::Inside);
+    }
     if bg.hovered() {
         if ui.input(|i| i.pointer.any_released()) {
-            if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
-                // A right-button drag asks, on empty space as on a folder.
-                if payload.secondary {
-                    view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: tab.path().to_path_buf() });
-                } else {
-                    let copy = ui.input(|i| i.modifiers.ctrl);
-                    view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: tab.path().to_path_buf(), copy });
-                }
-            }
+            drop_into(ui, view, tab.path());
         }
         
         let dropped = if view.chooser.is_some() { Vec::new() } else { ui.input(|i| i.raw.dropped_files.clone()) };
@@ -2573,22 +2616,14 @@ fn show_grid(
                     ui.ctx().memory_mut(|m| m.data.insert_temp(egui::Id::new("dnd"), DragPayload { source_paths: paths, secondary }));
                         }
 
-                        let is_drag = ui.ctx().memory(|m| m.data.get_temp::<DragPayload>(egui::Id::new("dnd")).is_some());
                         let hovered = resp.contains_pointer(); // see the list view for why
-                        if is_drag && hovered && entry_is_dir {
+                        if dragging(ui) && hovered && entry_is_dir {
                             ui.painter().rect_filled(rect, 3.0, theme.accent.gamma_multiply(0.5));
-                        }
-                        if hovered && ui.input(|i| i.pointer.any_released())
-                            && entry_is_dir {
-                                if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
-                                    if payload.secondary {
-                                        view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: entry_path.clone() });
-                                    } else {
-                                        let copy = ui.input(|i| i.modifiers.ctrl);
-                                        view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: entry_path.clone(), copy });
-                                    }
-                                }
+                            mark_drop_target(ui, &entry_path);
+                            if ui.input(|i| i.pointer.any_released()) {
+                                drop_into(ui, view, &entry_path);
                             }
+                        }
 
                         if resp.secondary_clicked() {
                             fix_selection_for_context(tab, &entry_name);
@@ -2690,17 +2725,13 @@ fn show_grid(
         }
     }
 
+    if dragging(ui) && bg.hovered() {
+        mark_drop_target(ui, tab.path());
+        ui.painter().rect_stroke(bg.rect.shrink(1.0), 3.0, egui::Stroke::new(2.0, theme.accent), egui::StrokeKind::Inside);
+    }
     if bg.hovered() {
         if ui.input(|i| i.pointer.any_released()) {
-            if let Some(payload) = ui.ctx().memory_mut(|m| m.data.remove_temp::<DragPayload>(egui::Id::new("dnd"))) {
-                // A right-button drag asks, on empty space as on a folder.
-                if payload.secondary {
-                    view.actions.borrow_mut().push(Action::OpenDropMenu { sources: payload.source_paths, dest: tab.path().to_path_buf() });
-                } else {
-                    let copy = ui.input(|i| i.modifiers.ctrl);
-                    view.actions.borrow_mut().push(Action::Drop { sources: payload.source_paths, dest: tab.path().to_path_buf(), copy });
-                }
-            }
+            drop_into(ui, view, tab.path());
         }
         
         let dropped = if view.chooser.is_some() { Vec::new() } else { ui.input(|i| i.raw.dropped_files.clone()) };
