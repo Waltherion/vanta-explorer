@@ -75,6 +75,11 @@ pub const DEFAULT_LOCAL: &str = r##"// Vanta Explorer, this machine only: kept w
   // should stay "hicolor", which every desktop ships. A theme that is repainted in place (some
   // desktops recolor their icons when the look changes) is picked up live.
   // "iconThemes": [],
+
+  // A copy keeps the original's modification date, as cp -a, Dolphin and Nautilus do, so
+  // sorting by date still says when a photo was taken. false: a copy is dated when it was
+  // made. A move always keeps the date.
+  // "keepDates": true,
 }
 "##;
 

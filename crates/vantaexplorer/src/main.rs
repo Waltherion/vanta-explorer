@@ -163,6 +163,7 @@ fn main() -> Result<()> {
     }
     let theme = browser::Theme::from_config(&cfg);
     let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
+    fileops::set_keep_dates(prefs.keep_dates);
     let mut app = App {
         probe,
         state: None,
@@ -658,6 +659,7 @@ impl ApplicationHandler for App {
             self.cfg = cfg;
             // A different icon theme means everything drawn from the old one is stale.
             self.icons.set_themes(s.icon_themes.clone());
+            fileops::set_keep_dates(s.keep_dates);
             self.settings = s;
             dirty = true;
         }

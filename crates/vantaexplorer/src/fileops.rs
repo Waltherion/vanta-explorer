@@ -1178,6 +1178,8 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
             merge,
             // A merged copy is undone item by item: what it added, never the folder it went into.
             record_created: req.kind == OpKind::Copy && merge,
+            keep_dates: req.kind == OpKind::Move || KEEP_DATES.load(Ordering::Relaxed),
+            src_base: src_root.parent().unwrap_or(Path::new("/")),
             progress: &mut progress,
         };
         let result = job.run(&files[file_range.clone()], &dirs[dir_range.clone()], &dest_of);
@@ -1305,6 +1307,10 @@ struct CopyRoot<'a> {
     merge: bool,
     /// Put what this adds in `done.created` (the topmost new folder or the file), for undo.
     record_created: bool,
+    /// The copies get the originals' modification times (always for a move).
+    keep_dates: bool,
+    /// The folder the source root is in: where `dirs` are, relative to.
+    src_base: &'a Path,
     progress: &'a mut (u64, u64),
 }
 
@@ -1378,6 +1384,9 @@ impl CopyRoot<'_> {
                 });
                 match result {
                     Ok(()) => {
+                        if self.keep_dates {
+                            keep_times(src, &target);
+                        }
                         if self.record_created && !new_dirs.iter().any(|d| target.starts_with(d)) {
                             self.done.created.push(target.clone());
                         }
@@ -1402,7 +1411,26 @@ impl CopyRoot<'_> {
             self.progress.0 += size;
             self.progress.1 += 1;
         }
+        // A folder's time changes as things are written into it, so it is set last, innermost
+        // first; and only on folders this made, never on one a merge went into.
+        if self.keep_dates {
+            for rel in dirs.iter().rev() {
+                let to = dest_of(rel);
+                if new_dirs.contains(&to) {
+                    keep_times(&self.src_base.join(rel), &to);
+                }
+            }
+        }
         Ok((arrived, new_dirs))
+    }
+}
+
+/// `to` gets the modification and access times of `from`; a link is left as it is.
+fn keep_times(from: &Path, to: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(from) {
+        if !meta.file_type().is_symlink() {
+            copy_times(&meta, to);
+        }
     }
 }
 
@@ -1649,6 +1677,10 @@ fn move_path(from: &Path, to: &Path, cancel: &AtomicBool) -> Result<(), String> 
         }
         for (src, rel, _) in &files {
             copy_file(src, &dest_of(rel), cancel, &mut |_| {})?;
+            keep_times(src, &dest_of(rel));
+        }
+        for rel in dirs.iter().rev() {
+            keep_times(&base.join(rel), &dest_of(rel));
         }
         Ok(())
     })();
@@ -1693,6 +1725,24 @@ fn scan(
         files.push((path.to_path_buf(), rel, meta.len()));
     }
     Ok(())
+}
+
+static KEEP_DATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a copy keeps the original's modification time (the `keepDates` setting). A move
+/// keeps it whatever this says: it is the same file, somewhere else.
+pub fn set_keep_dates(keep: bool) {
+    KEEP_DATES.store(keep, Ordering::Relaxed);
+}
+
+/// Give `dst` the times of `src` (modification and access), not following links.
+fn copy_times(meta: &std::fs::Metadata, dst: &Path) {
+    let times = std::fs::FileTimes::new()
+        .set_modified(meta.modified().unwrap_or_else(|_| std::time::SystemTime::now()))
+        .set_accessed(meta.accessed().unwrap_or_else(|_| std::time::SystemTime::now()));
+    if let Ok(f) = std::fs::File::options().write(true).open(dst).or_else(|_| std::fs::File::open(dst)) {
+        let _ = f.set_times(times);
+    }
 }
 
 /// Chunked copy: byte-accurate progress and prompt cancellation. Symlinks are recreated as
@@ -1749,7 +1799,7 @@ fn copy_file(
         done += n as u64;
         progress(done);
     }
-    // Permissions carry over; timestamps deliberately do not (a copy is a new file).
+    // Permissions carry over; the times are the caller's to decide (see KEEP_DATES).
     let _ = std::fs::set_permissions(dst, meta.permissions());
     Ok(())
 }
@@ -2167,6 +2217,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(names, ["Test.txt"]);
+    }
+
+    /// A copy keeps the original's dates unless told not to, and a move between drives always
+    /// does, folders included.
+    #[test]
+    fn copies_keep_the_dates_unless_told_not_to() {
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        let date = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        for (kind, keep, other_fs) in [(OpKind::Copy, true, false), (OpKind::Copy, false, false), (OpKind::Move, false, true)] {
+            let (src, near) = setup(&format!("dates-{kind:?}-{keep}"));
+            let dst = if other_fs { PathBuf::from("/dev/shm/vantaexplorer-dates") } else { near };
+            let _ = std::fs::remove_dir_all(&dst);
+            std::fs::create_dir_all(&dst).unwrap();
+            for p in [src.join("sub/n.txt"), src.join("a.txt"), src.join("sub")] {
+                std::fs::File::open(&p).unwrap().set_modified(old).unwrap();
+            }
+            set_keep_dates(keep);
+            run_and_drain(Request::new(kind, vec![src.clone()], Some(dst.clone())));
+            set_keep_dates(true);
+            let kept = kind == OpKind::Move || keep;
+            for p in ["src/a.txt", "src/sub/n.txt", "src/sub"] {
+                assert_eq!(date(&dst.join(p)) == old, kept, "{kind:?} keep={keep}: {p}");
+            }
+            let _ = std::fs::remove_dir_all(&dst);
+        }
     }
 
     /// Same harness as run_and_drain but hands back the undo record.
