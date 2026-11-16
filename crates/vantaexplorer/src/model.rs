@@ -247,7 +247,13 @@ pub fn spawn_listing(path: PathBuf, generation: u64, search: Option<String>) -> 
                         return;
                     }
                 };
-                for dent in rd.flatten() {
+                // The trash view: the home trash, and after it the trash of every other drive.
+                let others: Vec<std::fs::ReadDir> = if crate::fileops::in_trash(&path) {
+                    crate::fileops::trash_folders().iter().skip(1).filter_map(|t| std::fs::read_dir(t.join("files")).ok()).collect()
+                } else {
+                    Vec::new()
+                };
+                for dent in rd.flatten().chain(others.into_iter().flat_map(|r| r.flatten())) {
                 let name = dent.file_name().to_string_lossy().into_owned();
                 let hidden = name.starts_with('.');
                 let ft = dent.file_type().ok();

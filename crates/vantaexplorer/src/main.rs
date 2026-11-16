@@ -148,6 +148,9 @@ fn main() -> Result<()> {
         Some((state, remembered)) => (Some(state), remembered),
         None => (None, chooser::Prefs::default()),
     };
+    if chooser.is_none() {
+        thumbs::clean_cache();
+    }
     let theme = browser::Theme::from_config(&cfg);
     let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
     let mut app = App {
@@ -240,9 +243,11 @@ enum Confirm {
 struct OpsState {
     ops: fileops::FileOps,
     active: Vec<OpUi>,
+    /// (op, name, both are folders, answer)
     pending_conflict: Option<(
         u64,
         String,
+        bool,
         std::sync::mpsc::Sender<fileops::ConflictAnswer>,
     )>,
     /// An item of a copy or move failed: (op, item, error, answer).
@@ -689,8 +694,8 @@ impl ApplicationHandler for App {
                         op.current = current;
                     }
                 }
-                fileops::Event::Conflict { id, name, reply } => {
-                    self.ops_state.pending_conflict = Some((id, name, reply));
+                fileops::Event::Conflict { id, name, folders, reply } => {
+                    self.ops_state.pending_conflict = Some((id, name, folders, reply));
                 }
                 fileops::Event::Error { id, name, error, reply } => {
                     self.ops_state.pending_error = Some((id, name, error, reply));
@@ -1584,6 +1589,10 @@ fn app_ui(
         // Per the spec, the sidebar navigates the ACTIVE pane.
         ws.active_pane().tab().navigate(path);
     }
+    if sidebar.take_empty_trash_request() {
+        // The same question the trash view's own Empty Trash asks.
+        app_ops.pending_delete = Some((Confirm::EmptyTrash, false));
+    }
     if let Some(device) = sidebar.take_eject_request() {
         app_ops.toast = Some((format!("Ejecting {device}..."), std::time::Instant::now()));
         drives.eject(device);
@@ -2079,7 +2088,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 }
                 Confirm::EmptyTrash => (
                     "Empty the trash?",
-                    "Permanently delete everything in the trash?".to_string(),
+                    "Permanently delete everything in the trash, on every drive?".to_string(),
                     "Empty",
                 ),
             };
@@ -2137,8 +2146,8 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
 
     // appearing until one of the buttons is pressed.
     let mut answer: Option<fileops::ConflictAnswer> = None;
-    if let Some((_, name, _)) = &app_ops.pending_conflict {
-        let name = name.clone();
+    if let Some((_, name, folders, _)) = &app_ops.pending_conflict {
+        let (name, folders) = (name.clone(), *folders);
         egui::Window::new("File exists")
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
@@ -2147,7 +2156,19 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 ui.label(format!("'{name}' already exists in the destination."));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Overwrite").clicked() {
+                    if folders
+                        && ui
+                            .button("Merge")
+                            .on_hover_text("Put the contents in the folder that is there; a file in both is asked about")
+                            .clicked()
+                    {
+                        answer = Some(fileops::ConflictAnswer::Merge);
+                    }
+                    if ui
+                        .button(if folders { "Replace" } else { "Overwrite" })
+                        .on_hover_text("What is there goes to the trash first")
+                        .clicked()
+                    {
                         answer = Some(fileops::ConflictAnswer::Overwrite);
                     }
                     if ui.button("Skip").clicked() {
@@ -2161,7 +2182,10 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                         answer = Some(fileops::ConflictAnswer::Rename);
                     }
                     ui.separator();
-                    if ui.button("Overwrite all").clicked() {
+                    if folders && ui.button("Merge all").on_hover_text("Every folder that is there already").clicked() {
+                        answer = Some(fileops::ConflictAnswer::MergeAll);
+                    }
+                    if ui.button(if folders { "Replace all" } else { "Overwrite all" }).clicked() {
                         answer = Some(fileops::ConflictAnswer::OverwriteAll);
                     }
                     if ui.button("Skip all").clicked() {
@@ -2181,7 +2205,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             });
     }
     if let Some(a) = answer {
-        if let Some((_, _, reply)) = app_ops.pending_conflict.take() {
+        if let Some((.., reply)) = app_ops.pending_conflict.take() {
             let _ = reply.send(a);
         }
     }

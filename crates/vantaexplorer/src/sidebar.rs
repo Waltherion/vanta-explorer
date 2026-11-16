@@ -146,6 +146,8 @@ pub struct Sidebar {
     /// Set by an eject click during show(); main.rs takes it after, because show() only
     /// has a shared borrow of Drives and the eject needs a mutable one.
     pending_eject: Option<String>,
+    /// "Empty Trash" was chosen on the Trash entry this frame.
+    pending_empty_trash: bool,
     /// Index of the custom section whose title is being renamed, plus the edit buffer.
     renaming: Option<(usize, String)>,
     /// The remote and special-folder rows, read from /proc/self/mountinfo, user-dirs.dirs and
@@ -164,6 +166,7 @@ impl Sidebar {
     pub fn new() -> Self {
         Self {
             pending_eject: None,
+            pending_empty_trash: false,
             config: SidebarConfig::load(),
             renaming: None,
             rows_cache: None,
@@ -195,6 +198,11 @@ impl Sidebar {
     /// The device an eject button was clicked for this frame, if any.
     pub fn take_eject_request(&mut self) -> Option<String> {
         self.pending_eject.take()
+    }
+
+    /// Whether "Empty Trash" was chosen on the Trash entry this frame.
+    pub fn take_empty_trash_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_empty_trash)
     }
 
     /// The sections a folder can be added to from the file view's menu: Special Folders and the
@@ -404,7 +412,17 @@ impl Sidebar {
                             continue;
                         }
                         let shown = || rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
+                        let trash = self.persist && crate::fileops::in_trash(&row.path);
+                        let mut empty_trash = false;
                         resp.context_menu(|ui| {
+                            // What the Trash entry is for, above the arranging every entry has.
+                            if trash {
+                                if ui.button(egui::RichText::new("Empty Trash").color(egui::Color32::LIGHT_RED)).clicked() {
+                                    empty_trash = true;
+                                    ui.close();
+                                }
+                                ui.separator();
+                            }
                             if ui.add_enabled(ri > 0, egui::Button::new("Move up")).clicked() {
                                 path_move = Some((i, shown(), ri, -1));
                                 ui.close();
@@ -423,6 +441,7 @@ impl Sidebar {
                                 ui.close();
                             }
                         });
+                        self.pending_empty_trash |= empty_trash;
                     }
                     if custom {
                         ui.horizontal(|ui| {
@@ -948,6 +967,7 @@ mod tests {
         let mut sb = Sidebar {
             config: SidebarConfig { sections: vec![special(&["/h", "/h/Music", "/h/Videos"])] },
             pending_eject: None,
+            pending_empty_trash: false,
             renaming: None,
             rows_cache: None,
             file_mtime: None,

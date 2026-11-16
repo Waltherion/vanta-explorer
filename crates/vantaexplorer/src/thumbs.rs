@@ -265,6 +265,7 @@ fn load_or_make(key: &str, path: &Path) -> Option<egui::ColorImage> {
 
     if let Some(f) = &file {
         if let Ok(img) = image::open(f) {
+            mark_used(f);
             return Some(to_color_image(&img.to_rgba8()));
         }
     }
@@ -281,10 +282,7 @@ fn load_or_make(key: &str, path: &Path) -> Option<egui::ColorImage> {
         let buf: image::RgbaImage =
             image::ImageBuffer::from_raw(img.width() as u32, img.height() as u32, rgba)?;
         if let Some(f) = &file {
-            if let Some(parent) = f.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = buf.save(f);
+            store(f, &buf);
         }
         return Some(to_color_image(&buf));
     }
@@ -294,12 +292,81 @@ fn load_or_make(key: &str, path: &Path) -> Option<egui::ColorImage> {
     let buf: image::RgbaImage = image::ImageBuffer::from_raw(hdr.w, hdr.h, rgba8)?;
 
     if let Some(f) = &file {
-        if let Some(parent) = f.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = buf.save(f);
+        store(f, &buf);
     }
     Some(to_color_image(&buf))
+}
+
+/// Written beside its final name and renamed over it, so another window reading the same
+/// thumbnail never sees half a file.
+fn store(f: &Path, buf: &image::RgbaImage) {
+    if let Some(parent) = f.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = f.with_extension(format!("{}.tmp", std::process::id()));
+    if buf.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {
+        let _ = std::fs::rename(&tmp, f);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// A thumbnail's modification time is when it was last shown, at day resolution: what the
+/// clean-up goes by. Reading does not move atime reliably (noatime), so it is set here.
+fn mark_used(f: &Path) {
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+    let stale = std::fs::metadata(f).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().unwrap_or_default() > DAY);
+    if stale {
+        if let Ok(file) = std::fs::File::options().write(true).open(f) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+    }
+}
+
+/// Thumbnails not shown for this long are deleted.
+const UNUSED_FOR: std::time::Duration = std::time::Duration::from_secs(90 * 24 * 3600);
+/// And beyond this much, the least recently shown go first.
+const CACHE_LIMIT: u64 = 1 << 30;
+
+/// The disk cache's clean-up, once at start on a thread of its own: thumbnails of files long
+/// gone or changed (their key has moved on) would otherwise stay forever.
+pub fn clean_cache() {
+    let Some(dir) = cache_dir() else { return };
+    let _ = std::thread::Builder::new().name("vx-thumb-clean".into()).spawn(move || prune(&dir, UNUSED_FOR, CACHE_LIMIT));
+}
+
+fn prune(dir: &Path, unused_for: std::time::Duration, limit: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut kept: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = 0u64;
+    for entry in rd.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(used) = meta.modified() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let age = used.elapsed().unwrap_or_default();
+        // A write that never got renamed into place (the program died mid-write).
+        let leftover = path.extension().is_some_and(|e| e == "tmp") && age.as_secs() > 3600;
+        if leftover || age > unused_for {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        total += meta.len();
+        kept.push((used, meta.len(), path));
+    }
+    if total > limit {
+        kept.sort();
+        for (_, len, path) in kept {
+            if total <= limit {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= len;
+            }
+        }
+    }
 }
 
 /// fp16 linear (203 nits) -> 8-bit sRGB, via the same tone map as the shader's SDR branch.
@@ -328,4 +395,28 @@ fn to_color_image(img: &image::RgbaImage) -> egui::ColorImage {
         [img.width() as usize, img.height() as usize],
         img.as_raw(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cache_loses_old_thumbnails_and_then_the_least_recently_shown() {
+        let dir = std::env::temp_dir().join("vantaexplorer-thumb-prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let now = std::time::SystemTime::now();
+        for (name, age_days) in [("old.png", 100), ("a.png", 3), ("b.png", 2), ("c.png", 1)] {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_len(100).unwrap();
+            f.set_modified(now - day * age_days).unwrap();
+        }
+        prune(&dir, day * 90, 250);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["b.png", "c.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

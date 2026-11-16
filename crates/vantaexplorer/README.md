@@ -79,7 +79,8 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 ### Working with files
 
 - Copy, cut, paste, trash, rename and new folder, with progress, cancel and conflict prompts.
-  Copied and cut files go on the system clipboard the way Nautilus and Dolphin put them
+  A folder that lands on one of the same name can be merged into it, and only what the
+  merge added is undone. Copied and cut files go on the system clipboard the way Nautilus and Dolphin put them
   there, so they paste between Explorer windows and to and from those file managers. Cut
   files are drawn faded until they are pasted.
 - **Undo and redo**, `Ctrl+Z` / `Ctrl+Y`, for moves, copies, renames and trashing. Undo of a
@@ -107,7 +108,7 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
   removable USB media only**: it requires the device to sit under a USB controller, be
   hot-pluggable, and be absent from `/etc/fstab`, so an internal drive never gets one.
 - **Remote** for FUSE and cloud mounts, **Special Folders** from XDG, **Recent Files**
-  opened through Vanta Explorer as a virtual folder, and your own **Places** sections.
+  opened through Vanta Explorer as a virtual folder, and the **Trash**, with what was trashed on every drive (each has a trash of its own) in one place, and your own **Places** sections.
 - **Right-click to arrange it**: move a section or an entry up or down, rename or remove a
   section of your own, and remove any entry, special folders included. Right-click a folder in
   the file view and choose **Add to sidebar** to put it in Special Folders or one of your own

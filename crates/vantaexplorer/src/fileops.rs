@@ -112,6 +112,9 @@ pub enum ConflictAnswer {
     OverwriteAll,
     SkipAll,
     RenameAll,
+    /// Both are folders: put the contents of the one into the other.
+    Merge,
+    MergeAll,
     Cancel,
 }
 
@@ -132,6 +135,8 @@ pub enum Event {
     Conflict {
         id: u64,
         name: String,
+        /// Both are folders, so they can be merged.
+        folders: bool,
         reply: Sender<ConflictAnswer>,
     },
     /// One item failed; the worker is blocked until the reply says what to do about it.
@@ -419,9 +424,11 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                 total_bytes: 0,
                 total_items: 0,
             });
-            trash::os_limited::list()
+            let r = trash::os_limited::list()
                 .and_then(trash::os_limited::purge_all)
-                .map_err(|e| format!("{e:?}"))
+                .map_err(|e| format!("{e:?}"));
+            remove_orphaned_info(&trash_folders());
+            r
         }
     };
 
@@ -474,25 +481,93 @@ pub fn trash_item_file(item: &trash::TrashItem) -> Option<PathBuf> {
 
 /// The trash entry whose payload is at `path`, if `path` is inside a trash folder.
 pub fn trash_item_at(path: &Path) -> Option<trash::TrashItem> {
-    // Cheap shape check before listing the trash: <trash>/files/<name> next to <trash>/info.
+    // Cheap shape check: <trash>/files/<name> next to <trash>/info.
     let files_dir = path.parent()?;
     if files_dir.file_name()? != "files" || !files_dir.parent()?.join("info").is_dir() {
         return None;
     }
-    trash::os_limited::list()
-        .ok()?
-        .into_iter()
-        .find(|i| trash_item_file(i).is_some_and(|f| f == path))
+    item_from_info(files_dir.parent()?, path.file_name()?).or_else(|| {
+        trash::os_limited::list().ok()?.into_iter().find(|i| trash_item_file(i).is_some_and(|f| f == path))
+    })
 }
 
 /// Trash entries for the given payload paths (selection in the trash view), in order.
 pub fn trash_items_at(paths: &[PathBuf]) -> Vec<trash::TrashItem> {
+    let quick: Vec<Option<trash::TrashItem>> = paths
+        .iter()
+        .map(|p| item_from_info(p.parent()?.parent()?, p.file_name()?))
+        .collect();
+    if quick.iter().all(Option::is_some) {
+        return quick.into_iter().flatten().collect();
+    }
     let Ok(all) = trash::os_limited::list() else { return Vec::new() };
     let by_file: std::collections::HashMap<PathBuf, trash::TrashItem> = all
         .into_iter()
         .filter_map(|i| trash_item_file(&i).map(|f| (f, i)))
         .collect();
     paths.iter().filter_map(|p| by_file.get(p).cloned()).collect()
+}
+
+/// The entry for `<root>/files/<name>`, from its own `<root>/info/<name>.trashinfo`.
+fn item_from_info(root: &Path, name: &std::ffi::OsStr) -> Option<trash::TrashItem> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info_name = name.to_os_string();
+    info_name.push(".trashinfo");
+    let info = root.join("info").join(info_name);
+    let text = std::fs::read_to_string(&info).ok()?;
+    let recorded = text.lines().find_map(|l| l.strip_prefix("Path="))?;
+    let mut original = PathBuf::from(std::ffi::OsStr::from_bytes(&percent_decode(recorded.trim())));
+    if original.is_relative() {
+        original = mount_top(root)?.join(original);
+    }
+    let when = std::fs::metadata(&info).and_then(|m| m.modified()).ok()?;
+    Some(trash::TrashItem {
+        id: info.into_os_string(),
+        name: original.file_name()?.to_os_string(),
+        original_parent: original.parent()?.to_path_buf(),
+        time_deleted: when.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+    })
+}
+
+/// Every trash folder there is for this user: the home trash first, then one per mounted
+/// drive that has one (`.Trash/<uid>` or `.Trash-<uid>` at its top), which is where a file
+/// trashed on that drive goes. The trash view shows them together.
+pub fn trash_folders() -> Vec<PathBuf> {
+    let home = trash_files_dir().parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut out = vec![home.clone()];
+    let uid = unsafe { libc::getuid() };
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    for line in mounts.lines() {
+        let mut f = line.split(' ');
+        let (Some(_), Some(mnt), Some(fstype)) = (f.next(), f.next(), f.next()) else { continue };
+        // Kernel filesystems hold no trash, and looking in a FUSE mount can hang on the network.
+        if matches!(fstype, "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "securityfs" | "debugfs" | "tracefs" | "configfs" | "pstore" | "bpf" | "mqueue" | "hugetlbfs" | "autofs" | "efivarfs" | "binfmt_misc" | "fusectl" | "nsfs" | "ramfs" | "rpc_pipefs" | "overlay" | "squashfs") || fstype.starts_with("fuse") {
+            continue;
+        }
+        let mnt = PathBuf::from(mnt.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\"));
+        for t in [mnt.join(".Trash").join(uid.to_string()), mnt.join(format!(".Trash-{uid}"))] {
+            if t != home && !out.contains(&t) && t.join("files").is_dir() {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Entries whose file is gone (deleted from the trash by hand, or by a program that left the
+/// info behind): never shown, never restorable, so they go when the trash is emptied.
+fn remove_orphaned_info(folders: &[PathBuf]) {
+    use std::os::unix::ffi::OsStrExt;
+    for root in folders {
+        let Ok(rd) = std::fs::read_dir(root.join("info")) else { continue };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let Some(payload) = name.as_bytes().strip_suffix(b".trashinfo") else { continue };
+            if root.join("files").join(std::ffi::OsStr::from_bytes(payload)).symlink_metadata().is_err() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// Send a path to the trash and return the resulting entry, so it can be restored later.
@@ -505,6 +580,96 @@ fn trash_and_record(path: &Path) -> Result<Option<trash::TrashItem>, String> {
 }
 
 fn newest_trash_entry(original: &Path) -> Option<trash::TrashItem> {
+    find_trash_entry(original).or_else(|| list_trash_entry(original))
+}
+
+/// The entry just made for `original`, found by its name in the trash folders it can be in:
+/// a directory listing and a few small files, where listing the trash reads every entry it
+/// holds. That was the cost of each overwritten or trashed file, so 500 of them with a full
+/// trash took minutes.
+fn find_trash_entry(original: &Path) -> Option<trash::TrashItem> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = original.file_name()?;
+    // The trash crate records the path with its folders resolved.
+    let resolved = original.parent().and_then(|p| std::fs::canonicalize(p).ok()).map(|p| p.join(name));
+    let top = mount_top(resolved.as_deref().unwrap_or(original));
+    let uid = unsafe { libc::getuid() };
+    let mut folders = vec![trash_files_dir().parent()?.to_path_buf()];
+    if let Some(top) = &top {
+        folders.push(top.join(".Trash").join(uid.to_string()));
+        folders.push(top.join(format!(".Trash-{uid}")));
+    }
+    let mut best: Option<(std::time::SystemTime, trash::TrashItem)> = None;
+    for folder in folders {
+        let info = folder.join("info");
+        let Ok(rd) = std::fs::read_dir(&info) else { continue };
+        for entry in rd.flatten() {
+            let file = entry.file_name();
+            // "<name>.trashinfo", or "<name>.<n>.trashinfo" when the name was taken.
+            let b = file.as_bytes();
+            let Some(stem) = b.strip_suffix(b".trashinfo") else { continue };
+            let Some(rest) = stem.strip_prefix(name.as_bytes()) else { continue };
+            if !(rest.is_empty() || rest.strip_prefix(b".").is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit))) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+            let Some(recorded) = text.lines().find_map(|l| l.strip_prefix("Path=")) else { continue };
+            let mut path = PathBuf::from(std::ffi::OsString::from(std::ffi::OsStr::from_bytes(&percent_decode(recorded.trim()))));
+            if path.is_relative() {
+                path = top.as_ref()?.join(path);
+            }
+            if path != original && Some(&path) != resolved.as_ref() {
+                continue;
+            }
+            let Ok(when) = entry.metadata().and_then(|m| m.modified()) else { continue };
+            if best.as_ref().is_some_and(|(t, _)| *t >= when) {
+                continue;
+            }
+            let item = trash::TrashItem {
+                id: entry.path().into_os_string(),
+                name: name.to_os_string(),
+                original_parent: path.parent()?.to_path_buf(),
+                time_deleted: when.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+            };
+            best = Some((when, item));
+        }
+    }
+    best.map(|(_, item)| item)
+}
+
+/// The mount point `path` is on: the longest one that is a prefix of it.
+fn mount_top(path: &Path) -> Option<PathBuf> {
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    mounts
+        .lines()
+        .filter_map(|l| l.split(' ').nth(1))
+        // Spaces and the like are octal escapes there ("\040").
+        .map(|m| PathBuf::from(m.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")))
+        .filter(|m| path.starts_with(m))
+        .max_by_key(|m| m.as_os_str().len())
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The slow way, by listing everything in the trash, if the entry was not where expected.
+fn list_trash_entry(original: &Path) -> Option<trash::TrashItem> {
     trash::os_limited::list()
         .ok()?
         .into_iter()
@@ -860,23 +1025,14 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
                 return Err("cancelled".into());
             }
             let Some(target) = decide(id, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)? else { continue };
-            if target == *src {
+            if target.path == *src {
                 continue;
             }
-            loop {
-                match std::fs::rename(src, &target) {
-                    Ok(()) => {
-                        done.moved.push((target.clone(), src.clone()));
-                        break;
-                    }
-                    Err(e) => match ask_error(id, src, &e.to_string(), &mut errors, ev)? {
-                        OnError::Retry => continue,
-                        OnError::Skip => {
-                            done.failed.push(display_name(src));
-                            break;
-                        }
-                    },
-                }
+            if target.merge {
+                let mut rn = Renames { id, cancel, ev, conflicts: &mut conflicts, errors: &mut errors, done: &mut *done };
+                rn.merge(src, &target.path, Path::new(src.file_name().unwrap_or_default()))?;
+            } else {
+                Renames { id, cancel, ev, conflicts: &mut conflicts, errors: &mut errors, done: &mut *done }.rename(src, &target.path)?;
             }
             renamed += 1;
             let _ = ev.send(Event::Progress { id, bytes_done: 0, items_done: renamed, current: display_name(src) });
@@ -906,16 +1062,15 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
     let _ = ev.send(Event::Started { id, kind: req.kind, total_bytes, total_items: files.len() as u64 });
 
     // Every root's destination is settled before the first byte is written.
-    let mut targets: Vec<Option<PathBuf>> = Vec::new();
+    let mut targets: Vec<Option<Target>> = Vec::new();
     for (src, ..) in &roots {
         targets.push(decide(id, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)?);
     }
 
-    let mut bytes_done = 0u64;
-    let mut items_done = 0u64;
-    for ((src_root, file_range, dir_range), target_root) in roots.into_iter().zip(targets) {
-        let Some(target_root) = target_root else { continue };
-        if req.kind == OpKind::Copy {
+    let mut progress = (0u64, 0u64); // (bytes, items)
+    for ((src_root, file_range, dir_range), target) in roots.into_iter().zip(targets) {
+        let Some(Target { path: target_root, merge }) = target else { continue };
+        if req.kind == OpKind::Copy && !merge {
             // Recorded before it is written, so undo also clears a copy that stopped half-way.
             done.created.push(target_root.clone());
         }
@@ -929,11 +1084,23 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
                 _ => target_root.clone(),
             }
         };
-        let copied = copy_root(id, cancel, ev, &mut errors, done, &files[file_range.clone()], &dirs[dir_range.clone()], &dest_of, &mut bytes_done, &mut items_done);
-        let copied = match copied {
-            Ok(c) => c,
+        let mut job = CopyRoot {
+            id,
+            cancel,
+            ev,
+            errors: &mut errors,
+            conflicts: &mut conflicts,
+            done: &mut *done,
+            merge,
+            // A merged copy is undone item by item: what it added, never the folder it went into.
+            record_created: req.kind == OpKind::Copy && merge,
+            progress: &mut progress,
+        };
+        let result = job.run(&files[file_range.clone()], &dirs[dir_range.clone()], &dest_of);
+        let (arrived, new_dirs) = match result {
+            Ok(r) => r,
             Err(e) => {
-                if req.kind == OpKind::Move {
+                if req.kind == OpKind::Move && !merge {
                     // The originals are all still in place; the half copy is only ours.
                     let _ = remove_any(&target_root);
                 }
@@ -943,23 +1110,25 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
         if req.kind != OpKind::Move {
             continue;
         }
-        if copied.iter().all(|c| *c) && done.failed.iter().all(|f| !Path::new(f).starts_with(root_name)) {
+        let complete = arrived.iter().all(Option::is_some) && done.failed.iter().all(|f| !Path::new(f).starts_with(root_name));
+        if complete && !merge {
             // Everything arrived: the source goes, and undo moves the whole root back.
             match remove_any(src_root) {
                 Ok(()) => done.moved.push((target_root.clone(), src_root.to_path_buf())),
                 Err(e) => done.failed.push(format!("{} (copied, but the original could not be removed: {e})", display_name(src_root))),
             }
         } else {
-            // Only the files that arrived leave the source; the rest stay where they were, with
-            // the folders that still hold them.
-            for ((src, rel, _), ok) in files[file_range].iter().zip(&copied) {
-                if *ok && std::fs::remove_file(src).is_ok() {
-                    done.moved.push((dest_of(rel), src.clone()));
+            // Item by item: only the files that arrived leave the source, the rest stay where
+            // they were with the folders that still hold them. Undo moves each one back, and
+            // takes away again the folders this move made (never one that was there).
+            for ((src, _, _), to) in files[file_range].iter().zip(&arrived) {
+                if let Some(to) = to {
+                    if std::fs::remove_file(src).is_ok() {
+                        done.moved.push((to.clone(), src.clone()));
+                    }
                 }
             }
-            // Its folders here were all made by this move (the root was new), so undo may
-            // take them away again once the files are back.
-            done.emptied.extend(dirs[dir_range.clone()].iter().rev().map(|rel| dest_of(rel)));
+            done.emptied.extend(new_dirs.into_iter().rev());
             let base = src_root.parent().unwrap_or(Path::new("/"));
             for rel in dirs[dir_range].iter().rev() {
                 let _ = std::fs::remove_dir(base.join(rel)); // fails, as it should, unless empty
@@ -969,82 +1138,188 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
     Ok(())
 }
 
-/// Copy one source root's folders and files to where `dest_of` puts them. Returns, per file,
-/// whether it arrived.
-#[allow(clippy::too_many_arguments)]
-fn copy_root(
+/// Where one source goes.
+struct Target {
+    path: PathBuf,
+    /// Into a folder already there, rather than a new one.
+    merge: bool,
+}
+
+/// Moves on one filesystem, by rename.
+struct Renames<'a> {
     id: u64,
-    cancel: &AtomicBool,
-    ev: &Sender<Event>,
-    errors: &mut ErrorPolicy,
-    done: &mut Transferred,
-    files: &[(PathBuf, PathBuf, u64)],
-    dirs: &[PathBuf],
-    dest_of: &dyn Fn(&Path) -> PathBuf,
-    bytes_done: &mut u64,
-    items_done: &mut u64,
-) -> Result<Vec<bool>, String> {
-    let mut failed_dirs: Vec<&Path> = Vec::new();
-    for rel in dirs {
-        if failed_dirs.iter().any(|f| rel.starts_with(f)) {
-            continue;
-        }
+    cancel: &'a AtomicBool,
+    ev: &'a Sender<Event>,
+    conflicts: &'a mut ConflictPolicy,
+    errors: &'a mut ErrorPolicy,
+    done: &'a mut Transferred,
+}
+
+impl Renames<'_> {
+    fn rename(&mut self, src: &Path, target: &Path) -> Result<(), String> {
         loop {
-            match std::fs::create_dir_all(dest_of(rel)) {
-                Ok(()) => break,
-                Err(e) => match ask_error(id, rel, &e.to_string(), errors, ev)? {
+            match std::fs::rename(src, target) {
+                Ok(()) => {
+                    self.done.moved.push((target.to_path_buf(), src.to_path_buf()));
+                    return Ok(());
+                }
+                Err(e) => match ask_error(self.id, src, &e.to_string(), self.errors, self.ev)? {
                     OnError::Retry => continue,
                     OnError::Skip => {
-                        done.failed.push(rel.to_string_lossy().into_owned());
-                        failed_dirs.push(rel);
-                        break;
+                        self.done.failed.push(display_name(src));
+                        return Ok(());
                     }
                 },
             }
         }
     }
-    let mut copied = vec![false; files.len()];
-    for (i, (src, rel, size)) in files.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        if failed_dirs.iter().any(|f| rel.starts_with(f)) {
-            continue;
-        }
-        let target = dest_of(rel);
-        loop {
-            let result = copy_file(src, &target, cancel, &mut |n| {
-                let _ = ev.send(Event::Progress {
-                    id,
-                    bytes_done: *bytes_done + n,
-                    items_done: *items_done,
-                    current: rel.to_string_lossy().into_owned(),
-                });
-            });
-            match result {
-                Ok(()) => {
-                    copied[i] = true;
-                    break;
+
+    /// The contents of `src` into the folder `dst`, each by rename. A folder on both sides is
+    /// merged in turn; a file on both sides is asked about. `rel` names it in questions.
+    fn merge(&mut self, src: &Path, dst: &Path, rel: &Path) -> Result<(), String> {
+        let entries = std::fs::read_dir(src).map_err(|e| e.to_string())?;
+        for entry in entries.flatten() {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            let (from, name) = (entry.path(), entry.file_name());
+            let mut to = dst.join(&name);
+            let rel = rel.join(&name);
+            if let Ok(there) = to.symlink_metadata() {
+                let folders = there.is_dir() && entry.file_type().is_ok_and(|t| t.is_dir());
+                if folders {
+                    self.merge(&from, &to, &rel)?;
+                    continue;
                 }
-                Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
-                Err(e) => {
-                    // What a failed copy left behind is part of a file, never something the
-                    // user had: the target did not exist (conflicts are settled before this).
-                    let _ = std::fs::remove_file(&target);
-                    match ask_error(id, rel, &e, errors, ev)? {
+                match resolve_conflict(self.id, rel.as_os_str(), false, self.conflicts, self.ev)? {
+                    Do::Skip | Do::Merge => continue,
+                    Do::Overwrite => {
+                        if let Some(item) = trash_and_record(&to)? {
+                            self.done.displaced.push(item);
+                        }
+                    }
+                    Do::Rename => to = dst.join(free_sibling_name_skipping(dst, &name, &[])),
+                }
+            }
+            self.rename(&from, &to)?;
+        }
+        // Empty now unless something was skipped; then it stays, holding what is left.
+        let _ = std::fs::remove_dir(src);
+        Ok(())
+    }
+}
+
+/// Copies one source root's folders and files to where `dest_of` puts them.
+struct CopyRoot<'a> {
+    id: u64,
+    cancel: &'a AtomicBool,
+    ev: &'a Sender<Event>,
+    errors: &'a mut ErrorPolicy,
+    conflicts: &'a mut ConflictPolicy,
+    done: &'a mut Transferred,
+    /// Into a folder that is there: what is already in it is asked about, never overwritten.
+    merge: bool,
+    /// Put what this adds in `done.created` (the topmost new folder or the file), for undo.
+    record_created: bool,
+    progress: &'a mut (u64, u64),
+}
+
+impl CopyRoot<'_> {
+    /// Per file, where it arrived (None: it did not); and the folders it made, outermost first.
+    #[allow(clippy::type_complexity)]
+    fn run(&mut self, files: &[(PathBuf, PathBuf, u64)], dirs: &[PathBuf], dest_of: &dyn Fn(&Path) -> PathBuf) -> Result<(Vec<Option<PathBuf>>, Vec<PathBuf>), String> {
+        let mut failed_dirs: Vec<&Path> = Vec::new();
+        let mut new_dirs: Vec<PathBuf> = Vec::new();
+        for rel in dirs {
+            if failed_dirs.iter().any(|f| rel.starts_with(f)) {
+                continue;
+            }
+            let to = dest_of(rel);
+            if to.is_dir() {
+                continue;
+            }
+            loop {
+                match std::fs::create_dir(&to).or_else(|e| if to.is_dir() { Ok(()) } else { Err(e) }) {
+                    Ok(()) => {
+                        if self.record_created && !new_dirs.iter().any(|d| to.starts_with(d)) {
+                            self.done.created.push(to.clone());
+                        }
+                        new_dirs.push(to.clone());
+                        break;
+                    }
+                    Err(e) => match ask_error(self.id, rel, &e.to_string(), self.errors, self.ev)? {
                         OnError::Retry => continue,
                         OnError::Skip => {
-                            done.failed.push(rel.to_string_lossy().into_owned());
+                            self.done.failed.push(rel.to_string_lossy().into_owned());
+                            failed_dirs.push(rel);
                             break;
+                        }
+                    },
+                }
+            }
+        }
+        let mut arrived = vec![None; files.len()];
+        for (i, (src, rel, size)) in files.iter().enumerate() {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            if failed_dirs.iter().any(|f| rel.starts_with(f)) {
+                continue;
+            }
+            let mut target = dest_of(rel);
+            // Only in a merge can something be there already (otherwise the folder is new).
+            if self.merge && target.symlink_metadata().is_ok() {
+                match resolve_conflict(self.id, rel.as_os_str(), false, self.conflicts, self.ev)? {
+                    Do::Skip | Do::Merge => {
+                        self.progress.0 += size;
+                        self.progress.1 += 1;
+                        continue;
+                    }
+                    Do::Overwrite => {
+                        if let Some(item) = trash_and_record(&target)? {
+                            self.done.displaced.push(item);
+                        }
+                    }
+                    Do::Rename => {
+                        let dir = target.parent().unwrap_or(Path::new("/")).to_path_buf();
+                        target = dir.join(free_sibling_name_skipping(&dir, target.file_name().unwrap_or_default(), &[]));
+                    }
+                }
+            }
+            loop {
+                let (bytes, items) = *self.progress;
+                let (id, ev) = (self.id, self.ev);
+                let result = copy_file(src, &target, self.cancel, &mut |n| {
+                    let _ = ev.send(Event::Progress { id, bytes_done: bytes + n, items_done: items, current: rel.to_string_lossy().into_owned() });
+                });
+                match result {
+                    Ok(()) => {
+                        if self.record_created && !new_dirs.iter().any(|d| target.starts_with(d)) {
+                            self.done.created.push(target.clone());
+                        }
+                        arrived[i] = Some(target.clone());
+                        break;
+                    }
+                    Err(e) if self.cancel.load(Ordering::Relaxed) => return Err(e),
+                    Err(e) => {
+                        // What a failed copy left behind is part of a file, never something the
+                        // user had: the target did not exist (conflicts are settled above).
+                        let _ = std::fs::remove_file(&target);
+                        match ask_error(self.id, rel, &e, self.errors, self.ev)? {
+                            OnError::Retry => continue,
+                            OnError::Skip => {
+                                self.done.failed.push(rel.to_string_lossy().into_owned());
+                                break;
+                            }
                         }
                     }
                 }
             }
+            self.progress.0 += size;
+            self.progress.1 += 1;
         }
-        *bytes_done += size;
-        *items_done += 1;
+        Ok((arrived, new_dirs))
     }
-    Ok(copied)
 }
 
 /// Where one source goes: its own name in the destination, unless that is taken. None: skipped.
@@ -1056,26 +1331,31 @@ fn decide(
     conflicts: &mut ConflictPolicy,
     displaced: &mut Vec<trash::TrashItem>,
     ev: &Sender<Event>,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<Target>, String> {
     let name = src.file_name().ok_or("nameless source")?.to_os_string();
     let mut target = dest_dir.join(&name);
+    let mut merge = false;
     if claimed.contains(&name) {
         // Taken by another source of this same operation, not by anything the user had: both
         // are kept, without asking.
         target = dest_dir.join(free_name(dest_dir, &name, claimed));
-    } else if target.symlink_metadata().is_ok() && target != src {
-        match resolve_conflict(id, &name, conflicts, ev)? {
-            Do::Skip => return Ok(None),
-            Do::Overwrite => {
-                if let Some(item) = trash_and_record(&target)? {
-                    displaced.push(item);
+    } else if let Ok(there) = target.symlink_metadata().map(|m| m.is_dir()) {
+        if target != src {
+            let folders = there && std::fs::symlink_metadata(src).is_ok_and(|m| m.is_dir());
+            match resolve_conflict(id, &name, folders, conflicts, ev)? {
+                Do::Skip => return Ok(None),
+                Do::Overwrite => {
+                    if let Some(item) = trash_and_record(&target)? {
+                        displaced.push(item);
+                    }
                 }
+                Do::Rename => target = dest_dir.join(free_name(dest_dir, &name, claimed)),
+                Do::Merge => merge = true,
             }
-            Do::Rename => target = dest_dir.join(free_name(dest_dir, &name, claimed)),
         }
     }
     claimed.insert(target.file_name().unwrap_or_default().to_os_string());
-    Ok(Some(target))
+    Ok(Some(Target { path: target, merge }))
 }
 
 /// The undo record and the summary of what was left out, at the end of a transfer.
@@ -1166,6 +1446,8 @@ enum Do {
     Skip,
     /// Keep both: written under the first free "name (n)".
     Rename,
+    /// Into the folder that is there.
+    Merge,
 }
 
 /// Sticky "... all" answers for one operation.
@@ -1174,6 +1456,7 @@ struct ConflictPolicy {
     overwrite_all: bool,
     skip_all: bool,
     rename_all: bool,
+    merge_all: bool,
 }
 
 /// First free "name (n).ext" sibling in `dir`, the name Dolphin and Nautilus would pick.
@@ -1207,9 +1490,13 @@ fn free_sibling_name_skipping(dir: &Path, name: &std::ffi::OsStr, skip: &[std::f
 fn resolve_conflict(
     id: u64,
     name: &std::ffi::OsStr,
+    folders: bool,
     policy: &mut ConflictPolicy,
     ev: &Sender<Event>,
 ) -> Result<Do, String> {
+    if folders && policy.merge_all {
+        return Ok(Do::Merge);
+    }
     if policy.overwrite_all {
         return Ok(Do::Overwrite);
     }
@@ -1223,6 +1510,7 @@ fn resolve_conflict(
     let _ = ev.send(Event::Conflict {
         id,
         name: name.to_string_lossy().into_owned(),
+        folders,
         reply: tx,
     });
     match rx.recv().map_err(|_| "ui gone")? {
@@ -1241,6 +1529,13 @@ fn resolve_conflict(
             policy.rename_all = true;
             Ok(Do::Rename)
         }
+        ConflictAnswer::Merge if folders => Ok(Do::Merge),
+        ConflictAnswer::MergeAll if folders => {
+            policy.merge_all = true;
+            Ok(Do::Merge)
+        }
+        // Only offered for two folders.
+        ConflictAnswer::Merge | ConflictAnswer::MergeAll => Ok(Do::Skip),
         ConflictAnswer::Cancel => Err("cancelled".into()),
     }
 }
@@ -1615,6 +1910,131 @@ mod tests {
         assert_eq!(std::fs::read(src.join("sub/n.txt")).unwrap(), b"nested");
         assert!(!dst.join("sub").exists());
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// The quick lookup finds the same entry the full listing does, the newest of two.
+    #[test]
+    fn a_trashed_file_is_found_without_listing_the_trash() {
+        let (src, _) = setup("trash-lookup");
+        let f = src.join("twice trashed.txt");
+        let purge = || {
+            let all = trash::os_limited::list().unwrap_or_default();
+            let _ = trash::os_limited::purge_all(all.into_iter().filter(|i| i.original_path() == f));
+        };
+        purge();
+        for content in ["first", "second"] {
+            std::fs::write(&f, content).unwrap();
+            trash::delete_all([&f]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The listing knows deletion times to the second only, so it cannot tell these two
+        // apart; the lookup goes by the info file's own time.
+        let quick = find_trash_entry(&f).expect("found by name");
+        assert_eq!(quick.original_path(), f);
+        trash::os_limited::restore_all([quick]).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"second", "the newest one");
+        purge();
+    }
+
+    /// Runs an operation, giving `answers` to its conflict questions in turn (folders first, as
+    /// asked); hands back the undo record and the questions' names.
+    fn run_conflicts(req: Request, answers: &[ConflictAnswer]) -> (Option<UndoRecord>, Vec<(String, bool)>) {
+        let (tx, rx) = channel();
+        let handle = std::thread::spawn(move || run(1, req, &AtomicBool::new(false), &tx));
+        let mut asked = Vec::new();
+        let undo = loop {
+            match rx.recv().expect("worker alive") {
+                Event::Done { undo, .. } => break undo,
+                Event::Failed { error, .. } => panic!("op failed: {error}"),
+                Event::Conflict { name, folders, reply, .. } => {
+                    reply.send(answers[asked.len()]).unwrap();
+                    asked.push((name, folders));
+                }
+                Event::Error { error, .. } => panic!("item failed: {error}"),
+                _ => {}
+            }
+        };
+        handle.join().unwrap();
+        (undo, asked)
+    }
+
+    /// A folder copied onto one of the same name: merged, the file in both kept twice, what was
+    /// there untouched; and undo takes away only what the copy added.
+    #[test]
+    fn copying_a_folder_into_one_that_is_there_merges() {
+        let (src, dst) = setup("merge-copy");
+        std::fs::create_dir_all(dst.join("src")).unwrap();
+        std::fs::write(dst.join("src/keep.txt"), b"mine").unwrap();
+        std::fs::write(dst.join("src/a.txt"), b"old").unwrap();
+        let (undo, asked) = run_conflicts(
+            Request::new(OpKind::Copy, vec![src.clone()], Some(dst.clone())),
+            &[ConflictAnswer::Merge, ConflictAnswer::Rename],
+        );
+        assert_eq!(asked, [("src".to_string(), true), ("src/a.txt".to_string(), false)]);
+        assert_eq!(std::fs::read(dst.join("src/keep.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(dst.join("src/a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dst.join("src/a (1).txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dst.join("src/sub/n.txt")).unwrap(), b"nested");
+        let Some(UndoRecord { action: UndoAction::Copied(mut created), .. }) = undo else { panic!("no undo") };
+        created.sort();
+        assert_eq!(created, [dst.join("src/a (1).txt"), dst.join("src/sub")], "never the folder that was there");
+    }
+
+    /// The same as a move, on one filesystem and onto another: what was there stays, the file in
+    /// both is replaced (into the trash), and undo puts everything back where it came from.
+    #[test]
+    fn moving_a_folder_into_one_that_is_there_merges_and_undoes() {
+        for other_fs in [false, true] {
+            let (src, near) = setup(&format!("merge-move-{other_fs}"));
+            let dst = if other_fs { PathBuf::from("/dev/shm/vantaexplorer-merge-move") } else { near };
+            let _ = std::fs::remove_dir_all(&dst);
+            std::fs::create_dir_all(dst.join("src")).unwrap();
+            std::fs::write(dst.join("src/keep.txt"), b"mine").unwrap();
+            std::fs::write(dst.join("src/a.txt"), b"old").unwrap();
+            let (undo, asked) = run_conflicts(
+                Request::new(OpKind::Move, vec![src.clone()], Some(dst.clone())),
+                &[ConflictAnswer::Merge, ConflictAnswer::Overwrite],
+            );
+            assert_eq!(asked.len(), 2, "{asked:?}");
+            assert!(!src.exists(), "everything moved, so the source folder is gone");
+            assert_eq!(std::fs::read(dst.join("src/keep.txt")).unwrap(), b"mine");
+            assert_eq!(std::fs::read(dst.join("src/a.txt")).unwrap(), b"hello");
+            assert_eq!(std::fs::read(dst.join("src/sub/n.txt")).unwrap(), b"nested");
+            let rec = undo.expect("undo");
+            assert_eq!(rec.displaced.len(), 1, "the replaced a.txt is in the trash");
+            let UndoAction::Moved(pairs) = rec.action else { panic!("not a move") };
+            let back = Request { kind: OpKind::MoveExact, pairs, sources: rec.emptied, ..Default::default() };
+            run_conflicts(back, &[]);
+            assert_eq!(std::fs::read(src.join("a.txt")).unwrap(), b"hello");
+            assert_eq!(std::fs::read(src.join("sub/n.txt")).unwrap(), b"nested");
+            assert_eq!(std::fs::read(dst.join("src/keep.txt")).unwrap(), b"mine");
+            assert!(!dst.join("src/sub").exists(), "the folder the move made is gone again");
+            let _ = trash::os_limited::restore_all(rec.displaced);
+            assert_eq!(std::fs::read(dst.join("src/a.txt")).unwrap(), b"old");
+            let _ = std::fs::remove_dir_all(&dst);
+        }
+    }
+
+    /// A file trashed on another drive (here /tmp, a filesystem of its own) is in a trash
+    /// folder the trash view looks in, and is found from its file there.
+    #[test]
+    fn the_trash_of_another_drive_is_seen() {
+        let (src, _) = setup("other-trash");
+        let f = src.join("on another drive.txt");
+        std::fs::write(&f, b"x").unwrap();
+        trash::delete_all([&f]).unwrap();
+        let item = find_trash_entry(&f).expect("trashed");
+        let payload = trash_item_file(&item).unwrap();
+        let root = payload.parent().unwrap().parent().unwrap().to_path_buf();
+        if root != trash_files_dir().parent().unwrap() {
+            assert!(trash_folders().contains(&root), "{root:?} not among {:?}", trash_folders());
+        }
+        let found = trash_item_at(&payload).expect("found from its file");
+        assert_eq!(found.original_path(), f);
+        // An entry whose file is gone is cleared away.
+        std::fs::remove_file(&payload).unwrap();
+        remove_orphaned_info(&[root]);
+        assert!(!Path::new(&found.id).exists());
     }
 
     /// Same harness as run_and_drain but hands back the undo record.
