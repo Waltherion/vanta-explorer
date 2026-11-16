@@ -2065,7 +2065,8 @@ fn show_rows_view(
                 let text_col = if entry.hidden { theme.text.gamma_multiply(0.6) } else { theme.text }.gamma_multiply(ghost);
                 let font = egui::TextStyle::Body.resolve(ui.style());
                 let name_left = icon_rect.max.x + 6.0;
-                ui.painter().text(
+                // Where the name is drawn: clicking it (and nothing else in the row) renames.
+                let name_text_rect = ui.painter().text(
                     egui::pos2(name_left, rect.center().y),
                     egui::Align2::LEFT_CENTER,
                     crate::text::elide_end(ui, &entry.name, cols.size_left - 6.0 - name_left),
@@ -2192,15 +2193,16 @@ fn show_rows_view(
                     interacted = true;
                     let mods = ui.input(|i| i.modifiers);
                     // Clicking the NAME of a file that is already the only selection starts
-                    // an inline rename, as in Dolphin. Only the name column counts: clicking
-                    // out in Size or Modified is how you re-select without renaming.
+                    // an inline rename, as in Dolphin. Only the name's own text counts: the
+                    // icon, the space after the name and the other columns re-select without
+                    // renaming.
                     let rearm = view.chooser.is_none()
                         && !mods.ctrl
                         && !mods.shift
                         && tab.renaming.is_none()
                         && tab.selection.len() == 1
                         && tab.selection.contains(&entry_name)
-                        && resp.interact_pointer_pos().is_some_and(|p| p.x < split_x);
+                        && resp.interact_pointer_pos().is_some_and(|p| name_text_rect.expand(2.0).contains(p));
                     tab.rename_armed =
                         rearm.then(|| (entry_name.clone(), std::time::Instant::now()));
                     if mods.ctrl {
@@ -2580,7 +2582,7 @@ fn show_grid(
                             theme.text
                         }
                         .gamma_multiply(tint.a() as f32 / 255.0);
-                        ui.painter().text(
+                        let name_text_rect = ui.painter().text(
                             egui::pos2(rect.center().x, rect.max.y - label_h * 0.5),
                             egui::Align2::CENTER_CENTER,
                             crate::text::elide_end(ui, &entry.name, cell_w - 6.0),
@@ -2645,10 +2647,8 @@ fn show_grid(
                             interacted = true;
                             let mods = ui.input(|i| i.modifiers);
                             // Clicking the NAME of the single selected item starts an inline
-                            // rename, exactly as in the list view. Here the name is the label
-                            // band along the bottom of the cell; clicking the icon above it
-                            // re-selects without renaming, which is the grid's equivalent of
-                            // the list's "only the Name column counts".
+                            // rename, exactly as in the list view: only the label's own text
+                            // counts, not the icon above it or the band beside a short name.
                             let rearm = view.chooser.is_none()
                                 && !mods.ctrl
                                 && !mods.shift
@@ -2657,7 +2657,7 @@ fn show_grid(
                                 && tab.selection.contains(&entry_name)
                                 && resp
                                     .interact_pointer_pos()
-                                    .is_some_and(|p| p.y >= rect.max.y - label_h);
+                                    .is_some_and(|p| name_text_rect.expand(2.0).contains(p));
                             tab.rename_armed =
                                 rearm.then(|| (entry_name.clone(), std::time::Instant::now()));
                             if mods.ctrl {
