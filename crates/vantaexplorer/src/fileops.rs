@@ -217,11 +217,50 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
         return Err("invalid name".into());
     }
     let dest = path.with_file_name(new_name);
-    if dest.exists() {
-        return Err("a file with that name already exists".into());
-    }
-    std::fs::rename(path, &dest).map_err(|e| e.to_string())?;
+    rename_no_replace(path, &dest).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => "a file with that name already exists".to_string(),
+        _ => e.to_string(),
+    })?;
     Ok(dest)
+}
+
+/// Rename that never replaces anything at `to`, a dead link included: the kernel checks and
+/// renames in one step (RENAME_NOREPLACE), so nothing created between a check and the rename
+/// can be overwritten either. Where a filesystem cannot do that, it is checked first.
+///
+/// The one exception is `to` being `from` itself under another spelling, which a filesystem
+/// that ignores case (exFAT, NTFS) says of "Notes" and "notes": that rename is let through.
+pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let same_file = |a: &Path, b: &Path| match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    let (cf, ct) = (c(from)?, c(to)?);
+    let r = unsafe { libc::renameat2(libc::AT_FDCWD, cf.as_ptr(), libc::AT_FDCWD, ct.as_ptr(), libc::RENAME_NOREPLACE) };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        // exFAT takes a rename that only changes case as done and leaves the old spelling, so
+        // it goes by way of a name of its own.
+        Some(libc::EEXIST) if from != to && same_file(from, to) => {
+            let step = from.with_file_name(format!(".{}.vx-rename", std::process::id()));
+            std::fs::rename(from, &step)?;
+            std::fs::rename(&step, to).or_else(|e| std::fs::rename(&step, from).and(Err(e)))
+        }
+        // The filesystem (or kernel) has no RENAME_NOREPLACE: check, then rename.
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => {
+            if to.symlink_metadata().is_ok() && !same_file(from, to) {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(from, to)
+        }
+        _ => Err(e),
+    }
 }
 
 /// Create a uniquely named folder and return it, so the UI can start an inline rename on it.
@@ -1202,7 +1241,7 @@ struct Renames<'a> {
 impl Renames<'_> {
     fn rename(&mut self, src: &Path, target: &Path) -> Result<(), String> {
         loop {
-            match std::fs::rename(src, target) {
+            match rename_no_replace(src, target) {
                 Ok(()) => {
                     self.done.moved.push((target.to_path_buf(), src.to_path_buf()));
                     return Ok(());
@@ -1587,7 +1626,8 @@ fn resolve_conflict(
 /// Rename, or where the two are on different filesystems (undoing a move from one drive to
 /// another), copy and then remove the original once all of it has arrived.
 fn move_path(from: &Path, to: &Path, cancel: &AtomicBool) -> Result<(), String> {
-    match std::fs::rename(from, to) {
+    // Undo puts things back where they were; whatever has appeared there since is not replaced.
+    match rename_no_replace(from, to) {
         Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
         other => return other.map_err(|e| e.to_string()),
     }
@@ -2100,6 +2140,17 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.join("files")).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(root.join("info")).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Renaming onto a dead link, or onto anything, is refused; a change of case only is not.
+    #[test]
+    fn rename_never_replaces_a_dead_link() {
+        let (src, _) = setup("rename-dead-link");
+        std::os::unix::fs::symlink(src.join("gone"), src.join("noter.txt")).unwrap();
+        assert!(rename(&src.join("a.txt"), "noter.txt").is_err());
+        assert!(src.join("a.txt").exists(), "nothing moved");
+        assert!(src.join("noter.txt").symlink_metadata().unwrap().file_type().is_symlink(), "the link is still there");
+        assert!(rename(&src.join("a.txt"), "A.txt").is_ok(), "a new spelling is a new name here");
     }
 
     /// Same harness as run_and_drain but hands back the undo record.
