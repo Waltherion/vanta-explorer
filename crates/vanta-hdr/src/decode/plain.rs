@@ -1,7 +1,7 @@
 //! Everything the `image` crate handles: SDR formats plus scene-linear EXR and Radiance HDR.
 
 use crate::color::{Primaries, Tf};
-use crate::decode::{downscale_rgba, linearise_rgba, DecodeError, HdrImage};
+use crate::decode::{linearise_rgba, DecodeError, HdrImage};
 use std::path::Path;
 
 pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
@@ -14,6 +14,12 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
         .decode()
         .map_err(|e| DecodeError::Decode(e.to_string()))?;
 
+    // A thumbnail is scaled in the image's own type (8 bits for a JPEG) before it becomes
+    // float, which is four times larger: a 50-megapixel photo is 800 MB as float RGBA.
+    let img = match crate::decode::scaled_size(img.width(), img.height(), max_dim) {
+        (w, h) if (w, h) != (img.width(), img.height()) => img.thumbnail_exact(w, h),
+        _ => img,
+    };
     let (w, h) = (img.width(), img.height());
 
     // EXR and Radiance carry SCENE-LINEAR float with values above 1.0 preserved. Treat those
@@ -25,7 +31,6 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
     );
 
     let rgba: Vec<f32> = img.to_rgba32f().into_raw();
-    let (rgba, w, h) = downscale_rgba(&rgba, w, h, max_dim);
 
     let tf = if is_linear_float {
         Tf::Linear

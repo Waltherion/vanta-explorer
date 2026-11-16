@@ -34,6 +34,19 @@ The package makes it a handler for folders. To make it the one that opens them:
 
     xdg-mime default vantaexplorer.desktop inode/directory
 
+### "Show in folder" from other programs
+
+A browser's "Show in folder" for a download, and the same in chat programs and Steam, asks for
+whatever answers `org.freedesktop.FileManager1` on D-Bus. Dolphin and Nautilus both do, so Vanta
+Explorer only does once you say so, by putting its entry where D-Bus looks first:
+
+    mkdir -p ~/.local/share/dbus-1/services
+    cp /usr/share/vantaexplorer/org.freedesktop.FileManager1.service ~/.local/share/dbus-1/services/
+
+It takes effect for the next program that asks, as long as no other file manager is running and
+holding the name already (`dolphin --daemon`, for one; log out and in if it is). To undo it,
+delete that file.
+
 ### As the file chooser other programs get
 
 When a program asks the desktop for a file, a folder or a place to save, it can be Vanta Explorer

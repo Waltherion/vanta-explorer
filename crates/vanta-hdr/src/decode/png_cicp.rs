@@ -5,7 +5,7 @@
 //! they would be shown washed out.
 
 use crate::color::{tf_from_icc, Primaries, Tf};
-use crate::decode::{downscale_rgba, linearise_rgba, DecodeError, HdrImage};
+use crate::decode::{linearise_rgba, DecodeError, HdrImage};
 use std::path::Path;
 
 pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
@@ -35,9 +35,10 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
         };
         return Ok(crate::decode::from_codes_u16(w, h, &codes, tf, primaries));
     }
-    let rgba: Vec<f32> = img.to_rgba32f().into_raw();
-
-    let (rgba, w, h) = downscale_rgba(&rgba, w, h, max_dim);
+    // Scaled in its own 8 or 16 bits before it becomes float, four or two times larger.
+    let (nw, nh) = crate::decode::scaled_size(w, h, max_dim);
+    let rgba: Vec<f32> = img.thumbnail_exact(nw, nh).to_rgba32f().into_raw();
+    let (w, h) = (nw, nh);
     let linear = linearise_rgba(&rgba, tf, true);
     Ok(HdrImage::from_linear_f32(w, h, &linear, tf, primaries))
 }

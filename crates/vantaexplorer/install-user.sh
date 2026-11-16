@@ -38,6 +38,12 @@ if [ -x "$portal" ]; then
       "$here/org.freedesktop.impl.portal.desktop.vanta.service" \
       > "$HOME/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.vanta.service"
   cp -f "$here/vanta.portal" "$HOME/.local/share/xdg-desktop-portal/portals/vanta.portal"
+  # "Show in folder" from other programs, only where it was switched on (docs/install.md): the
+  # entry is then pointed at this vantaportal.
+  fm="$HOME/.local/share/dbus-1/services/org.freedesktop.FileManager1.service"
+  if [ -f "$fm" ] && grep -q vantaportal "$fm"; then
+    sed "s|^Exec=[^ ]*|Exec=$HOME/.local/bin/vantaportal|" "$here/org.freedesktop.FileManager1.service" > "$fm"
+  fi
   # The bus reads its service files again; a running chooser service makes way for the new one.
   busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig >/dev/null 2>&1 || true
   pkill -x vantaportal 2>/dev/null || true

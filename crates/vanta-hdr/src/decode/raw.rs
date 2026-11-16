@@ -13,7 +13,7 @@
 //! as SDR. A RAW holds more shadow detail than an SDR file, but nothing above white.
 
 use crate::color::{Primaries, Tf};
-use crate::decode::{downscale_rgba, DecodeError, HdrImage};
+use crate::decode::{sample_rgba, DecodeError, HdrImage};
 use std::path::Path;
 
 #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
@@ -75,16 +75,12 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
         }
         let count = w as usize * h as usize * colors;
         let samples = std::slice::from_raw_parts(image.data.as_ptr().cast::<u16>(), count);
-        let mut rgba = vec![0.0f32; w as usize * h as usize * 4];
-        for (px, out) in samples.chunks_exact(colors).zip(rgba.chunks_exact_mut(4)) {
-            for c in 0..3 {
-                out[c] = px[c] as f32 / 65535.0;
-            }
-            out[3] = 1.0;
-        }
+        // Read at the size wanted, straight from libraw's buffer.
+        let (rgba, w, h) = sample_rgba(w, h, max_dim, |x, y| {
+            let px = &samples[(y * w as usize + x) * colors..];
+            [px[0] as f32 / 65535.0, px[1] as f32 / 65535.0, px[2] as f32 / 65535.0, 1.0]
+        });
         sys::libraw_dcraw_clear_mem(mem);
-
-        let (rgba, w, h) = downscale_rgba(&rgba, w, h, max_dim);
         Ok(HdrImage::from_linear_f32(w, h, &rgba, Tf::Srgb, Primaries::Bt709))
     }
 }

@@ -98,6 +98,9 @@ pub struct UndoRecord {
     /// can put them back, otherwise "overwrite" would be a silently unrecoverable action.
     /// Restored AFTER the main action is reversed, since their paths are occupied until then.
     pub displaced: Vec<trash::TrashItem>,
+    /// Folders the action made that undo removes again, once undo has left them empty: where
+    /// a move that left some files behind put the rest. Deepest first.
+    pub emptied: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +133,13 @@ pub enum Event {
         id: u64,
         name: String,
         reply: Sender<ConflictAnswer>,
+    },
+    /// One item failed; the worker is blocked until the reply says what to do about it.
+    Error {
+        id: u64,
+        name: String,
+        error: String,
+        reply: Sender<ErrorAnswer>,
     },
     Done {
         id: u64,
@@ -289,6 +299,7 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                         undo = Some(UndoRecord {
                             action: UndoAction::Trashed(items),
                             displaced: Vec::new(),
+                            emptied: Vec::new(),
                         });
                     }
                 })
@@ -314,7 +325,7 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                 }
             })
         }
-        OpKind::Copy | OpKind::Move => transfer(id, &req, cancel, ev, &mut undo),
+        OpKind::Copy | OpKind::Move => transfer(id, &req, cancel, ev, &mut undo, &mut warning),
         OpKind::Extract => extract(id, &req, cancel, ev, &mut undo),
         OpKind::Compress => compress(id, &req, cancel, ev, &mut undo),
 
@@ -332,7 +343,7 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                 if let Some(parent) = to.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                std::fs::rename(from, to).map_err(|e| e.to_string())?;
+                move_path(from, to, cancel)?;
                 back.push((to.clone(), from.clone()));
                 let _ = ev.send(Event::Progress {
                     id,
@@ -342,8 +353,15 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                 });
                 Ok(())
             });
+            // Folders the move made, gone again now that undo has emptied them; a folder that still
+            // holds something stays (remove_dir only takes empty ones).
+            if r.is_ok() {
+                for dir in &req.sources {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
             if r.is_ok() && !back.is_empty() {
-                undo = Some(UndoRecord { action: UndoAction::Moved(back), displaced: Vec::new() });
+                undo = Some(UndoRecord { action: UndoAction::Moved(back), displaced: Vec::new(), emptied: Vec::new() });
             }
             r
         }
@@ -382,6 +400,7 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                 undo = Some(UndoRecord {
                     action: UndoAction::Restored(restored),
                     displaced: Vec::new(),
+                    emptied: Vec::new(),
                 });
             }
             match (failures.is_empty(), undo.is_some()) {
@@ -655,6 +674,7 @@ fn compress(
     *undo = Some(UndoRecord {
         action: UndoAction::Copied(vec![archive]),
         displaced: Vec::new(),
+        emptied: Vec::new(),
     });
     Ok(())
 }
@@ -751,6 +771,7 @@ fn extract(
         *undo = Some(UndoRecord {
             action: UndoAction::Copied(created),
             displaced: Vec::new(),
+            emptied: Vec::new(),
         });
     }
 
@@ -771,185 +792,380 @@ fn transfer(
     cancel: &AtomicBool,
     ev: &Sender<Event>,
     undo: &mut Option<UndoRecord>,
+    warning: &mut Option<String>,
 ) -> Result<(), String> {
+    let mut done = Transferred::default();
+    match transfer_into(id, req, cancel, ev, &mut done) {
+        Ok(()) => {}
+        // Stopped part-way (cancelled, or an answer of Cancel, or an error that ends it): what
+        // already happened is still recorded, so undo can reverse it.
+        Err(e) if done.anything() => done.failed.insert(0, if e == "cancelled" { "the rest (cancelled)".into() } else { format!("the rest ({e})") }),
+        Err(e) => return Err(e),
+    }
+    finish(req, done, undo, warning);
+    Ok(())
+}
+
+/// What a transfer has done so far, kept outside the work so a stop part-way loses none of it.
+#[derive(Default)]
+struct Transferred {
+    moved: Vec<(PathBuf, PathBuf)>,
+    created: Vec<PathBuf>,
+    displaced: Vec<trash::TrashItem>,
+    /// What could not be done, by name, for the summary at the end.
+    failed: Vec<String>,
+    /// See UndoRecord::emptied.
+    emptied: Vec<PathBuf>,
+}
+
+impl Transferred {
+    fn anything(&self) -> bool {
+        !self.moved.is_empty() || !self.created.is_empty() || !self.displaced.is_empty()
+    }
+}
+
+fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>, done: &mut Transferred) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::ffi::OsString;
+    use std::os::unix::fs::MetadataExt;
+
     let dest_dir = req.dest.as_ref().ok_or("no destination")?;
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut created: Vec<PathBuf> = Vec::new();
-    let mut displaced: Vec<trash::TrashItem> = Vec::new();
+    let mut conflicts = ConflictPolicy::default();
+    let mut errors = ErrorPolicy::default();
+    // Names this operation has already written into the destination. Two sources can share a
+    // name (search results from different folders): the second must not land on the first.
+    let mut claimed: HashSet<OsString> = HashSet::new();
 
-    // Same-device Move degenerates to rename: instant, no byte progress needed.
+    // A move within one filesystem is a rename: instant, no bytes to copy. Decided per source,
+    // since a selection (search results, say) can span filesystems; the others are copied
+    // and then removed below.
+    let dest_dev = std::fs::metadata(dest_dir).map_err(|e| e.to_string())?.dev();
+    let mut to_copy: Vec<&PathBuf> = Vec::new();
     if req.kind == OpKind::Move {
-        if let (Ok(a), Ok(b)) = (
-            std::fs::metadata(dest_dir),
-            req.sources
-                .first()
-                .and_then(|s| std::fs::symlink_metadata(s).ok())
-                .ok_or("missing source"),
-        ) {
-            use std::os::unix::fs::MetadataExt;
-            if a.dev() == b.dev() {
-                let _ = ev.send(Event::Started {
-                    id,
-                    kind: req.kind,
-                    total_bytes: 0,
-                    total_items: req.sources.len() as u64,
-                });
-                let mut policy = ConflictPolicy::default();
-                for (n, src) in req.sources.iter().enumerate() {
-                    let name = src.file_name().ok_or("nameless source")?;
-                    let mut target = dest_dir.join(name);
-                    if target.exists() && target != *src {
-                        match resolve_conflict(id, dest_dir, name, &mut policy, ev)? {
-                            Do::Skip => continue,
-                            Do::Overwrite => {
-                                if let Some(item) = trash_and_record(&target)? {
-                                    displaced.push(item);
-                                }
-                            }
-                            Do::Rename(new_name) => target = dest_dir.join(new_name),
+        let same: Vec<&PathBuf> = req
+            .sources
+            .iter()
+            .filter(|s| std::fs::symlink_metadata(s).is_ok_and(|m| m.dev() == dest_dev))
+            .collect();
+        if !same.is_empty() {
+            let _ = ev.send(Event::Started { id, kind: req.kind, total_bytes: 0, total_items: same.len() as u64 });
+        }
+        let mut renamed = 0u64;
+        for src in &req.sources {
+            if !same.contains(&src) {
+                to_copy.push(src);
+                continue;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            let Some(target) = decide(id, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)? else { continue };
+            if target == *src {
+                continue;
+            }
+            loop {
+                match std::fs::rename(src, &target) {
+                    Ok(()) => {
+                        done.moved.push((target.clone(), src.clone()));
+                        break;
+                    }
+                    Err(e) => match ask_error(id, src, &e.to_string(), &mut errors, ev)? {
+                        OnError::Retry => continue,
+                        OnError::Skip => {
+                            done.failed.push(display_name(src));
+                            break;
                         }
-                    }
-                    std::fs::rename(src, &target).map_err(|e| e.to_string())?;
-                    moved.push((target.clone(), src.clone()));
-                    let _ = ev.send(Event::Progress {
-                        id,
-                        bytes_done: 0,
-                        items_done: n as u64 + 1,
-                        current: name.to_string_lossy().into_owned(),
-                    });
+                    },
                 }
-                if !moved.is_empty() || !displaced.is_empty() {
-                    *undo = Some(UndoRecord { action: UndoAction::Moved(moved), displaced });
-                }
-                return Ok(());
             }
+            renamed += 1;
+            let _ = ev.send(Event::Progress { id, bytes_done: 0, items_done: renamed, current: display_name(src) });
         }
+    } else {
+        to_copy = req.sources.iter().collect();
+    }
+    if to_copy.is_empty() {
+        return Ok(());
     }
 
-    // Pre-scan: totals for honest progress, done before touching anything.
-    let mut files: Vec<(PathBuf, PathBuf, u64)> = Vec::new(); // (src, rel, bytes)
-    let mut dirs: Vec<PathBuf> = Vec::new(); // relative
+    // Copying, and moving between filesystems. Pre-scan first: totals for honest progress,
+    // done before touching anything.
+    let mut files: Vec<(PathBuf, PathBuf, u64)> = Vec::new(); // (src, rel to the root's parent, bytes)
+    let mut dirs: Vec<PathBuf> = Vec::new(); // rel to the root's parent
     let mut total_bytes = 0u64;
-    for src in &req.sources {
-        let base = src.parent().unwrap_or(Path::new("/"));
-        scan(src, base, &mut files, &mut dirs, &mut total_bytes)?;
-    }
-    let _ = ev.send(Event::Started {
-        id,
-        kind: req.kind,
-        total_bytes,
-        total_items: files.len() as u64,
-    });
-
-    // Top-level conflicts are decided up front; nested paths follow their root's fate.
-    let mut policy = ConflictPolicy::default();
-    let mut skipped_roots: Vec<PathBuf> = Vec::new();
-    // (source root name, name it is written under) for roots the user chose to keep both of.
-    let mut renamed_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for src in &req.sources {
-        let name = src.file_name().ok_or("nameless source")?;
-        let target = dest_dir.join(name);
-        if target.exists() {
-            match resolve_conflict(id, dest_dir, name, &mut policy, ev)? {
-                Do::Skip => skipped_roots.push(PathBuf::from(name)),
-                Do::Overwrite => {
-                    if let Some(item) = trash_and_record(&target)? {
-                        displaced.push(item);
-                    }
-                }
-                Do::Rename(new_name) => renamed_roots.push((PathBuf::from(name), PathBuf::from(new_name))),
-            }
-        }
-    }
-    // Where a relative path lands: under its root's new name if that root was renamed.
-    let dest_of = |rel: &Path| -> PathBuf {
-        for (from, to) in &renamed_roots {
-            if let Ok(tail) = rel.strip_prefix(from) {
-                // The root itself strips to "", and join("") appends a trailing slash that
-                // makes the kernel treat a file path as a directory.
-                return if tail.as_os_str().is_empty() {
-                    dest_dir.join(to)
-                } else {
-                    dest_dir.join(to).join(tail)
-                };
-            }
-        }
-        dest_dir.join(rel)
-    };
-
-    for rel in &dirs {
-        if skipped_roots.iter().any(|r| rel.starts_with(r)) {
-            continue;
-        }
-        std::fs::create_dir_all(dest_of(rel)).map_err(|e| e.to_string())?;
-    }
-
-    let mut bytes_done = 0u64;
-    for (n, (src, rel, size)) in files.iter().enumerate() {
-        if skipped_roots.iter().any(|r| rel.starts_with(r)) {
-            continue;
-        }
+    let mut roots: Vec<(&Path, std::ops::Range<usize>, std::ops::Range<usize>)> = Vec::new();
+    for src in &to_copy {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let target = dest_of(rel);
-        copy_file(src, &target, cancel, &mut |done| {
-            let _ = ev.send(Event::Progress {
-                id,
-                bytes_done: bytes_done + done,
-                items_done: n as u64,
-                current: rel.to_string_lossy().into_owned(),
-            });
-        })?;
-        bytes_done += size;
+        let base = src.parent().unwrap_or(Path::new("/"));
+        let (f0, d0) = (files.len(), dirs.len());
+        scan(src, base, &mut files, &mut dirs, &mut total_bytes)?;
+        roots.push((src.as_path(), f0..files.len(), d0..dirs.len()));
+    }
+    let _ = ev.send(Event::Started { id, kind: req.kind, total_bytes, total_items: files.len() as u64 });
+
+    // Every root's destination is settled before the first byte is written.
+    let mut targets: Vec<Option<PathBuf>> = Vec::new();
+    for (src, ..) in &roots {
+        targets.push(decide(id, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)?);
     }
 
-    // Record what actually landed: every source root that was not skipped, under the name
-    // it was really written as.
-    for src in &req.sources {
-        let name = src.file_name().ok_or("nameless source")?;
-        if skipped_roots.iter().any(|r| Path::new(name) == r) {
+    let mut bytes_done = 0u64;
+    let mut items_done = 0u64;
+    for ((src_root, file_range, dir_range), target_root) in roots.into_iter().zip(targets) {
+        let Some(target_root) = target_root else { continue };
+        if req.kind == OpKind::Copy {
+            // Recorded before it is written, so undo also clears a copy that stopped half-way.
+            done.created.push(target_root.clone());
+        }
+        let root_name = src_root.file_name().unwrap_or_default();
+        // Below the root, a path keeps its place; the root itself may have a new name.
+        let dest_of = |rel: &Path| -> PathBuf {
+            match rel.strip_prefix(root_name) {
+                // The root strips to "", and join("") would append a slash that makes the
+                // kernel treat a file path as a directory.
+                Ok(tail) if !tail.as_os_str().is_empty() => target_root.join(tail),
+                _ => target_root.clone(),
+            }
+        };
+        let copied = copy_root(id, cancel, ev, &mut errors, done, &files[file_range.clone()], &dirs[dir_range.clone()], &dest_of, &mut bytes_done, &mut items_done);
+        let copied = match copied {
+            Ok(c) => c,
+            Err(e) => {
+                if req.kind == OpKind::Move {
+                    // The originals are all still in place; the half copy is only ours.
+                    let _ = remove_any(&target_root);
+                }
+                return Err(e);
+            }
+        };
+        if req.kind != OpKind::Move {
             continue;
         }
-        let target = dest_of(Path::new(name));
-        if req.kind == OpKind::Move {
-            moved.push((target, src.clone()));
-        } else {
-            created.push(target);
-        }
-    }
-
-    if req.kind == OpKind::Move {
-        for src in &req.sources {
-            let name = src.file_name().ok_or("nameless source")?;
-            if skipped_roots.iter().any(|r| Path::new(name) == r) {
-                continue;
+        if copied.iter().all(|c| *c) && done.failed.iter().all(|f| !Path::new(f).starts_with(root_name)) {
+            // Everything arrived: the source goes, and undo moves the whole root back.
+            match remove_any(src_root) {
+                Ok(()) => done.moved.push((target_root.clone(), src_root.to_path_buf())),
+                Err(e) => done.failed.push(format!("{} (copied, but the original could not be removed: {e})", display_name(src_root))),
             }
-            remove_any(src)?;
+        } else {
+            // Only the files that arrived leave the source; the rest stay where they were, with
+            // the folders that still hold them.
+            for ((src, rel, _), ok) in files[file_range].iter().zip(&copied) {
+                if *ok && std::fs::remove_file(src).is_ok() {
+                    done.moved.push((dest_of(rel), src.clone()));
+                }
+            }
+            // Its folders here were all made by this move (the root was new), so undo may
+            // take them away again once the files are back.
+            done.emptied.extend(dirs[dir_range.clone()].iter().rev().map(|rel| dest_of(rel)));
+            let base = src_root.parent().unwrap_or(Path::new("/"));
+            for rel in dirs[dir_range].iter().rev() {
+                let _ = std::fs::remove_dir(base.join(rel)); // fails, as it should, unless empty
+            }
         }
     }
+    Ok(())
+}
 
-    let action = if req.kind == OpKind::Move {
-        UndoAction::Moved(moved)
-    } else {
-        UndoAction::Copied(created)
-    };
+/// Copy one source root's folders and files to where `dest_of` puts them. Returns, per file,
+/// whether it arrived.
+#[allow(clippy::too_many_arguments)]
+fn copy_root(
+    id: u64,
+    cancel: &AtomicBool,
+    ev: &Sender<Event>,
+    errors: &mut ErrorPolicy,
+    done: &mut Transferred,
+    files: &[(PathBuf, PathBuf, u64)],
+    dirs: &[PathBuf],
+    dest_of: &dyn Fn(&Path) -> PathBuf,
+    bytes_done: &mut u64,
+    items_done: &mut u64,
+) -> Result<Vec<bool>, String> {
+    let mut failed_dirs: Vec<&Path> = Vec::new();
+    for rel in dirs {
+        if failed_dirs.iter().any(|f| rel.starts_with(f)) {
+            continue;
+        }
+        loop {
+            match std::fs::create_dir_all(dest_of(rel)) {
+                Ok(()) => break,
+                Err(e) => match ask_error(id, rel, &e.to_string(), errors, ev)? {
+                    OnError::Retry => continue,
+                    OnError::Skip => {
+                        done.failed.push(rel.to_string_lossy().into_owned());
+                        failed_dirs.push(rel);
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    let mut copied = vec![false; files.len()];
+    for (i, (src, rel, size)) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        if failed_dirs.iter().any(|f| rel.starts_with(f)) {
+            continue;
+        }
+        let target = dest_of(rel);
+        loop {
+            let result = copy_file(src, &target, cancel, &mut |n| {
+                let _ = ev.send(Event::Progress {
+                    id,
+                    bytes_done: *bytes_done + n,
+                    items_done: *items_done,
+                    current: rel.to_string_lossy().into_owned(),
+                });
+            });
+            match result {
+                Ok(()) => {
+                    copied[i] = true;
+                    break;
+                }
+                Err(e) if cancel.load(Ordering::Relaxed) => return Err(e),
+                Err(e) => {
+                    // What a failed copy left behind is part of a file, never something the
+                    // user had: the target did not exist (conflicts are settled before this).
+                    let _ = std::fs::remove_file(&target);
+                    match ask_error(id, rel, &e, errors, ev)? {
+                        OnError::Retry => continue,
+                        OnError::Skip => {
+                            done.failed.push(rel.to_string_lossy().into_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        *bytes_done += size;
+        *items_done += 1;
+    }
+    Ok(copied)
+}
+
+/// Where one source goes: its own name in the destination, unless that is taken. None: skipped.
+fn decide(
+    id: u64,
+    dest_dir: &Path,
+    src: &Path,
+    claimed: &mut std::collections::HashSet<std::ffi::OsString>,
+    conflicts: &mut ConflictPolicy,
+    displaced: &mut Vec<trash::TrashItem>,
+    ev: &Sender<Event>,
+) -> Result<Option<PathBuf>, String> {
+    let name = src.file_name().ok_or("nameless source")?.to_os_string();
+    let mut target = dest_dir.join(&name);
+    if claimed.contains(&name) {
+        // Taken by another source of this same operation, not by anything the user had: both
+        // are kept, without asking.
+        target = dest_dir.join(free_name(dest_dir, &name, claimed));
+    } else if target.symlink_metadata().is_ok() && target != src {
+        match resolve_conflict(id, &name, conflicts, ev)? {
+            Do::Skip => return Ok(None),
+            Do::Overwrite => {
+                if let Some(item) = trash_and_record(&target)? {
+                    displaced.push(item);
+                }
+            }
+            Do::Rename => target = dest_dir.join(free_name(dest_dir, &name, claimed)),
+        }
+    }
+    claimed.insert(target.file_name().unwrap_or_default().to_os_string());
+    Ok(Some(target))
+}
+
+/// The undo record and the summary of what was left out, at the end of a transfer.
+fn finish(req: &Request, done: Transferred, undo: &mut Option<UndoRecord>, warning: &mut Option<String>) {
+    let Transferred { moved, created, displaced, failed, emptied } = done;
+    let action = if req.kind == OpKind::Move { UndoAction::Moved(moved) } else { UndoAction::Copied(created) };
     let empty = match &action {
         UndoAction::Moved(v) => v.is_empty(),
         UndoAction::Copied(v) => v.is_empty(),
         _ => true,
     };
     if !empty || !displaced.is_empty() {
-        *undo = Some(UndoRecord { action, displaced });
+        *undo = Some(UndoRecord { action, displaced, emptied });
     }
-    Ok(())
+    if !failed.is_empty() {
+        const SHOWN: usize = 5;
+        let mut list = failed.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+        if failed.len() > SHOWN {
+            list.push_str(&format!(" and {} more", failed.len() - SHOWN));
+        }
+        let verb = if req.kind == OpKind::Move { "moved" } else { "copied" };
+        *warning = Some(format!("Not {verb}: {list}"));
+    }
+}
+
+fn display_name(p: &Path) -> String {
+    p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned()
+}
+
+/// First free "name (n).ext" in `dir` that this operation has not already taken either.
+fn free_name(dir: &Path, name: &std::ffi::OsStr, claimed: &std::collections::HashSet<std::ffi::OsString>) -> std::ffi::OsString {
+    if !claimed.contains(name) && dir.join(name).symlink_metadata().is_err() {
+        return name.to_os_string();
+    }
+    let mut taken: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        let candidate = free_sibling_name_skipping(dir, name, &taken);
+        if !claimed.contains(&candidate) {
+            return candidate;
+        }
+        taken.push(candidate);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ErrorAnswer {
+    Retry,
+    Skip,
+    SkipAll,
+    Cancel,
+}
+
+enum OnError {
+    Retry,
+    Skip,
+}
+
+#[derive(Default)]
+struct ErrorPolicy {
+    skip_all: bool,
+}
+
+/// One item of a copy or move failed: ask whether to try it again, leave it out, or stop.
+fn ask_error(id: u64, what: &Path, error: &str, policy: &mut ErrorPolicy, ev: &Sender<Event>) -> Result<OnError, String> {
+    if policy.skip_all {
+        return Ok(OnError::Skip);
+    }
+    let (tx, rx) = channel();
+    let _ = ev.send(Event::Error {
+        id,
+        name: what.to_string_lossy().into_owned(),
+        error: error.to_string(),
+        reply: tx,
+    });
+    match rx.recv().map_err(|_| "ui gone")? {
+        ErrorAnswer::Retry => Ok(OnError::Retry),
+        ErrorAnswer::Skip => Ok(OnError::Skip),
+        ErrorAnswer::SkipAll => {
+            policy.skip_all = true;
+            Ok(OnError::Skip)
+        }
+        ErrorAnswer::Cancel => Err("cancelled".into()),
+    }
 }
 
 enum Do {
     Overwrite,
     Skip,
-    /// Write under this name instead of the source's.
-    Rename(std::ffi::OsString),
+    /// Keep both: written under the first free "name (n)".
+    Rename,
 }
 
 /// Sticky "... all" answers for one operation.
@@ -962,7 +1178,13 @@ struct ConflictPolicy {
 
 /// First free "name (n).ext" sibling in `dir`, the name Dolphin and Nautilus would pick.
 /// Directories and dot-files have no extension to preserve, so they get "name (n)".
+#[cfg(test)]
 fn free_sibling_name(dir: &Path, name: &std::ffi::OsStr) -> std::ffi::OsString {
+    free_sibling_name_skipping(dir, name, &[])
+}
+
+/// The same, passing over names in `skip` as if they were taken.
+fn free_sibling_name_skipping(dir: &Path, name: &std::ffi::OsStr, skip: &[std::ffi::OsString]) -> std::ffi::OsString {
     let p = Path::new(name);
     let is_dir = dir.join(name).is_dir();
     let (stem, ext) = match (p.file_stem(), p.extension()) {
@@ -975,7 +1197,7 @@ fn free_sibling_name(dir: &Path, name: &std::ffi::OsStr) -> std::ffi::OsString {
             Some(ext) => format!("{stem} ({n}).{ext}"),
             None => format!("{stem} ({n})"),
         };
-        if !dir.join(&candidate).exists() {
+        if dir.join(&candidate).symlink_metadata().is_err() && !skip.iter().any(|t| *t == *candidate) {
             return candidate.into();
         }
         n += 1;
@@ -984,7 +1206,6 @@ fn free_sibling_name(dir: &Path, name: &std::ffi::OsStr) -> std::ffi::OsString {
 
 fn resolve_conflict(
     id: u64,
-    dest_dir: &Path,
     name: &std::ffi::OsStr,
     policy: &mut ConflictPolicy,
     ev: &Sender<Event>,
@@ -996,7 +1217,7 @@ fn resolve_conflict(
         return Ok(Do::Skip);
     }
     if policy.rename_all {
-        return Ok(Do::Rename(free_sibling_name(dest_dir, name)));
+        return Ok(Do::Rename);
     }
     let (tx, rx) = channel();
     let _ = ev.send(Event::Conflict {
@@ -1007,7 +1228,7 @@ fn resolve_conflict(
     match rx.recv().map_err(|_| "ui gone")? {
         ConflictAnswer::Overwrite => Ok(Do::Overwrite),
         ConflictAnswer::Skip => Ok(Do::Skip),
-        ConflictAnswer::Rename => Ok(Do::Rename(free_sibling_name(dest_dir, name))),
+        ConflictAnswer::Rename => Ok(Do::Rename),
         ConflictAnswer::OverwriteAll => {
             policy.overwrite_all = true;
             Ok(Do::Overwrite)
@@ -1018,10 +1239,44 @@ fn resolve_conflict(
         }
         ConflictAnswer::RenameAll => {
             policy.rename_all = true;
-            Ok(Do::Rename(free_sibling_name(dest_dir, name)))
+            Ok(Do::Rename)
         }
         ConflictAnswer::Cancel => Err("cancelled".into()),
     }
+}
+
+/// Rename, or where the two are on different filesystems (undoing a move from one drive to
+/// another), copy and then remove the original once all of it has arrived.
+fn move_path(from: &Path, to: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    match std::fs::rename(from, to) {
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
+        other => return other.map_err(|e| e.to_string()),
+    }
+    if to.symlink_metadata().is_ok() {
+        return Err(format!("{} already exists", to.display()));
+    }
+    let base = from.parent().unwrap_or(Path::new("/"));
+    let (mut files, mut dirs, mut total) = (Vec::new(), Vec::new(), 0u64);
+    scan(from, base, &mut files, &mut dirs, &mut total)?;
+    let root = from.file_name().unwrap_or_default();
+    let dest_of = |rel: &Path| match rel.strip_prefix(root) {
+        Ok(tail) if !tail.as_os_str().is_empty() => to.join(tail),
+        _ => to.to_path_buf(),
+    };
+    let copied = (|| -> Result<(), String> {
+        for rel in &dirs {
+            std::fs::create_dir_all(dest_of(rel)).map_err(|e| e.to_string())?;
+        }
+        for (src, rel, _) in &files {
+            copy_file(src, &dest_of(rel), cancel, &mut |_| {})?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = copied {
+        let _ = remove_any(to); // only the half copy; the original is untouched
+        return Err(e);
+    }
+    remove_any(from)
 }
 
 fn remove_any(path: &Path) -> Result<(), String> {
@@ -1270,6 +1525,96 @@ mod tests {
             !dst.join("src/stale").exists(),
             "overwrite replaced the old tree"
         );
+    }
+
+    /// Runs an operation, answering every failed item with `on_error`; hands back the undo
+    /// record, the warning, and how many items were asked about.
+    fn run_answering(req: Request, on_error: ErrorAnswer) -> (Option<UndoRecord>, Option<String>, usize) {
+        let (tx, rx) = channel();
+        let handle = std::thread::spawn(move || run(1, req, &AtomicBool::new(false), &tx));
+        let mut asked = 0;
+        let out = loop {
+            match rx.recv().expect("worker alive") {
+                Event::Done { undo, warning, .. } => break (undo, warning),
+                Event::Failed { error, .. } => panic!("op failed: {error}"),
+                Event::Conflict { reply, .. } => reply.send(ConflictAnswer::Overwrite).unwrap(),
+                Event::Error { reply, .. } => {
+                    asked += 1;
+                    reply.send(on_error).unwrap();
+                }
+                _ => {}
+            }
+        };
+        handle.join().unwrap();
+        (out.0, out.1, asked)
+    }
+
+    /// An unreadable file in the middle: the others still arrive, the user is told which one
+    /// did not, and a move leaves exactly that one (and the folder holding it) in place.
+    #[test]
+    fn a_failing_file_is_skipped_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        for kind in [OpKind::Copy, OpKind::Move] {
+            let (src, _) = setup(&format!("skip-{kind:?}"));
+            std::fs::write(src.join("sub/locked.txt"), b"x").unwrap();
+            std::fs::set_permissions(src.join("sub/locked.txt"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Another filesystem, so the move copies too.
+            let dst = PathBuf::from(format!("/dev/shm/vantaexplorer-skip-{kind:?}"));
+            let _ = std::fs::remove_dir_all(&dst);
+            std::fs::create_dir_all(&dst).unwrap();
+            let (undo, warning, asked) = run_answering(Request::new(kind, vec![src.clone()], Some(dst.clone())), ErrorAnswer::SkipAll);
+            assert_eq!(asked, 1);
+            assert!(warning.is_some_and(|w| w.contains("locked.txt")));
+            assert_eq!(std::fs::read(dst.join("src/a.txt")).unwrap(), b"hello");
+            assert_eq!(std::fs::read(dst.join("src/sub/n.txt")).unwrap(), b"nested");
+            assert!(!dst.join("src/sub/locked.txt").exists(), "no half file left behind");
+            if kind == OpKind::Move {
+                assert!(!src.join("a.txt").exists() && !src.join("sub/n.txt").exists(), "what arrived left the source");
+                assert!(src.join("sub/locked.txt").symlink_metadata().is_ok(), "what did not, stayed");
+                let Some(UndoRecord { action: UndoAction::Moved(pairs), emptied, .. }) = undo else { panic!("no undo") };
+                assert_eq!(pairs.len(), 2, "undo moves back the two files that moved");
+                let back = Request { kind: OpKind::MoveExact, pairs, sources: emptied, ..Default::default() };
+                run_answering(back, ErrorAnswer::Cancel);
+                assert_eq!(std::fs::read(src.join("sub/n.txt")).unwrap(), b"nested");
+                assert!(!dst.join("src").exists(), "the folders the move made are gone again");
+            }
+            std::fs::set_permissions(src.join("sub/locked.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::remove_dir_all(&dst);
+        }
+    }
+
+    /// Two sources with the same name (search results from different folders): both arrive,
+    /// the second under a numbered name, and nothing is asked.
+    #[test]
+    fn sources_with_the_same_name_are_both_kept() {
+        for kind in [OpKind::Copy, OpKind::Move] {
+            let (src, dst) = setup(&format!("same-name-{kind:?}"));
+            std::fs::write(src.join("sub/a.txt"), b"second").unwrap();
+            let (_, warning, asked) = run_answering(
+                Request::new(kind, vec![src.join("a.txt"), src.join("sub/a.txt")], Some(dst.clone())),
+                ErrorAnswer::Cancel,
+            );
+            assert_eq!((asked, warning), (0, None));
+            assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
+            assert_eq!(std::fs::read(dst.join("a (1).txt")).unwrap(), b"second");
+        }
+    }
+
+    /// A move between filesystems is undone by copying back, not by a rename that cannot work.
+    #[test]
+    fn a_move_to_another_filesystem_can_be_undone() {
+        let (src, _) = setup("undo-cross");
+        let dst = PathBuf::from("/dev/shm/vantaexplorer-undo-cross");
+        let _ = std::fs::remove_dir_all(&dst);
+        std::fs::create_dir_all(&dst).unwrap();
+        let (undo, ..) = run_answering(Request::new(OpKind::Move, vec![src.join("sub")], Some(dst.clone())), ErrorAnswer::Cancel);
+        assert!(!src.join("sub").exists());
+        let Some(UndoRecord { action: UndoAction::Moved(pairs), .. }) = undo else { panic!("no undo") };
+        let back = Request { kind: OpKind::MoveExact, pairs: pairs.clone(), ..Default::default() };
+        run_answering(back, ErrorAnswer::Cancel);
+        assert_eq!(std::fs::read(src.join("sub/n.txt")).unwrap(), b"nested");
+        assert!(!dst.join("sub").exists());
+        let _ = std::fs::remove_dir_all(&dst);
     }
 
     /// Same harness as run_and_drain but hands back the undo record.

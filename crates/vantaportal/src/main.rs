@@ -229,7 +229,95 @@ fn answer(printed: &str, options: &Options) -> (u32, Options) {
     (CHOSEN, results)
 }
 
+/// "Show in folder" from other programs: a browser's downloads, a chat program's files. They ask
+/// `org.freedesktop.FileManager1`, and with `--file-manager` (started for that name by its own
+/// D-Bus entry, which is opt-in: Dolphin and Nautilus answer to the same name) this answers by
+/// opening Vanta Explorer there.
+struct FileManager;
+
+#[zbus::interface(name = "org.freedesktop.FileManager1")]
+impl FileManager {
+    /// Each folder in a window of its own.
+    fn show_folders(&self, uris: Vec<String>, _startup_id: String) {
+        for path in uris.iter().filter_map(|u| local_path(u)) {
+            open_explorer(&path);
+        }
+    }
+
+    /// The folder each item is in, with the item selected: one window per folder.
+    fn show_items(&self, uris: Vec<String>, _startup_id: String) {
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for path in uris.iter().filter_map(|u| local_path(u)) {
+            let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            if !seen.contains(&parent) {
+                seen.push(parent);
+                open_explorer(&path);
+            }
+        }
+    }
+
+    /// No properties window yet: the item is shown instead, which is what the asker can use.
+    fn show_item_properties(&self, uris: Vec<String>, startup_id: String) {
+        self.show_items(uris, startup_id);
+    }
+}
+
+/// Vanta Explorer on `path`: a folder opens, a file opens its folder with it selected.
+fn open_explorer(path: &Path) {
+    match Command::new(explorer()).arg(path).stdin(Stdio::null()).spawn() {
+        // Waited for on a thread of its own, so it does not linger as a zombie.
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => log(format!("could not start Vanta Explorer: {e}")),
+    }
+}
+
+/// The path of a `file://` URI (percent-decoded, any host part dropped), or a plain path as is.
+fn local_path(uri: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let rest = match uri.strip_prefix("file://") {
+        Some(rest) => &rest[rest.find('/')?..],
+        None if uri.starts_with('/') => uri,
+        None => return None,
+    };
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--file-manager") {
+        let built = zbus::blocking::connection::Builder::session()
+            .and_then(|b| b.name("org.freedesktop.FileManager1"))
+            .and_then(|b| b.serve_at("/org/freedesktop/FileManager1", FileManager))
+            .and_then(|b| b.build());
+        match built {
+            Ok(_conn) => {
+                log("answering org.freedesktop.FileManager1");
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(e) => {
+                log(format!("could not take org.freedesktop.FileManager1 (another file manager has it?): {e}"));
+                std::process::exit(1);
+            }
+        }
+    }
     let open: Open = Arc::default();
     let built = zbus::blocking::connection::Builder::session()
         .and_then(|b| b.name(NAME))
@@ -256,6 +344,15 @@ mod tests {
 
     fn owned<'a>(v: impl Into<Value<'a>>) -> OwnedValue {
         OwnedValue::try_from(v.into()).unwrap()
+    }
+
+    #[test]
+    fn show_in_folder_takes_file_uris() {
+        assert_eq!(local_path("file:///home/u/My%20Files/a%C3%A6.txt"), Some(PathBuf::from("/home/u/My Files/aæ.txt")));
+        assert_eq!(local_path("file://localhost/tmp/x"), Some(PathBuf::from("/tmp/x")));
+        assert_eq!(local_path("/tmp/plain"), Some(PathBuf::from("/tmp/plain")));
+        assert_eq!(local_path("file:///tmp/100%"), Some(PathBuf::from("/tmp/100%")));
+        assert_eq!(local_path("https://example.com/a"), None);
     }
 
     #[test]

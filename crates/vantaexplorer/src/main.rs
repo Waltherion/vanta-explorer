@@ -168,6 +168,7 @@ fn main() -> Result<()> {
             active: Vec::new(),
             drop_menu: None,
             pending_conflict: None,
+            pending_error: None,
             clipboard: None,
             open_with: None,
             pending_delete: None,
@@ -244,6 +245,8 @@ struct OpsState {
         String,
         std::sync::mpsc::Sender<fileops::ConflictAnswer>,
     )>,
+    /// An item of a copy or move failed: (op, item, error, answer).
+    pending_error: Option<(u64, String, String, std::sync::mpsc::Sender<fileops::ErrorAnswer>)>,
     drop_menu: Option<(Vec<std::path::PathBuf>, std::path::PathBuf, egui::Pos2)>,
     clipboard: Option<(Vec<std::path::PathBuf>, bool)>,
     open_with: Option<OpenWithState>,
@@ -293,6 +296,8 @@ struct OpUi {
     items_done: u64,
     current: String,
     error: Option<String>,
+    /// The operation went through, but `error` lists what it left out: shown until dismissed.
+    finished: bool,
 }
 
 struct Gfx {
@@ -669,6 +674,7 @@ impl ApplicationHandler for App {
                         items_done: 0,
                         current: String::new(),
                         error: None,
+                        finished: false,
                     });
                 }
                 fileops::Event::Progress {
@@ -686,15 +692,23 @@ impl ApplicationHandler for App {
                 fileops::Event::Conflict { id, name, reply } => {
                     self.ops_state.pending_conflict = Some((id, name, reply));
                 }
+                fileops::Event::Error { id, name, error, reply } => {
+                    self.ops_state.pending_error = Some((id, name, error, reply));
+                }
                 fileops::Event::Done {
                     id,
                     affected,
                     undo,
                     warning,
                 } => {
-                    if let Some(w) = warning {
-                        self.ops_state.toast = Some((w, Instant::now()));
-                    }
+                    // What was left out stays on screen until dismissed: a toast is gone before
+                    // anyone reads a list of files.
+                    let notice = warning.and_then(|w| {
+                        let op = self.ops_state.active.iter_mut().find(|o| o.id == id)?;
+                        op.error = Some(w);
+                        op.finished = true;
+                        Some(())
+                    });
                     if let Some(rec) = undo {
                         match self.ops_state.reversing.remove(&id) {
                             Some(Reversal::Undo) => self.ops_state.redo.push(rec),
@@ -708,7 +722,9 @@ impl ApplicationHandler for App {
                     } else {
                         self.ops_state.reversing.remove(&id);
                     }
-                    self.ops_state.active.retain(|o| o.id != id);
+                    if notice.is_none() {
+                        self.ops_state.active.retain(|o| o.id != id);
+                    }
                     self.ops_state.ops.forget(id);
                     reload_affected(&mut self.ws, &affected);
                 }
@@ -1255,6 +1271,7 @@ fn draw(
                 app_ops.undo.push(fileops::UndoRecord {
                     action: fileops::UndoAction::Renamed { from, to },
                     displaced: Vec::new(),
+                    emptied: Vec::new(),
                 });
                 app_ops.redo.clear();
             }
@@ -1273,6 +1290,7 @@ fn draw(
                 app_ops.undo.push(fileops::UndoRecord {
                     action: fileops::UndoAction::Copied(vec![path]),
                     displaced: Vec::new(),
+                    emptied: Vec::new(),
                 });
                 app_ops.redo.clear();
             }
@@ -1432,6 +1450,7 @@ fn app_ui(
     let modal_open = help::is_open(root.ctx())
         || app_ops.pending_delete.is_some()
         || app_ops.pending_conflict.is_some()
+        || app_ops.pending_error.is_some()
         || app_ops.open_with.is_some()
         || chooser.as_ref().is_some_and(|c| c.replace.is_some());
 
@@ -1860,6 +1879,7 @@ fn inverse_request(rec: &fileops::UndoRecord) -> Option<fileops::Request> {
         UndoAction::Moved(pairs) if !pairs.is_empty() => Some(Request {
             kind: OpKind::MoveExact,
             pairs: pairs.clone(),
+            sources: rec.emptied.clone(),
             ..Default::default()
         }),
         UndoAction::Copied(created) if !created.is_empty() => {
@@ -1968,6 +1988,12 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 let mut dismiss: Option<u64> = None;
                 for op in &app_ops.active {
                     ui.horizontal(|ui| match &op.error {
+                        Some(e) if op.finished => {
+                            ui.colored_label(egui::Color32::from_rgb(240, 200, 90), e);
+                            if ui.small_button("Dismiss").clicked() {
+                                dismiss = Some(op.id);
+                            }
+                        }
                         Some(e) => {
                             ui.colored_label(
                                 egui::Color32::LIGHT_RED,
@@ -2156,6 +2182,45 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
     }
     if let Some(a) = answer {
         if let Some((_, _, reply)) = app_ops.pending_conflict.take() {
+            let _ = reply.send(a);
+        }
+    }
+
+    // One item of a copy or move failed; the rest wait for the answer.
+    let mut answer: Option<fileops::ErrorAnswer> = None;
+    if let Some((id, name, error, _)) = &app_ops.pending_error {
+        let moving = app_ops.active.iter().any(|o| o.id == *id && o.kind == fileops::OpKind::Move);
+        egui::Window::new(if moving { "Could not move" } else { "Could not copy" })
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("'{name}'"));
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Try again").clicked() {
+                        answer = Some(fileops::ErrorAnswer::Retry);
+                    }
+                    if ui.button("Skip").clicked() {
+                        answer = Some(fileops::ErrorAnswer::Skip);
+                    }
+                    if ui.button("Skip all").on_hover_text("Leave out every item that fails from here on").clicked() {
+                        answer = Some(fileops::ErrorAnswer::SkipAll);
+                    }
+                    ui.separator();
+                    if ui
+                        .button(egui::RichText::new("Stop").color(egui::Color32::LIGHT_RED))
+                        .on_hover_text("What is done so far stays, and undo can reverse it")
+                        .clicked()
+                    {
+                        answer = Some(fileops::ErrorAnswer::Cancel);
+                    }
+                });
+            });
+    }
+    if let Some(a) = answer {
+        if let Some((.., reply)) = app_ops.pending_error.take() {
             let _ = reply.send(a);
         }
     }

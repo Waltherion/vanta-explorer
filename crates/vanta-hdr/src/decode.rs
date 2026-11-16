@@ -275,25 +275,29 @@ fn code_table(tf: Tf) -> std::sync::Arc<Vec<f16>> {
     t
 }
 
-/// Nearest-neighbour box scale on interleaved RGBA f32, used when a decoder cannot scale.
-pub(crate) fn downscale_rgba(src: &[f32], w: u32, h: u32, max_dim: u32) -> (Vec<f32>, u32, u32) {
+/// The size a thumbnail of (w, h) is decoded at: neither side above `max_dim` (0: no limit).
+pub(crate) fn scaled_size(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
     if max_dim == 0 || (w <= max_dim && h <= max_dim) {
-        return (src.to_vec(), w, h);
+        return (w, h);
     }
     let scale = (max_dim as f32 / w.max(h) as f32).min(1.0);
-    let nw = ((w as f32 * scale).round() as u32).max(1);
-    let nh = ((h as f32 * scale).round() as u32).max(1);
-    let mut out = vec![0.0f32; (nw as usize) * (nh as usize) * 4];
-    out.par_chunks_mut(nw as usize * 4)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let sy = (y as u64 * h as u64 / nh as u64).min(h as u64 - 1) as usize;
-            for x in 0..nw as usize {
-                let sx = (x as u64 * w as u64 / nw as u64).min(w as u64 - 1) as usize;
-                let si = (sy * w as usize + sx) * 4;
-                row[x * 4..x * 4 + 4].copy_from_slice(&src[si..si + 4]);
-            }
-        });
+    (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1))
+}
+
+/// Float RGBA at the scaled size, each pixel read from the decoder's own buffer by `at(x, y)`
+/// (nearest neighbour). A thumbnail of a large picture then never holds
+/// the whole picture as float, which is four times its 8-bit size and for a 50-megapixel
+/// photo close to a gigabyte, per decoding thread.
+pub(crate) fn sample_rgba(w: u32, h: u32, max_dim: u32, at: impl Fn(usize, usize) -> [f32; 4] + Sync) -> (Vec<f32>, u32, u32) {
+    let (nw, nh) = scaled_size(w, h, max_dim);
+    let mut out = vec![0.0f32; nw as usize * nh as usize * 4];
+    out.par_chunks_mut(nw as usize * 4).enumerate().for_each(|(y, row)| {
+        let sy = (y as u64 * h as u64 / nh as u64).min(h as u64 - 1) as usize;
+        for x in 0..nw as usize {
+            let sx = (x as u64 * w as u64 / nw as u64).min(w as u64 - 1) as usize;
+            row[x * 4..x * 4 + 4].copy_from_slice(&at(sx, sy));
+        }
+    });
     (out, nw, nh)
 }
 

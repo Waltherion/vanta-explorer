@@ -86,6 +86,10 @@ package() {
     "$pkgdir/usr/share/xdg-desktop-portal/portals/vanta.portal"
   install -Dm644 crates/vantaexplorer/org.freedesktop.impl.portal.desktop.vanta.service \
     "$pkgdir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.vanta.service"
+  # "Show in folder" from other programs. Not installed where D-Bus looks: Dolphin and Nautilus
+  # answer to the same name, so it is copied into place by whoever wants it (docs/install.md).
+  install -Dm644 crates/vantaexplorer/org.freedesktop.FileManager1.service \
+    -t "$pkgdir/usr/share/vantaexplorer"
 
   # Its own icons: the folders, file types and drives of KDE's Breeze (LGPL-3.0-or-later, see
   # the README there), as an icon theme of their own. -d keeps the links between them.

@@ -1,7 +1,7 @@
 //! JPEG XL via the system libjxl (jpegxl-rs links it with pkg-config).
 
 use crate::color::{tf_from_icc, Primaries, Tf};
-use crate::decode::{downscale_rgba, linearise_rgba, DecodeError, HdrImage};
+use crate::decode::{linearise_rgba, DecodeError, HdrImage};
 use std::path::Path;
 
 pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
@@ -39,8 +39,8 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
     }
 
     // Normalise to interleaved RGBA regardless of channel count.
-    let rgba = to_rgba(&pixels, w as usize, h as usize)?;
-    let (rgba, w, h) = downscale_rgba(&rgba, w, h, max_dim);
+    let rgba = to_rgba(&pixels, w, h, max_dim)?;
+    let (w, h) = crate::decode::scaled_size(w, h, max_dim);
     let linear = linearise_rgba(&rgba, tf, true);
     Ok(HdrImage::from_linear_f32(w, h, &linear, tf, primaries))
 }
@@ -91,26 +91,20 @@ fn named_colour(bytes: &[u8]) -> Option<(Tf, Primaries)> {
     }
 }
 
-fn to_rgba(pixels: &[f32], w: usize, h: usize) -> Result<Vec<f32>, DecodeError> {
-    let px = w * h;
-    match pixels.len() / px.max(1) {
-        4 => Ok(pixels.to_vec()),
-        3 => Ok((0..px)
-            .flat_map(|i| [pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2], 1.0])
-            .collect()),
-        1 => Ok((0..px)
-            .flat_map(|i| [pixels[i], pixels[i], pixels[i], 1.0])
-            .collect()),
-        2 => Ok((0..px)
-            .flat_map(|i| {
-                [
-                    pixels[i * 2],
-                    pixels[i * 2],
-                    pixels[i * 2],
-                    pixels[i * 2 + 1],
-                ]
-            })
-            .collect()),
-        n => Err(DecodeError::Unsupported(format!("{n} channels"))),
+/// Interleaved RGBA at the scaled size, whatever the channel count, without a full-size copy.
+fn to_rgba(pixels: &[f32], w: u32, h: u32, max_dim: u32) -> Result<Vec<f32>, DecodeError> {
+    let n = pixels.len() / (w as usize * h as usize).max(1);
+    let at = |x: usize, y: usize| -> [f32; 4] {
+        let i = y * w as usize + x;
+        match n {
+            4 => [pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2], pixels[i * 4 + 3]],
+            3 => [pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2], 1.0],
+            2 => [pixels[i * 2], pixels[i * 2], pixels[i * 2], pixels[i * 2 + 1]],
+            _ => [pixels[i], pixels[i], pixels[i], 1.0],
+        }
+    };
+    if !(1..=4).contains(&n) {
+        return Err(DecodeError::Unsupported(format!("{n} channels")));
     }
+    Ok(crate::decode::sample_rgba(w, h, max_dim, at).0)
 }

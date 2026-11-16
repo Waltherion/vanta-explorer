@@ -1,7 +1,7 @@
 //! HEIC/HEIF via the system libheif. Mostly iPhone photos, which are Display-P3.
 
 use crate::color::{tf_from_icc, Primaries, Tf};
-use crate::decode::{downscale_rgba, linearise_rgba, DecodeError, HdrImage};
+use crate::decode::{linearise_rgba, sample_rgba, DecodeError, HdrImage};
 use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
 use std::path::Path;
 
@@ -34,22 +34,20 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
     // bright and clipped.
     let depth = if wide { (plane.bits_per_pixel as u32).clamp(8, 16) } else { 8 };
     let max = ((1u32 << depth) - 1) as f32;
-    let mut rgba = vec![0.0f32; (w as usize) * (h as usize) * 4];
-    for y in 0..h as usize {
-        let row = &plane.data[y * plane.stride..];
-        for x in 0..w as usize {
-            let o = (y * w as usize + x) * 4;
-            for c in 0..4 {
-                rgba[o + c] = if wide {
-                    // Big-endian 16-bit, per HdrRgbaBe.
-                    let i = (x * 4 + c) * 2;
-                    (u16::from_be_bytes([row[i], row[i + 1]]) as f32) / max
-                } else {
-                    (row[x * 4 + c] as f32) / max
-                };
+    // Read at the size wanted, straight from libheif's buffer.
+    let (data, stride) = (plane.data, plane.stride);
+    let (rgba, w, h) = sample_rgba(w, h, max_dim, |x, y| {
+        let row = &data[y * stride..];
+        std::array::from_fn(|c| {
+            if wide {
+                // Big-endian 16-bit, per HdrRgbaBe.
+                let i = (x * 4 + c) * 2;
+                (u16::from_be_bytes([row[i], row[i + 1]]) as f32) / max
+            } else {
+                (row[x * 4 + c] as f32) / max
             }
-        }
-    }
+        })
+    });
 
     let (mut tf, mut primaries) = (Tf::Srgb, Primaries::Bt709);
     // NCLX first, then ICC wins, the same order as the AVIF path.
@@ -78,7 +76,6 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
         }
     }
 
-    let (rgba, w, h) = downscale_rgba(&rgba, w, h, max_dim);
     let linear = linearise_rgba(&rgba, tf, true);
     Ok(HdrImage::from_linear_f32(w, h, &linear, tf, primaries))
 }
