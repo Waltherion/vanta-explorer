@@ -57,7 +57,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Shift+T", "Reopen the last closed tab"),
             ("Ctrl+Page Down, Ctrl+Page Up", "Next, previous tab"),
             ("Ctrl+Tab, Ctrl+Shift+Tab, F6", "Next, previous pane"),
-            ("F3", "Split side by side; again: close the pane you are in"),
+            ("F3, Shift+F3", "Split side by side, one above the other; again: close the pane"),
         ],
     ),
     ("Other", &[("F4", "Terminal in this folder"), ("F1", "This window")]),

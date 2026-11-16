@@ -62,7 +62,8 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 
 - **Unlimited splits** in a binary tree, tabs per pane, draggable dividers. Splitting across
   a pure row or column of panes escalates to the root, so the new pane spans the window.
-- `F3` splits side by side and joins again, `F9` hides the sidebar.
+- `F3` splits side by side and `Shift+F3` one above the other; either joins again. `F9`
+  hides the sidebar.
 - `Ctrl+T` / `Ctrl+W` for tabs, `Ctrl+PgUp` / `Ctrl+PgDn` between them, middle-click a folder
   to open it in a new tab, `Ctrl+Tab` or `F6` to cycle panes.
 - A breadcrumb that **drops leading components** when the path is long, so the tail stays

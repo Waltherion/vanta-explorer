@@ -1551,15 +1551,16 @@ fn app_ui(
         }
         (next, prev)
     });
-    // F3 splits the pane side by side, and joins it again: with more than one pane it closes
-    // the one you are in, which after an F3 is the new one. F9 hides and shows the sidebar.
+    // F3 splits the pane side by side, Shift+F3 one above the other, and either joins it again:
+    // with more than one pane it closes the one you are in, which after a split is the new one.
+    // F9 hides and shows the sidebar.
     if !modal_open && chooser.is_none() {
-        let (f3, f9) = root.input(|i| (i.key_pressed(egui::Key::F3), i.key_pressed(egui::Key::F9)));
+        let (f3, shift, f9) = root.input(|i| (i.key_pressed(egui::Key::F3), i.modifiers.shift, i.key_pressed(egui::Key::F9)));
         if f3 {
             if ws.panes.len() > 1 {
                 ws.close(ws.active);
             } else {
-                ws.split(ws.active, panes::SplitDir::Horizontal);
+                ws.split(ws.active, if shift { panes::SplitDir::Vertical } else { panes::SplitDir::Horizontal });
             }
         }
         if f9 {
