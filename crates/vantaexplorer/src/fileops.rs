@@ -191,6 +191,7 @@ impl FileOps {
     }
 
     pub fn submit(&mut self, req: Request) -> u64 {
+        log::debug!("op {}: {:?} {:?} -> {:?}", self.next_id, req.kind, req.sources, req.dest);
         let id = self.next_id;
         self.next_id += 1;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -488,6 +489,7 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
         undo = None;
     }
 
+    log::debug!("op {id} {:?}: {:?}, warning {:?}", req.kind, result, warning);
     match result {
         Ok(()) => {
             let _ = ev.send(Event::Done {
@@ -1108,7 +1110,7 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            let Some(target) = decide(id, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)? else { continue };
+            let Some(target) = decide(id, req.kind, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)? else { continue };
             if target.path == *src {
                 continue;
             }
@@ -1148,7 +1150,7 @@ fn transfer_into(id: u64, req: &Request, cancel: &AtomicBool, ev: &Sender<Event>
     // Every root's destination is settled before the first byte is written.
     let mut targets: Vec<Option<Target>> = Vec::new();
     for (src, ..) in &roots {
-        targets.push(decide(id, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)?);
+        targets.push(decide(id, req.kind, dest_dir, src, &mut claimed, &mut conflicts, &mut done.displaced, ev)?);
     }
 
     let mut progress = (0u64, 0u64); // (bytes, items)
@@ -1437,6 +1439,7 @@ fn keep_times(from: &Path, to: &Path) {
 /// Where one source goes: its own name in the destination, unless that is taken. None: skipped.
 fn decide(
     id: u64,
+    kind: OpKind,
     dest_dir: &Path,
     src: &Path,
     claimed: &mut std::collections::HashSet<std::ffi::OsString>,
@@ -1451,8 +1454,15 @@ fn decide(
         // Taken by another source of this same operation, not by anything the user had: both
         // are kept, without asking.
         target = dest_dir.join(free_name(dest_dir, &name, claimed));
+    } else if target == src {
+        // Into the folder it is in. A move there is nothing to do (the caller skips it); a copy
+        // is a second one beside it, as Dolphin and Nautilus make, never a copy onto itself,
+        // which would empty the original as it is opened to be written.
+        if kind == OpKind::Copy {
+            target = dest_dir.join(free_name(dest_dir, &name, claimed));
+        }
     } else if let Ok(there) = target.symlink_metadata().map(|m| m.is_dir()) {
-        if target != src {
+        {
             let folders = there && std::fs::symlink_metadata(src).is_ok_and(|m| m.is_dir());
             match resolve_conflict(id, &name, folders, conflicts, ev)? {
                 Do::Skip => return Ok(None),
@@ -1767,6 +1777,13 @@ fn copy_file(
         return Err(format!("{name} is {what}, not a file with contents, so it cannot be copied"));
     }
 
+    // Never a file onto itself: opening it to be written empties it before a byte is read.
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(dst).is_ok_and(|d| d.dev() == meta.dev() && d.ino() == meta.ino()) {
+            return Err(format!("{} would be copied onto itself", src.display()));
+        }
+    }
     let mut r = std::fs::File::open(src).map_err(|e| e.to_string())?;
     let mut w = std::fs::File::create(dst).map_err(|e| e.to_string())?;
     let mut done = 0u64;
@@ -2242,6 +2259,22 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dst);
         }
+    }
+
+    /// Copied into the folder it is in: a second one beside it, "name (1)", and the original
+    /// untouched; a folder the same, with all it holds.
+    #[test]
+    fn a_copy_into_its_own_folder_is_a_second_one() {
+        let (src, _) = setup("copy-here");
+        let (undo, asked) = run_conflicts(Request::new(OpKind::Copy, vec![src.join("a.txt"), src.join("sub")], Some(src.clone())), &[]);
+        assert!(asked.is_empty(), "{asked:?}");
+        assert_eq!(std::fs::read(src.join("a.txt")).unwrap(), b"hello", "the original is untouched");
+        assert_eq!(std::fs::read(src.join("a (1).txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(src.join("sub/n.txt")).unwrap(), b"nested");
+        assert_eq!(std::fs::read(src.join("sub (1)/n.txt")).unwrap(), b"nested");
+        let Some(UndoRecord { action: UndoAction::Copied(mut created), .. }) = undo else { panic!("no undo") };
+        created.sort();
+        assert_eq!(created, [src.join("a (1).txt"), src.join("sub (1)")]);
     }
 
     /// Same harness as run_and_drain but hands back the undo record.
