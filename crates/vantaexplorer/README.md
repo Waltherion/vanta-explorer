@@ -101,7 +101,7 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 - **Archives**: extract here, extract to a folder, or compress a selection to tar.zst, tar.gz,
   zip or 7z, through libarchive. Extraction never overwrites, and undo trashes exactly what
   the archive added.
-- **Copy path** as text (`Ctrl+Shift+P`), and **Open with**, including "always open with".
+- **Copy path** as text (`Ctrl+Alt+C` or `Ctrl+Shift+P`), and **Open with**, including "always open with".
 - **Show in folder** from browsers and other programs opens Vanta Explorer at the file, once its
   D-Bus entry is copied into place (`docs/install.md`).
 - **Properties** (Alt+Enter): type, size (folders counted as you watch), owner, permissions

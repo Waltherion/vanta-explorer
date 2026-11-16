@@ -28,7 +28,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
         "Files",
         &[
             ("Ctrl+C, Ctrl+X, Ctrl+V", "Copy, cut, paste (also between windows)"),
-            ("Ctrl+Shift+P", "Copy the path as text"),
+            ("Ctrl+Alt+C, Ctrl+Shift+P", "Copy the path as text"),
             ("Ctrl+A", "Select all"),
             ("F2", "Rename"),
             ("Ctrl+Shift+N", "New folder"),

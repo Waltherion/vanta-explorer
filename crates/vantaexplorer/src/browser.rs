@@ -60,6 +60,8 @@ fn dragging(ui: &egui::Ui) -> bool {
 
 /// The folder a drop would land in right now, for the note that follows the pointer. Set by
 /// whatever is under the pointer this frame; read and cleared by the overlay.
+/// Set by main.rs for one Ctrl+Alt+C (copy path), read by the shortcuts below.
+pub const COPY_PATH_KEY: &str = "vx-copy-path-key";
 pub const DROP_TARGET: &str = "dnd-target";
 
 fn mark_drop_target(ui: &egui::Ui, dest: &std::path::Path) {
@@ -1292,7 +1294,7 @@ fn entry_context_menu(
     }
     if ui
         .button("Copy path")
-        .on_hover_text("Absolute path as text (Ctrl+Shift+P)")
+        .on_hover_text("Absolute path as text (Ctrl+Alt+C, Ctrl+Shift+P)")
         .clicked()
     {
         publish_paths(ui.ctx(), &paths);
@@ -1482,6 +1484,8 @@ fn handle_shortcuts(
     // to any clickable widget, so simply clicking a row focused it and killed every shortcut
     // in the pane, Ctrl+C did nothing after selecting a file with the mouse. Ctrl+Z appeared
     // to work only because reaching it via the context menu cleared focus on the way.
+    // Ctrl+Alt+C, seen as itself by main.rs: taken whatever happens next, so it never lingers.
+    let copy_path_key = ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::new(COPY_PATH_KEY))).unwrap_or(false);
     if ui.ctx().text_edit_focused() || view.modal_open {
         return false;
     }
@@ -1515,9 +1519,11 @@ fn handle_shortcuts(
     });
     // Ctrl+Shift+P: P is not a clipboard key, so egui-winit passes it through as a normal
     // key event and there is nothing to disambiguate.
-    let copy_path = ui.input(|i| {
+    let copy_path = copy_path_key || ui.input(|i| {
         i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::P)
     });
+    // The Copy event the same keystroke made is not a file copy.
+    let copy = copy && !copy_path_key;
     if std::env::var_os("VANTAEXPLORER_KEY_DEBUG").is_some()
         && (copy || cut || paste || copy_path || view.paste_key)
     {

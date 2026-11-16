@@ -457,6 +457,22 @@ impl ApplicationHandler for App {
         // so this is the only place the keystroke is still visible as itself.
         match &event {
             WindowEvent::ModifiersChanged(m) => self.winit_mods = m.state(),
+            // Ctrl+Alt+C, copy path (Dolphin's key). egui-winit turns every Ctrl+C, Alt or not,
+            // into the same Copy event, and egui's own idea of Alt can be stale (Alt pressed
+            // here, released in another window during a compositor shortcut). winit's state is
+            // the compositor's own, sent again each time the window gets the keyboard, so the
+            // two are told apart here, by the keystroke itself.
+            WindowEvent::KeyboardInput { event: key, .. }
+                if key.state == winit::event::ElementState::Pressed
+                    && self.winit_mods.control_key()
+                    && self.winit_mods.alt_key()
+                    && !self.winit_mods.shift_key()
+                    && (matches!(&key.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("c"))
+                        || key.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC)) =>
+            {
+                gfx.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new(browser::COPY_PATH_KEY), true));
+                self.needs_draw = true;
+            }
             WindowEvent::KeyboardInput { event: key, .. }
                 if key.state == winit::event::ElementState::Pressed
                     && self.winit_mods.control_key()
