@@ -66,6 +66,9 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
   to open it in a new tab, `Ctrl+Tab` or `F6` to cycle panes.
 - A breadcrumb that **drops leading components** when the path is long, so the tail stays
   readable; click past it to edit the path as text.
+- **The session** (panes, tabs, history) is kept by the first window started without a
+  folder. A window opened on a folder, by Show in folder or another program, is one tab on that
+  folder, and it and any second window save nothing, so they never overwrite your tabs.
 - Columns that drop Modified, then Size, as a pane narrows, rather than painting over each
   other.
 

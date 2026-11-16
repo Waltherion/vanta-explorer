@@ -129,6 +129,9 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let (cfg, prefs) = config::load();
+    // `vantaexplorer <path>`: the first argument that is not a flag (the probes have returned).
+    let start_folder = args.iter().skip(1).find(|a| !a.starts_with("--")).filter(|_| choosing.is_none()).cloned();
+    let session = if choosing.is_none() && start_folder.is_none() { panes::lock_session() } else { None };
     // The chooser is one pane on the folder it was asked for, with its own few preferences; it
     // neither reads nor writes the file manager's session.
     let ws = match &choosing {
@@ -142,7 +145,14 @@ fn main() -> Result<()> {
             pane.show_hidden = remembered.show_hidden;
             ws
         }
-        None => panes::load(panes::home_dir()),
+        // Only the first window started without a folder keeps the session (see `session`):
+        // a window opened on a folder, or a second one, starts on its own and saves nothing, so
+        // it can never overwrite the tabs of the window that does.
+        None if start_folder.is_some() => panes::single_like_session(panes::home_dir()),
+        None => match &session {
+            Some(_) => panes::load(panes::home_dir()),
+            None => panes::single_like_session(panes::home_dir()),
+        },
     };
     let (chooser, chooser_prefs) = match choosing {
         Some((state, remembered)) => (Some(state), remembered),
@@ -193,6 +203,7 @@ fn main() -> Result<()> {
         events_since_draw: 0,
         focused: true,
         last_session_save: Instant::now(),
+        session,
         chooser,
         chooser_prefs,
         exit_code: 0,
@@ -205,7 +216,7 @@ fn main() -> Result<()> {
     // launch the app and then silently show the wrong folder. A file argument opens its
     // parent with the file selected. Probe flags have already returned above, so anything
     // left that does not start with `--` is the path.
-    if let Some(arg) = args.iter().skip(1).find(|a| !a.starts_with("--")).filter(|_| app.chooser.is_none()) {
+    if let Some(arg) = &start_folder {
         let target = std::fs::canonicalize(arg).unwrap_or_else(|_| std::path::PathBuf::from(arg));
         let (dir, reveal) = if target.is_dir() {
             (Some(target), None)
@@ -219,8 +230,9 @@ fn main() -> Result<()> {
             (None, None)
         };
         if let Some(dir) = dir {
+            // A window of its own on that folder: its history starts there.
             let tab = app.ws.active_pane().tab();
-            tab.navigate(dir);
+            *tab = panes::Tab::new(dir);
             tab.pending_reveal = reveal;
         }
     }
@@ -385,6 +397,8 @@ struct App {
     /// Layout used to persist only on clean close; with the app still crash-prone that lost
     /// the session every time, so it also saves on a slow timer.
     last_session_save: Instant,
+    /// Held by the one window that keeps the session; None: this window saves nothing.
+    session: Option<panes::SessionLock>,
     /// How many input events piled up since the last frame, if this climbs, we are behind.
     events_since_draw: u32,
     /// Set when the window is choosing a file for another program (`--choose`).
@@ -527,7 +541,9 @@ impl ApplicationHandler for App {
                     // Closing the chooser is saying no; about_to_wait answers and leaves.
                     Some(c) => c.cancel(),
                     None => {
-                        panes::save(&self.ws, true);
+                        if self.session.is_some() {
+                            panes::save(&self.ws, true);
+                        }
                         event_loop.exit();
                     }
                 }
@@ -840,7 +856,7 @@ impl ApplicationHandler for App {
             }
         }
 
-        if self.chooser.is_none() && self.last_session_save.elapsed() >= Duration::from_secs(30) {
+        if self.session.is_some() && self.last_session_save.elapsed() >= Duration::from_secs(30) {
             self.last_session_save = Instant::now();
             panes::save(&self.ws, false);
         }

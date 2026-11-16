@@ -639,6 +639,38 @@ fn clone_tree(n: &Node) -> Node {
     }
 }
 
+/// Held for as long as this process is the window that keeps the session: the first one
+/// started without a folder. The kernel lets go of it when the process ends, crash or not.
+pub struct SessionLock(#[allow(dead_code)] std::fs::File);
+
+/// The session's lock, if no other window holds it.
+pub fn lock_session() -> Option<SessionLock> {
+    use std::os::fd::AsRawFd;
+    let dir = crate::model::state_dir()?;
+    let _ = std::fs::create_dir_all(&dir);
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("session.lock")).ok()?;
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    taken.then_some(SessionLock(file))
+}
+
+/// A window that does not keep the session: one tab on `path`, but with the look the session
+/// has (sidebar and preview width, zoom, hidden files), read and never written.
+pub fn single_like_session(path: PathBuf) -> Workspace {
+    let saved = load(path.clone());
+    let mut ws = Workspace::single(path);
+    ws.sidebar_width = saved.sidebar_width;
+    ws.preview_open = saved.preview_open;
+    ws.preview_w = saved.preview_w;
+    if let Some(from) = saved.panes.get(saved.active.min(saved.panes.len().saturating_sub(1))) {
+        let pane = ws.active_pane();
+        pane.zoom = from.zoom;
+        pane.show_hidden = from.show_hidden;
+        pane.col_name_w = from.col_name_w;
+        pane.col_size_w = from.col_size_w;
+    }
+    ws
+}
+
 pub fn load(fallback: PathBuf) -> Workspace {
     let restore = || -> Option<Workspace> {
         let json = std::fs::read_to_string(session_path()?).ok()?;

@@ -322,6 +322,10 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
                 if let Some(item) = trash_item_at(p) {
                     return trash::os_limited::purge_all([item]).map_err(|e| format!("{e:?}"));
                 }
+                // An entry whose info cannot be read: the file goes, and the info with it.
+                if let Some(info) = info_file_of(p) {
+                    let _ = std::fs::remove_file(info);
+                }
                 let meta = std::fs::symlink_metadata(p).map_err(|e| e.to_string())?;
                 if meta.is_dir() {
                     std::fs::remove_dir_all(p).map_err(|e| e.to_string())
@@ -427,8 +431,16 @@ fn run(id: u64, req: Request, cancel: &AtomicBool, ev: &Sender<Event>) {
             let r = trash::os_limited::list()
                 .and_then(trash::os_limited::purge_all)
                 .map_err(|e| format!("{e:?}"));
-            remove_orphaned_info(&trash_folders());
-            r
+            // What the listing could not read stays behind otherwise: an entry whose info file
+            // is damaged (all zeros after a drive was pulled, say) is shown, but never purged.
+            let folders = trash_folders();
+            let left = empty_trash_folders(&folders);
+            remove_orphaned_info(&folders);
+            match (r, left.is_empty()) {
+                (Err(e), _) => Err(e),
+                (Ok(()), true) => Ok(()),
+                (Ok(()), false) => Err(format!("could not delete: {}", left.join("; "))),
+            }
         }
     };
 
@@ -556,6 +568,38 @@ pub fn trash_folders() -> Vec<PathBuf> {
 
 /// Entries whose file is gone (deleted from the trash by hand, or by a program that left the
 /// info behind): never shown, never restorable, so they go when the trash is emptied.
+/// `<trash>/info/<name>.trashinfo` for a payload `<trash>/files/<name>`, when `path` is one.
+fn info_file_of(path: &Path) -> Option<PathBuf> {
+    let files = path.parent()?;
+    if files.file_name()? != "files" {
+        return None;
+    }
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".trashinfo");
+    let info = files.parent()?.join("info").join(name);
+    info.is_file().then_some(info)
+}
+
+/// Whatever is still in the trash folders' files/ after the purge, deleted outright, with its
+/// info. Returns what could not be deleted.
+fn empty_trash_folders(folders: &[PathBuf]) -> Vec<String> {
+    let mut left = Vec::new();
+    for root in folders {
+        let Ok(rd) = std::fs::read_dir(root.join("files")) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if let Err(e) = remove_any(&path) {
+                left.push(format!("{} ({e})", path.display()));
+                continue;
+            }
+            if let Some(info) = info_file_of(&path) {
+                let _ = std::fs::remove_file(info);
+            }
+        }
+    }
+    left
+}
+
 fn remove_orphaned_info(folders: &[PathBuf]) {
     use std::os::unix::ffi::OsStrExt;
     for root in folders {
@@ -2039,6 +2083,23 @@ mod tests {
         std::fs::remove_file(&payload).unwrap();
         remove_orphaned_info(&[root]);
         assert!(!Path::new(&found.id).exists());
+    }
+
+    /// An entry with a damaged info file (all zeros) cannot be listed, so it is not purged by
+    /// the trash crate; emptying the trash still takes it.
+    #[test]
+    fn emptying_takes_entries_with_damaged_info_too() {
+        let root = std::env::temp_dir().join("vantaexplorer-damaged-trash");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("files/$R1515WX/sub")).unwrap();
+        std::fs::write(root.join("files/$R1515WX/sub/a.mp4"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        std::fs::write(root.join("info/$R1515WX.trashinfo"), [0u8; 86]).unwrap();
+        assert!(item_from_info(&root, "$R1515WX".as_ref()).is_none(), "unreadable, as on the drive");
+        assert!(empty_trash_folders(std::slice::from_ref(&root)).is_empty());
+        assert_eq!(std::fs::read_dir(root.join("files")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.join("info")).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Same harness as run_and_drain but hands back the undo record.
