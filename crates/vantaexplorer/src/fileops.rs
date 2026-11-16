@@ -1820,6 +1820,10 @@ mod tests {
             !dst.join("src/stale").exists(),
             "overwrite replaced the old tree"
         );
+        // The replaced tree went to the trash; it is not left there for the trash view to show.
+        if let Some(item) = find_trash_entry(&dst.join("src")) {
+            let _ = trash::os_limited::purge_all([item]);
+        }
     }
 
     /// Runs an operation, answering every failed item with `on_error`; hands back the undo

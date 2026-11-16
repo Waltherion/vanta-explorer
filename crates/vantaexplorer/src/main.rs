@@ -1248,6 +1248,13 @@ fn draw(
                     app_ops.drop_menu = Some((sources, dest, pos));
                 }
             }
+            // Dropped on the trash: trashed, with the record that lets it be restored. Moving
+            // it into the trash's folder would leave it there with no way back.
+            browser::Action::Drop { sources, dest, .. } if fileops::in_trash(&dest) => {
+                if !sources.iter().any(|s| s.starts_with(fileops::trash_files_dir())) {
+                    app_ops.ops.submit(fileops::Request::new(fileops::OpKind::Trash, sources, None));
+                }
+            }
             browser::Action::Drop { sources, dest, copy } => {
                 app_ops.ops.submit(fileops::Request::new(
                     if copy { fileops::OpKind::Copy } else { fileops::OpKind::Move },

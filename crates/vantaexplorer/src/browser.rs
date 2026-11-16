@@ -448,7 +448,7 @@ fn show_pane(
         let (n, h) = (theme.text.gamma_multiply(0.75), theme.accent);
         let tab = pane.tab();
         let (can_back, can_fwd, has_parent) =
-            (tab.can_back(), tab.can_forward(), tab.path().parent().is_some());
+            (tab.can_back(), tab.can_forward(), tab.path().parent().is_some() && !crate::fileops::in_trash(tab.path()));
         if glyph::button(ui, Glyph::ChevronLeft, can_back, "Back", n, h) {
             tab.back();
         }
@@ -530,7 +530,12 @@ fn show_pane(
                 } else {
                     tab.path_edit_focused = false;
                     // Clickable breadcrumb segments.
-                    let comps: Vec<PathBuf> = {
+                    // The trash is one place, on every drive at once: "Trash", not the home
+                    // trash's files/ folder it happens to start from.
+                    let in_trash = crate::fileops::in_trash(tab.path());
+                    let comps: Vec<PathBuf> = if in_trash {
+                        vec![tab.path().to_path_buf()]
+                    } else {
                         let mut acc = PathBuf::new();
                         tab.path()
                             .components()
@@ -542,7 +547,7 @@ fn show_pane(
                     };
                     let labels: Vec<String> = comps
                         .iter()
-                        .map(|c| {
+                        .map(|c| if in_trash { "Trash".to_string() } else {
                             c.file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| "/".into())

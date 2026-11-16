@@ -102,6 +102,9 @@ impl Tab {
     }
 
     pub fn title(&self) -> String {
+        if crate::fileops::in_trash(&self.listing.path) {
+            return "Trash".into();
+        }
         self.listing
             .path
             .file_name()
@@ -179,6 +182,10 @@ impl Tab {
     }
 
     pub fn up(&mut self) {
+        // The trash is a place of its own, not a folder inside ~/.local/share.
+        if crate::fileops::in_trash(&self.listing.path) {
+            return;
+        }
         if let Some(parent) = self.listing.path.parent() {
             self.navigate(parent.to_path_buf());
         }
