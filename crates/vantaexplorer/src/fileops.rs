@@ -244,6 +244,7 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let e = std::io::Error::last_os_error();
+    log::debug!("rename {} -> {}: {e} (same file: {})", from.display(), to.display(), same_file(from, to));
     match e.raw_os_error() {
         // exFAT takes a rename that only changes case as done and leaves the old spelling, so
         // it goes by way of a name of its own.
@@ -2151,6 +2152,21 @@ mod tests {
         assert!(src.join("a.txt").exists(), "nothing moved");
         assert!(src.join("noter.txt").symlink_metadata().unwrap().file_type().is_symlink(), "the link is still there");
         assert!(rename(&src.join("a.txt"), "A.txt").is_ok(), "a new spelling is a new name here");
+    }
+
+    /// On a drive that ignores case (exFAT, NTFS), set in VANTAEXPLORER_CASE_DIR.
+    #[test]
+    #[ignore = "needs a case-insensitive drive in VANTAEXPLORER_CASE_DIR"]
+    fn a_change_of_case_renames_on_a_drive_that_ignores_case() {
+        let dir = PathBuf::from(std::env::var("VANTAEXPLORER_CASE_DIR").unwrap()).join("vx-case-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.txt"), b"x").unwrap();
+        let r = rename(&dir.join("test.txt"), "Test.txt");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(names, ["Test.txt"]);
     }
 
     /// Same harness as run_and_drain but hands back the undo record.

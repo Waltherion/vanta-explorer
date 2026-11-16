@@ -1620,6 +1620,7 @@ fn rename_editor(
         tab.renaming = None;
         if !new_name.is_empty() && new_name != original {
             let src = tab.path().join(&original);
+            log::debug!("rename '{original}' to '{new_name}' in {}", here.display());
             match crate::fileops::rename(&src, &new_name) {
                 Ok(dest) => {
                     view.actions
