@@ -265,6 +265,12 @@ pub fn common_mime(paths: &[PathBuf]) -> Option<String> {
     paths[1..].iter().all(|p| mime_for(p).as_deref() == Some(first.as_str())).then_some(first)
 }
 
+/// The name of the application set to open this type, if one is.
+pub fn default_app_name(mime: &str) -> Option<String> {
+    let id = query_default(mime);
+    (!id.is_empty()).then(|| parse_desktop(&id, true)).flatten().map(|a| a.name)
+}
+
 fn query_default(mime: &str) -> String {
     std::process::Command::new("xdg-mime")
         .args(["query", "default", mime])

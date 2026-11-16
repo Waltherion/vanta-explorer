@@ -628,6 +628,10 @@ read a Microsoft calendar.
   // sorting by date still says when a photo was taken. false: a copy is dated when it was
   // made. A move always keeps the date.
   // "keepDates": true,
+
+  // Folders before files, whichever column the list is sorted by. false: folders sort in
+  // among the files, by name, size or date like everything else.
+  // "foldersFirst": true,
 }
 ```
 

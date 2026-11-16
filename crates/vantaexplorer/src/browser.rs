@@ -20,6 +20,8 @@ pub enum Action {
     Paste { dest: std::path::PathBuf },
     Drop { sources: Vec<std::path::PathBuf>, dest: std::path::PathBuf, copy: bool },
     OpenWith(Vec<PathBuf>),
+    /// The Properties window for these (Alt+Enter).
+    Properties(Vec<PathBuf>),
     /// Measure these directories as one total; replaces any walk in flight.
     CalculateDirSize(Vec<PathBuf>),
     /// A synchronous rename already happened; record it so Ctrl+Z can reverse it.
@@ -1323,7 +1325,12 @@ fn entry_context_menu(
         .button(egui::RichText::new("Delete permanently").color(egui::Color32::LIGHT_RED))
         .clicked()
     {
-        push(Action::ConfirmDelete(paths));
+        push(Action::ConfirmDelete(paths.clone()));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Properties").on_hover_text("Alt+Enter").clicked() {
+        push(Action::Properties(paths));
         ui.close();
     }
 }
@@ -1430,7 +1437,12 @@ fn folder_context_menu(ui: &mut egui::Ui, tab: &mut crate::panes::Tab, view: &Vi
         .on_hover_text(format!("{} (F4)", view.settings.terminal_command().map_or_else(|| "no terminal".to_string(), |(t, _)| t)))
         .clicked()
     {
-        view.actions.borrow_mut().push(Action::OpenTerminal(here));
+        view.actions.borrow_mut().push(Action::OpenTerminal(here.clone()));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button("Properties").on_hover_text("Of this folder (Alt+Enter with nothing marked)").clicked() {
+        view.actions.borrow_mut().push(Action::Properties(vec![here]));
         ui.close();
     }
 }
@@ -1532,6 +1544,14 @@ fn handle_shortcuts(
     // drops what moves, removes or leaves the window.
     let choosing = view.chooser.is_some();
     let (copy, cut, paste, copy_path, del, shift_del) = if choosing { (false, false, false, false, false, false) } else { (copy, cut, paste, copy_path, del, shift_del) };
+    // Alt+Enter: what is marked, or the folder itself when nothing is.
+    if !choosing && ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Enter)) {
+        let what = if paths.is_empty() { vec![tab.path().to_path_buf()] } else { paths.clone() };
+        if !crate::fileops::in_trash(tab.path()) || !paths.is_empty() {
+            push(Action::Properties(what));
+        }
+        return true;
+    }
     if !choosing && ui.input(|i| i.key_pressed(egui::Key::F4)) {
         // Dolphin's binding. The terminal opens in the folder you are looking at.
         push(Action::OpenTerminal(tab.path().to_path_buf()));

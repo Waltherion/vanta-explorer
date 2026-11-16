@@ -312,6 +312,8 @@ pub struct Workspace {
     /// selection, so one panel and one decoded texture serve every pane.
     pub preview_open: bool,
     pub preview_w: f32,
+    /// F9: the sidebar out of the way, its width kept for when it comes back.
+    pub sidebar_hidden: bool,
     /// Last frame's pane geometry (index, left, top), written by the layout pass.
     /// Runtime-only; used to cycle panes in VISUAL reading order (see visual_order).
     pub visual_rects: Vec<(usize, f32, f32)>,
@@ -326,6 +328,7 @@ impl Workspace {
             sidebar_width: DEFAULT_SIDEBAR_W,
             preview_open: false,
             preview_w: DEFAULT_PREVIEW_W,
+            sidebar_hidden: false,
             visual_rects: Vec::new(),
         }
     }
@@ -538,6 +541,8 @@ struct Session {
     preview_open: bool,
     #[serde(default = "default_preview_w")]
     preview_w: f32,
+    #[serde(default)]
+    sidebar_hidden: bool,
 }
 
 fn default_sidebar_w() -> f32 {
@@ -599,6 +604,7 @@ pub fn save(ws: &Workspace, wait: bool) {
         sidebar_width: ws.sidebar_width,
         preview_open: ws.preview_open,
         preview_w: ws.preview_w,
+        sidebar_hidden: ws.sidebar_hidden,
     };
     let Ok(json) = serde_json::to_string_pretty(&session) else { return };
     static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -661,6 +667,7 @@ pub fn single_like_session(path: PathBuf) -> Workspace {
     ws.sidebar_width = saved.sidebar_width;
     ws.preview_open = saved.preview_open;
     ws.preview_w = saved.preview_w;
+    ws.sidebar_hidden = saved.sidebar_hidden;
     if let Some(from) = saved.panes.get(saved.active.min(saved.panes.len().saturating_sub(1))) {
         let pane = ws.active_pane();
         pane.zoom = from.zoom;
@@ -723,6 +730,7 @@ pub fn load(fallback: PathBuf) -> Workspace {
             sidebar_width: s.sidebar_width.clamp(140.0, 600.0),
             preview_open: s.preview_open,
             preview_w: s.preview_w.max(MIN_PREVIEW_W),
+            sidebar_hidden: s.sidebar_hidden,
             visual_rects: Vec::new(),
         })
     };

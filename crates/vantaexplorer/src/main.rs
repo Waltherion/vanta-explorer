@@ -21,6 +21,7 @@ mod icons;
 mod model;
 mod panes;
 mod preview;
+mod props;
 mod settings;
 mod sidebar;
 mod text;
@@ -172,6 +173,7 @@ fn main() -> Result<()> {
     let theme = browser::Theme::from_config(&cfg);
     let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
     fileops::set_keep_dates(prefs.keep_dates);
+    model::set_folders_first(prefs.folders_first);
     let mut app = App {
         probe,
         state: None,
@@ -193,6 +195,7 @@ fn main() -> Result<()> {
             pending_error: None,
             clipboard: None,
             open_with: None,
+            properties: None,
             pending_delete: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -276,6 +279,8 @@ struct OpsState {
     drop_menu: Option<(Vec<std::path::PathBuf>, std::path::PathBuf, egui::Pos2)>,
     clipboard: Option<(Vec<std::path::PathBuf>, bool)>,
     open_with: Option<OpenWithState>,
+    /// The Properties window, when one is open.
+    properties: Option<props::Properties>,
     /// Paths awaiting a "really delete permanently?" answer, plus which button the keyboard
     /// has selected (false = Cancel, the deliberate default).
     pending_delete: Option<(Confirm, bool)>,
@@ -668,6 +673,11 @@ impl ApplicationHandler for App {
             // A different icon theme means everything drawn from the old one is stale.
             self.icons.set_themes(s.icon_themes.clone());
             fileops::set_keep_dates(s.keep_dates);
+            if model::set_folders_first(s.folders_first) {
+                for tab in self.ws.panes.iter_mut().flat_map(|p| p.tabs.iter_mut()) {
+                    tab.listing.apply_sort();
+                }
+            }
             self.settings = s;
             dirty = true;
         }
@@ -1288,24 +1298,11 @@ fn draw(
                     Some(dest),
                 ));
             }
+            browser::Action::Properties(paths) => {
+                app_ops.properties = Some(props::Properties::new(paths, &settings.date_format));
+            }
             browser::Action::OpenWith(paths) => {
-                let mime = apps::common_mime(&paths).unwrap_or_default();
-                // "image" for a JPEG and a PNG together: the half of the type they share.
-                let majors: Vec<String> = paths
-                    .iter()
-                    .filter_map(|p| apps::mime_for(p))
-                    .filter_map(|m| m.split('/').next().map(str::to_string))
-                    .collect();
-                let major = majors.first().filter(|m| !m.is_empty() && majors.len() == paths.len() && majors.iter().all(|x| x == *m)).cloned();
-                app_ops.open_with = Some(OpenWithState {
-                    paths,
-                    search: String::new(),
-                    apps: apps::all_apps(),
-                    relevant_only: major.is_some(),
-                    major,
-                    mime,
-                    make_default: false,
-                });
+                app_ops.open_with = Some(open_with_state(paths));
             }
             browser::Action::RecordRename { from, to } => {
                 app_ops.undo.push(fileops::UndoRecord {
@@ -1492,6 +1489,7 @@ fn app_ui(
         || app_ops.pending_conflict.is_some()
         || app_ops.pending_error.is_some()
         || app_ops.open_with.is_some()
+        || app_ops.properties.is_some()
         || chooser.as_ref().is_some_and(|c| c.replace.is_some());
 
     // Escape says no to the program that asked, once there is nothing smaller for it to close:
@@ -1553,6 +1551,21 @@ fn app_ui(
         }
         (next, prev)
     });
+    // F3 splits the pane side by side, and joins it again: with more than one pane it closes
+    // the one you are in, which after an F3 is the new one. F9 hides and shows the sidebar.
+    if !modal_open && chooser.is_none() {
+        let (f3, f9) = root.input(|i| (i.key_pressed(egui::Key::F3), i.key_pressed(egui::Key::F9)));
+        if f3 {
+            if ws.panes.len() > 1 {
+                ws.close(ws.active);
+            } else {
+                ws.split(ws.active, panes::SplitDir::Horizontal);
+            }
+        }
+        if f9 {
+            ws.sidebar_hidden = !ws.sidebar_hidden;
+        }
+    }
     if (cycle_next || cycle_prev) && ws.panes.len() > 1 {
         let order = ws.visual_order();
         if let Some(pos) = order.iter().position(|&x| x == ws.active) {
@@ -1611,7 +1624,7 @@ fn app_ui(
     let body_bottom = full.max.y - STATUS_H - 4.0 - bar_h;
 
     // --- sidebar (left, global) ---
-    let side_w = ws.sidebar_width;
+    let side_w = if ws.sidebar_hidden { 0.0 } else { ws.sidebar_width };
     let side_rect =
         egui::Rect::from_min_max(full.min, egui::pos2(full.min.x + side_w, body_bottom));
     let mut side_ui = root.new_child(
@@ -1620,7 +1633,9 @@ fn app_ui(
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     let current_dir = ws.active_pane().tab_ref().path().to_path_buf();
-    if let Some(path) = sidebar.show(&mut side_ui, drives, icons, theme, &current_dir) {
+    if ws.sidebar_hidden {
+        // Nothing drawn, nothing to drag; F9 brings it back at the width it had.
+    } else if let Some(path) = sidebar.show(&mut side_ui, drives, icons, theme, &current_dir) {
         // Per the spec, the sidebar navigates the ACTIVE pane.
         ws.active_pane().tab().navigate(path);
     }
@@ -1637,7 +1652,7 @@ fn app_ui(
         egui::pos2(side_rect.max.x - 3.0, side_rect.min.y),
         egui::pos2(side_rect.max.x + 3.0, side_rect.max.y),
     );
-    let grip_resp = root.interact(grip, root.id().with("sidebar-grip"), egui::Sense::drag());
+    let grip_resp = root.interact(grip, root.id().with("sidebar-grip"), if ws.sidebar_hidden { egui::Sense::hover() } else { egui::Sense::drag() });
     if grip_resp.hovered() || grip_resp.dragged() {
         root.ctx()
             .set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -1645,7 +1660,7 @@ fn app_ui(
     if grip_resp.dragged() {
         ws.sidebar_width = (side_w + grip_resp.drag_delta().x).clamp(140.0, 600.0);
     }
-    root.painter().line_segment(
+    if !ws.sidebar_hidden { root.painter().line_segment(
         [
             egui::pos2(side_rect.max.x, side_rect.min.y),
             egui::pos2(side_rect.max.x, side_rect.max.y),
@@ -1658,7 +1673,7 @@ fn app_ui(
                 theme.text.gamma_multiply(0.15)
             },
         ),
-    );
+    ); }
 
     let sidebar_targets = sidebar.targets();
     let view = browser::View {
@@ -1992,8 +2007,40 @@ fn reload_affected(ws: &mut panes::Workspace, affected: &[std::path::PathBuf]) {
     }
 }
 
+/// The Open with window for these files: every application, the relevant ones shown first.
+fn open_with_state(paths: Vec<std::path::PathBuf>) -> OpenWithState {
+    let mime = apps::common_mime(&paths).unwrap_or_default();
+    // "image" for a JPEG and a PNG together: the half of the type they share.
+    let majors: Vec<String> = paths
+        .iter()
+        .filter_map(|p| apps::mime_for(p))
+        .filter_map(|m| m.split('/').next().map(str::to_string))
+        .collect();
+    let major = majors.first().filter(|m| !m.is_empty() && majors.len() == paths.len() && majors.iter().all(|x| x == *m)).cloned();
+    OpenWithState {
+        paths,
+        search: String::new(),
+        apps: apps::all_apps(),
+        relevant_only: major.is_some(),
+        major,
+        mime,
+        make_default: false,
+    }
+}
+
 /// Progress + conflict windows, drawn on top of everything.
 fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::Theme) {
+    if let Some(mut p) = app_ops.properties.take() {
+        let (open, wants) = p.show(ctx, theme.accent);
+        if open {
+            app_ops.properties = Some(p);
+        }
+        if let props::Wants::OpenWith(path) = wants {
+            let mut ow = open_with_state(vec![path]);
+            ow.make_default = true;
+            app_ops.open_with = Some(ow);
+        }
+    }
     if let Some((sources, dest, pos)) = app_ops.drop_menu.clone() {
         let mut close = false;
         egui::Area::new(egui::Id::new("drop_menu_popup"))

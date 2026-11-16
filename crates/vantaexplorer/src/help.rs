@@ -35,6 +35,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Delete", "Move to the trash"),
             ("Shift+Delete", "Delete for good (asks first)"),
             ("Ctrl+Z, Ctrl+Y", "Undo, redo"),
+            ("Alt+Enter", "Properties (of the folder, when nothing is marked)"),
             ("Drag", "Move; with Ctrl: copy; with the right button: ask"),
         ],
     ),
@@ -46,6 +47,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+1, Ctrl+2", "List, grid"),
             ("Ctrl+Plus, Ctrl+Minus, Ctrl+scroll", "Bigger, smaller"),
             ("Ctrl+0", "Default size"),
+            ("F9", "Show or hide the sidebar"),
         ],
     ),
     (
@@ -55,6 +57,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Shift+T", "Reopen the last closed tab"),
             ("Ctrl+Page Down, Ctrl+Page Up", "Next, previous tab"),
             ("Ctrl+Tab, Ctrl+Shift+Tab, F6", "Next, previous pane"),
+            ("F3", "Split side by side; again: close the pane you are in"),
         ],
     ),
     ("Other", &[("F4", "Terminal in this folder"), ("F1", "This window")]),

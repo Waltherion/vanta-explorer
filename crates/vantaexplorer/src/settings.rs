@@ -19,6 +19,8 @@ pub struct Settings {
     /// A copy keeps the original's modification time (as `cp -a`, Dolphin and Nautilus do);
     /// false: a copy is dated when it was made.
     pub keep_dates: bool,
+    /// Folders sort before files, whatever the column; false: in among them.
+    pub folders_first: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             terminal_args: Vec::new(),
             icon_themes: Vec::new(),
             keep_dates: true,
+            folders_first: true,
         }
     }
 }

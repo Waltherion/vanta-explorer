@@ -76,12 +76,13 @@ impl Listing {
         }
     }
 
-    /// Directories always sort before files (Dolphin-style), then by the active key.
+    /// Folders before files (the `foldersFirst` setting, on unless turned off), then by the
+    /// active key.
     pub fn apply_sort(&mut self) {
         let spec = self.sort;
+        let folders_first = FOLDERS_FIRST.load(std::sync::atomic::Ordering::Relaxed);
         self.entries.sort_unstable_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
+            (if folders_first { b.is_dir.cmp(&a.is_dir) } else { std::cmp::Ordering::Equal })
                 .then_with(|| {
                     let ord = match spec.key {
                         SortKey::Name => natural_cmp(&a.name, &b.name),
@@ -92,6 +93,14 @@ impl Listing {
                 })
         });
     }
+}
+
+static FOLDERS_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether folders sort before files (the `foldersFirst` setting). Returns whether it changed,
+/// so the listings shown can be sorted again.
+pub fn set_folders_first(on: bool) -> bool {
+    FOLDERS_FIRST.swap(on, std::sync::atomic::Ordering::Relaxed) != on
 }
 
 /// Case-insensitive compare with numeric runs compared as numbers, so "file2" < "file10".

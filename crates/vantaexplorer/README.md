@@ -62,6 +62,7 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 
 - **Unlimited splits** in a binary tree, tabs per pane, draggable dividers. Splitting across
   a pure row or column of panes escalates to the root, so the new pane spans the window.
+- `F3` splits side by side and joins again, `F9` hides the sidebar.
 - `Ctrl+T` / `Ctrl+W` for tabs, `Ctrl+PgUp` / `Ctrl+PgDn` between them, middle-click a folder
   to open it in a new tab, `Ctrl+Tab` or `F6` to cycle panes.
 - A breadcrumb that **drops leading components** when the path is long, so the tail stays
@@ -102,6 +103,8 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 - **Copy path** as text (`Ctrl+Shift+P`), and **Open with**, including "always open with".
 - **Show in folder** from browsers and other programs opens Vanta Explorer at the file, once its
   D-Bus entry is copied into place (`docs/install.md`).
+- **Properties** (Alt+Enter): type, size (folders counted as you watch), owner, permissions
+  and what you may do with it, dates, the drive it is on, and the application that opens it.
 - **F1** lists every keyboard shortcut, and shows which commit this build is and when it was
   built.
 
