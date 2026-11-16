@@ -1437,6 +1437,7 @@ fn keep_times(from: &Path, to: &Path) {
 }
 
 /// Where one source goes: its own name in the destination, unless that is taken. None: skipped.
+#[allow(clippy::too_many_arguments)]
 fn decide(
     id: u64,
     kind: OpKind,

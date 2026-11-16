@@ -148,6 +148,14 @@ pub fn candidates(path: &Path) -> Vec<AppEntry> {
         return Vec::new();
     };
     let mut ids: Vec<String> = mime_cache().get(&mime).cloned().unwrap_or_default();
+    // Then what takes the kinds it is: a text editor for Rust, which only says text/plain.
+    for kind in ancestors(&mime) {
+        for id in mime_cache().get(&kind).into_iter().flatten() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
     // The configured default floats to the top.
     if let Ok(out) = std::process::Command::new("xdg-mime")
         .args(["query", "default", &mime])
@@ -170,29 +178,138 @@ pub fn candidates(path: &Path) -> Vec<AppEntry> {
     out
 }
 
-/// Launch a file with a specific application, detached.
-pub fn launch(app: &AppEntry, path: &Path) {
-    // Exec field codes: %f/%u take the path; the rest are stripped (spec says ignore unknowns).
-    let mut parts = shell_words(&app.exec);
-    let mut placed = false;
-    parts.retain_mut(|p| match p.as_str() {
-        "%f" | "%F" | "%u" | "%U" => {
-            *p = path.to_string_lossy().into_owned();
-            placed = true;
-            true
+/// The types a type is a kind of, nearest first, from shared-mime-info's subclass lists:
+/// Markdown and TOML are text/plain, so a text editor is offered for them.
+fn ancestors(mime: &str) -> Vec<String> {
+    static PARENTS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+    let parents = PARENTS.get_or_init(|| {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let dirs = std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
+        let home = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"));
+        for dir in home.into_iter().chain(dirs.split(':').map(PathBuf::from)) {
+            let Ok(text) = std::fs::read_to_string(dir.join("mime/subclasses")) else { continue };
+            for line in text.lines() {
+                if let Some((child, parent)) = line.split_once(' ') {
+                    let e = map.entry(child.to_string()).or_default();
+                    if !e.iter().any(|p| p == parent) {
+                        e.push(parent.to_string());
+                    }
+                }
+            }
         }
-        s if s.starts_with('%') && s.len() == 2 => false,
-        _ => true,
+        map
     });
-    if !placed {
-        parts.push(path.to_string_lossy().into_owned());
+    let mut out: Vec<String> = Vec::new();
+    let mut next = vec![mime.to_string()];
+    while let Some(m) = next.pop() {
+        for p in parents.get(&m).into_iter().flatten() {
+            if !out.contains(p) && p != mime {
+                out.push(p.clone());
+                next.push(p.clone());
+            }
+        }
     }
-    if parts.is_empty() {
-        return;
+    out
+}
+
+/// The applications that open every one of these files: for one type, its own list; for
+/// several, those that take all of them (a text editor for Rust, TOML and Markdown; a player
+/// for MP4 and MKV), counting what a type is a kind of. The default goes first when the types
+/// share one.
+pub fn candidates_for(paths: &[PathBuf]) -> Vec<AppEntry> {
+    let mut mimes: Vec<String> = Vec::new();
+    for p in paths {
+        let m = mime_for(p).unwrap_or_else(|| UNKNOWN.to_string());
+        if !mimes.contains(&m) {
+            mimes.push(m);
+        }
     }
-    let _ = std::process::Command::new(&parts[0])
-        .args(&parts[1..])
-        .spawn();
+    match mimes.as_slice() {
+        [] => Vec::new(),
+        [_] => candidates(&paths[0]),
+        _ => {
+            let takes = |mime: &str| -> Vec<String> {
+                let mut ids: Vec<String> = Vec::new();
+                for m in std::iter::once(mime.to_string()).chain(ancestors(mime)) {
+                    for id in mime_cache().get(&m).into_iter().flatten() {
+                        if !ids.contains(id) {
+                            ids.push(id.clone());
+                        }
+                    }
+                }
+                ids
+            };
+            let mut ids = takes(&mimes[0]);
+            for m in &mimes[1..] {
+                let theirs = takes(m);
+                ids.retain(|id| theirs.contains(id));
+            }
+            let defaults: Vec<String> = mimes.iter().map(|m| query_default(m)).collect();
+            if let Some(def) = defaults.first().filter(|d| !d.is_empty() && defaults.iter().all(|x| x == *d)) {
+                if let Some(i) = ids.iter().position(|id| id == def) {
+                    let id = ids.remove(i);
+                    ids.insert(0, id);
+                }
+            }
+            let mut out: Vec<AppEntry> = ids.iter().filter_map(|id| parse_desktop(id, true)).collect();
+            let mut seen = std::collections::HashSet::new();
+            out.retain(|a| seen.insert((a.name.clone(), a.exec.clone())));
+            out
+        }
+    }
+}
+
+/// The one type all of these files are, if they are one; None for a mix.
+pub fn common_mime(paths: &[PathBuf]) -> Option<String> {
+    let first = mime_for(paths.first()?)?;
+    paths[1..].iter().all(|p| mime_for(p).as_deref() == Some(first.as_str())).then_some(first)
+}
+
+fn query_default(mime: &str) -> String {
+    std::process::Command::new("xdg-mime")
+        .args(["query", "default", mime])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The command lines that open `paths` in an application with this Exec line. %F and %U take
+/// every file, so one process gets them all; %f and %u take one, so there is a process per
+/// file; with none of them, the files go at the end. Other field codes are dropped.
+fn command_lines(exec: &str, paths: &[PathBuf]) -> Vec<Vec<String>> {
+    let parts = shell_words(exec);
+    let all = parts.iter().any(|p| p == "%F" || p == "%U");
+    let one = parts.iter().any(|p| p == "%f" || p == "%u");
+    let fill = |files: &[PathBuf]| -> Vec<String> {
+        let mut out = Vec::new();
+        for p in &parts {
+            match p.as_str() {
+                "%f" | "%F" | "%u" | "%U" => out.extend(files.iter().map(|f| f.to_string_lossy().into_owned())),
+                s if s.starts_with('%') && s.len() == 2 => {}
+                _ => out.push(p.clone()),
+            }
+        }
+        if !all && !one {
+            out.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
+        }
+        out
+    };
+    if one && !all {
+        paths.iter().map(|p| fill(std::slice::from_ref(p))).collect()
+    } else {
+        vec![fill(paths)]
+    }
+}
+
+/// Launch files with a specific application, detached, each process waited for on a thread
+/// of its own so none lingers as a zombie.
+pub fn launch_many(app: &AppEntry, paths: &[PathBuf]) {
+    for parts in command_lines(&app.exec, paths) {
+        let Some((program, args)) = parts.split_first() else { continue };
+        if let Ok(mut child) = std::process::Command::new(program).args(args).spawn() {
+            std::thread::spawn(move || child.wait());
+        }
+    }
 }
 
 /// Counts the defaults set, so a list that put the default first knows it is out of date.
@@ -297,5 +414,20 @@ mod tests {
         assert_eq!(mime.as_deref(), Some("text/plain"));
         // A name a rule does know is not looked into, and need not even exist.
         assert_eq!(mime_for(Path::new("/nowhere/picture.avif")).as_deref(), Some("image/avif"));
+    }
+
+    #[test]
+    fn several_files_go_to_one_process_or_one_each_as_the_exec_line_says() {
+        let files = [PathBuf::from("/a b.mp4"), PathBuf::from("/c.mkv")];
+        assert_eq!(command_lines("mpv --player-operation-mode=pseudo-gui -- %U", &files), [vec!["mpv", "--player-operation-mode=pseudo-gui", "--", "/a b.mp4", "/c.mkv"]]);
+        assert_eq!(command_lines("gimp %f", &files), [vec!["gimp", "/a b.mp4"], vec!["gimp", "/c.mkv"]]);
+        assert_eq!(command_lines("\"/opt/x y/app\" --new %i", &files), [vec!["/opt/x y/app", "--new", "/a b.mp4", "/c.mkv"]]);
+    }
+
+    #[test]
+    fn a_kind_of_text_counts_as_text() {
+        if std::path::Path::new("/usr/share/mime/subclasses").exists() {
+            assert!(ancestors("text/markdown").contains(&"text/plain".to_string()));
+        }
     }
 }

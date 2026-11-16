@@ -85,6 +85,14 @@ fn main() -> Result<()> {
                 println!("  {} [{}]", a.name, a.desktop_id);
             }
         }
+        // Several files: also what takes all of them, which is what "Open with" offers then.
+        if all.len() > i + 2 {
+            let paths: Vec<std::path::PathBuf> = all[i + 1..].iter().map(std::path::PathBuf::from).collect();
+            println!("all of them:");
+            for a in apps::candidates_for(&paths) {
+                println!("  {} [{}]", a.name, a.desktop_id);
+            }
+        }
         return Ok(());
     }
 
@@ -284,14 +292,14 @@ struct OpsState {
 
 /// State of the "Open with..." modal.
 struct OpenWithState {
-    path: std::path::PathBuf,
+    paths: Vec<std::path::PathBuf>,
     search: String,
     apps: Vec<apps::AppEntry>,
     /// Show only the applications that say they handle this kind of file.
     relevant_only: bool,
     /// The first half of the type, such as "image".
     major: Option<String>,
-    /// The file's whole type, such as "text/plain".
+    /// The files' whole type, such as "text/plain"; empty when they are of several.
     mime: String,
     /// Make the application picked the default for the type, as well as opening the file in it.
     make_default: bool,
@@ -1280,15 +1288,17 @@ fn draw(
                     Some(dest),
                 ));
             }
-            browser::Action::OpenWith(path) => {
-                let mime = apps::mime_for(&path).unwrap_or_default();
-                let major = mime
-                    .split('/')
-                    .next()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
+            browser::Action::OpenWith(paths) => {
+                let mime = apps::common_mime(&paths).unwrap_or_default();
+                // "image" for a JPEG and a PNG together: the half of the type they share.
+                let majors: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| apps::mime_for(p))
+                    .filter_map(|m| m.split('/').next().map(str::to_string))
+                    .collect();
+                let major = majors.first().filter(|m| !m.is_empty() && majors.len() == paths.len() && majors.iter().all(|x| x == *m)).cloned();
                 app_ops.open_with = Some(OpenWithState {
-                    path,
+                    paths,
                     search: String::new(),
                     apps: apps::all_apps(),
                     relevant_only: major.is_some(),
@@ -2275,7 +2285,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
     }
 
     if let Some(mut ow) = app_ops.open_with.take() {
-        let OpenWithState { path, search, apps, relevant_only, major, mime, make_default } = &mut ow;
+        let OpenWithState { paths, search, apps, relevant_only, major, mime, make_default } = &mut ow;
         let mut keep = true;
         let mut launched = false;
         egui::Window::new("Open with...")
@@ -2301,7 +2311,10 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 // Writes mimeapps.list via xdg-mime, so a plain double-click (xdg-open) follows the
                 // choice from now on, here and everywhere else. By type, which is what the system
                 // goes by, so the type is named: the choice holds for every file of it.
-                if mime.as_str() == apps::UNKNOWN || mime.is_empty() {
+                if mime.is_empty() {
+                    *make_default = false;
+                    ui.add_enabled(false, egui::Checkbox::new(make_default, "Set as default (the files are of different types)"));
+                } else if mime.as_str() == apps::UNKNOWN {
                     *make_default = false;
                     ui.add_enabled(false, egui::Checkbox::new(make_default, "Set as default (the file's type is unknown)"));
                 } else {
@@ -2325,10 +2338,12 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                             }
                             if ui.button(&app.name).clicked() {
                                 if *make_default {
-                                    apps::set_default(app, path);
+                                    apps::set_default(app, &paths[0]);
                                 }
-                                model::log_recent(path);
-                                apps::launch(app, path);
+                                for p in paths.iter() {
+                                    model::log_recent(p);
+                                }
+                                apps::launch_many(app, paths);
                                 launched = true;
                             }
                         }

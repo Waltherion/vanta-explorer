@@ -19,7 +19,7 @@ pub enum Action {
     OpenDropMenu { sources: Vec<std::path::PathBuf>, dest: std::path::PathBuf },
     Paste { dest: std::path::PathBuf },
     Drop { sources: Vec<std::path::PathBuf>, dest: std::path::PathBuf, copy: bool },
-    OpenWith(PathBuf),
+    OpenWith(Vec<PathBuf>),
     /// Measure these directories as one total; replaces any walk in flight.
     CalculateDirSize(Vec<PathBuf>),
     /// A synchronous rename already happened; record it so Ctrl+Z can reverse it.
@@ -1157,37 +1157,42 @@ fn entry_context_menu(
         }
         return;
     }
-    if single && !entry_is_dir {
-        let target = paths[0].clone();
+    // Files only: a folder is opened here. One file or many, of one type or several; for
+    // several, only the applications that take all of them are offered.
+    let files_only = if single { !entry_is_dir } else { paths.iter().all(|p| tab.listing.entries.iter().find(|e| e.path == *p).is_some_and(|e| !e.is_dir)) };
+    if !paths.is_empty() && files_only {
+        let targets = paths.clone();
         ui.menu_button("Open with", |ui| {
-            // Looked up once for the file the menu is open on, not on every frame it stays open:
-            // it runs xdg-mime and reads the desktop files.
+            // Looked up once for the files the menu is open on, not on every frame it stays
+            // open: it runs xdg-mime and reads the desktop files.
             thread_local! {
-                static OPEN_WITH: std::cell::RefCell<Option<(std::path::PathBuf, u64, Vec<crate::apps::AppEntry>)>> = const { std::cell::RefCell::new(None) };
+                static OPEN_WITH: std::cell::RefCell<Option<OfferedApps>> = const { std::cell::RefCell::new(None) };
             }
             let candidates = OPEN_WITH.with(|c| {
                 let mut c = c.borrow_mut();
                 // Looked up again once a default has been set, since the default goes first.
                 let set = crate::apps::defaults_set();
-                if c.as_ref().is_none_or(|(p, n, _)| *p != target || *n != set) {
-                    *c = Some((target.clone(), set, crate::apps::candidates(&target)));
+                if c.as_ref().is_none_or(|(p, n, _)| *p != targets || *n != set) {
+                    *c = Some((targets.clone(), set, crate::apps::candidates_for(&targets)));
                 }
                 c.as_ref().map(|(_, _, v)| v.clone()).unwrap_or_default()
             });
             if candidates.is_empty() {
-                ui.weak("No applications found");
+                ui.weak(if targets.len() > 1 { "No application takes all of them" } else { "No applications found" });
             }
             for app in &candidates {
                 if ui.button(&app.name).clicked() {
-                    crate::model::log_recent(&target);
-                    crate::apps::launch(app, &target);
+                    for t in &targets {
+                        crate::model::log_recent(t);
+                    }
+                    crate::apps::launch_many(app, &targets);
                     ui.close();
                 }
             }
             ui.separator();
             // Every installed application, and the place to make one the default for the type.
             if ui.button("Other application...").clicked() {
-                push(Action::OpenWith(target.clone()));
+                push(Action::OpenWith(targets.clone()));
                 ui.close();
             }
         });
@@ -1368,6 +1373,9 @@ fn add_to_sidebar_menu(ui: &mut egui::Ui, folder: &std::path::Path, view: &View)
         }
     });
 }
+
+/// The applications "Open with" offered, for which files, as of which default being set.
+type OfferedApps = (Vec<PathBuf>, u64, Vec<crate::apps::AppEntry>);
 
 /// Background (empty area) context menu: acts on the folder itself.
 fn folder_context_menu(ui: &mut egui::Ui, tab: &mut crate::panes::Tab, view: &View) {
