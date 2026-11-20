@@ -24,8 +24,10 @@ pub fn decode(path: &Path, max_dim: u32) -> Result<HdrImage, DecodeError> {
         }
     }
 
-    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-        .map_err(|e| DecodeError::Decode(e.to_string()))?;
+    // An eXIf chunk with an Orientation tag is rare in PNG but legal, and screenshots from some
+    // phones carry one, so it is honored the same way as in a JPEG.
+    let reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), image::ImageFormat::Png);
+    let img = crate::decode::decode_oriented(reader)?;
     let (w, h) = (img.width(), img.height());
     if max_dim == 0 || (w <= max_dim && h <= max_dim) {
         // Full size: 16-bit codes (an 8-bit file scaled up exactly) through one table.

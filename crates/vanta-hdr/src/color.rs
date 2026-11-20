@@ -198,6 +198,71 @@ pub fn tf_from_icc(_icc: &[u8]) -> Option<(Tf, Option<Primaries>)> {
     None
 }
 
+/// What the profile embedded in an ordinary picture (a JPEG, a WebP, a TIFF) means for its pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Embedded {
+    /// sRGB, or nothing that can be read: the pixels are taken as sRGB.
+    Srgb,
+    /// A color space the pipeline knows by name, Display P3 from a phone or a Mac above all:
+    /// the pixels are kept and the primaries said.
+    Known(Tf, Primaries),
+    /// Anything else (Adobe RGB, ProPhoto, a camera's own): the profile itself is needed to
+    /// read the pixels, and they are converted with it.
+    Other,
+}
+
+/// Reads an embedded profile by its description, the same way as `tf_from_icc`, and says which
+/// of the three it is.
+#[cfg(feature = "icc")]
+pub fn embedded(icc: &[u8]) -> Embedded {
+    let Ok(profile) = lcms2::Profile::new_icc(icc) else { return Embedded::Srgb };
+    if profile.color_space() != lcms2::ColorSpaceSignature::RgbData {
+        return Embedded::Srgb;
+    }
+    let d = profile.info(lcms2::InfoType::Description, lcms2::Locale::none()).unwrap_or_default().to_lowercase();
+    // Trusted by name only where the name settles it: PQ and HLG, and Display P3 (sRGB's curve).
+    // DCI-P3 has a 2.6 gamma and a linear profile has none, so those go through the profile.
+    match tf_from_icc(icc) {
+        Some((tf @ (Tf::Pq | Tf::Hlg), p)) => Embedded::Known(tf, p.unwrap_or(Primaries::Bt709)),
+        Some((Tf::Srgb, Some(Primaries::DisplayP3))) if !d.contains("dci") => Embedded::Known(Tf::Srgb, Primaries::DisplayP3),
+        Some((Tf::Srgb, None)) if d.contains("srgb") || d.contains("61966") => Embedded::Srgb,
+        _ => Embedded::Other,
+    }
+}
+
+#[cfg(not(feature = "icc"))]
+pub fn embedded(_icc: &[u8]) -> Embedded {
+    Embedded::Srgb
+}
+
+/// Converts RGBA float pixels, encoded as the profile `icc` describes, to linear light in BT.2020
+/// primaries, in place: wide enough that nothing an Adobe RGB or ProPhoto picture holds is lost
+/// on the way. Alpha is left as it is. False when the profile cannot be used, and nothing changed.
+#[cfg(feature = "icc")]
+pub fn convert_to_linear_bt2020(icc: &[u8], rgba: &mut [f32]) -> bool {
+    use lcms2::{CIExyY, CIExyYTRIPLE, Flags, Intent, PixelFormat, Profile, ToneCurve, Transform};
+    let Ok(from) = Profile::new_icc(icc) else { return false };
+    let d65 = CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 };
+    let bt2020 = CIExyYTRIPLE {
+        Red: CIExyY { x: 0.708, y: 0.292, Y: 1.0 },
+        Green: CIExyY { x: 0.170, y: 0.797, Y: 1.0 },
+        Blue: CIExyY { x: 0.131, y: 0.046, Y: 1.0 },
+    };
+    let linear = ToneCurve::new(1.0);
+    let Ok(to) = Profile::new_rgb(&d65, &bt2020, &[&linear, &linear, &linear]) else { return false };
+    let Ok(t) = Transform::<[f32; 4], [f32; 4]>::new_flags(&from, PixelFormat::RGBA_FLT, &to, PixelFormat::RGBA_FLT, Intent::RelativeColorimetric, Flags::COPY_ALPHA)
+    else {
+        return false;
+    };
+    t.transform_in_place(rgba.as_chunks_mut::<4>().0);
+    true
+}
+
+#[cfg(not(feature = "icc"))]
+pub fn convert_to_linear_bt2020(_icc: &[u8], _rgba: &mut [f32]) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +329,40 @@ mod tests {
         // BT.2408: 75% HLG signal is reference white on a 1000-nit display.
         let v = lin_chan(0.75, Tf::Hlg);
         assert!((v - 1.0).abs() < 0.02, "75% HLG decoded to {v}");
+    }
+}
+
+#[cfg(all(test, feature = "icc"))]
+mod embedded_tests {
+    use super::*;
+    use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
+
+    /// Adobe RGB (1998) as lcms2 builds it: its primaries, D65 and a 2.2 gamma.
+    fn adobe_rgb() -> Vec<u8> {
+        let d65 = CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 };
+        let p = CIExyYTRIPLE {
+            Red: CIExyY { x: 0.64, y: 0.33, Y: 1.0 },
+            Green: CIExyY { x: 0.21, y: 0.71, Y: 1.0 },
+            Blue: CIExyY { x: 0.15, y: 0.06, Y: 1.0 },
+        };
+        let g = ToneCurve::new(2.2);
+        Profile::new_rgb(&d65, &p, &[&g, &g, &g]).unwrap().icc().unwrap()
+    }
+
+    #[test]
+    fn a_profile_not_known_by_name_converts_through_itself() {
+        let icc = adobe_rgb();
+        assert_eq!(embedded(&icc), Embedded::Other);
+        assert_eq!(embedded(&Profile::new_srgb().icc().unwrap()), Embedded::Srgb);
+        // White, mid grey and the profile's own green, with alpha that must stay put.
+        let mut px = vec![1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.25, 0.0, 1.0, 0.0, 1.0];
+        assert!(convert_to_linear_bt2020(&icc, &mut px));
+        for c in &px[0..3] {
+            assert!((c - 1.0).abs() < 0.01, "white stays white: {px:?}");
+        }
+        assert!((px[4] - 0.5f32.powf(2.2)).abs() < 0.01, "a 2.2 gamma undone: {px:?}");
+        assert_eq!(px[7], 0.25, "alpha untouched");
+        // Adobe green is inside BT.2020, short of its corner: some red mixed in, still positive.
+        assert!(px[9] > 0.5 && px[8] > 0.0 && px[8] < px[9], "{px:?}");
     }
 }

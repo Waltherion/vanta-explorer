@@ -191,7 +191,11 @@ the band on HDR screens).
   // height: how far the curve rises, as a share of the room between its floor and the pill's
   // edge, so 1 is as tall as it can be without its peaks being cut off. Its floor is the foot of
   // the clock's own digits, whatever the font and size, so the two line up.
+  // enabled: false leaves the weekday where it is and listens to nothing. engine: "builtin" (the
+  // bar listens itself) or "cava" (needs cava installed).
   // "visualizer": {
+  //   "enabled": true,
+  //   "engine": "builtin",
   //   "rainbow": {
   //     "enabled": true,
   //     "mode": "level",
@@ -219,7 +223,7 @@ the band on HDR screens).
   // "system": {
   //   "temperature": "celsius",
   // },
-  // How the pill writes the time and the date (strftime): "%H:%M:%S" and "%d-%m-%Y" here,
+  // How the pill writes the time and the date (strftime): "%H:%M:%S" and "%Y-%m-%d" here,
   // "%I:%M:%S %p" and "%m/%d/%Y" for the American way. Leaving the seconds out lets the bar
   // sleep until the minute turns.
   // "clock": {
@@ -236,6 +240,15 @@ the band on HDR screens).
   // "hub": {
   //   // The buttons in the row that folds out of the pill: "square", "circle" or "squircle".
   //   "buttonShape": "squircle",
+  // },
+  // How the hub folds out, written as in Hyprland: the bezier's two middle points and the speed
+  // in tenths of a second (2 = 200 ms). A y above 1 runs past the end and comes back; this one is
+  // Hyprland's "crazyshot". dropIn is the bar coming back from hidden, with a bigger bounce.
+  // false turns all of it off.
+  // "animation": {
+  //   "bezier": [0.1, 1.5, 0.76, 0.92],
+  //   "speed": 2,
+  //   "dropIn": { "bezier": [0.1, 2.0, 0.4, 0.85], "speed": 2.5 },
   // },
   // "selector": {
   //   // How far the theme and wallpaper selector opens below the pill: points (576) or a share
@@ -267,7 +280,8 @@ the band on HDR screens).
   //   // networks, VPN, a fixed address). Shown only when the program is installed.
   //   "wifiSettings": "nm-connection-editor",
   //   "bluetoothSettings": "blueman-manager",
-  //   "brightness": "brightnessctl set {pct}%", // {pct} is the percentage
+  //   // Unset, the bar sets the screen's backlight itself; or a command, {pct} the percentage.
+  //   "brightness": "brightnessctl set {pct}%",
   // },
   // What the suspend button is called.
   // "sleepLabel": "Sleep",
@@ -646,10 +660,10 @@ read a Microsoft calendar.
 // Lines starting with // are options left at their default: remove the // to use one.
 {
   // Area behind and around the image: "black" (true 0 nits on OLED), "transparent"
-  // (see the wallpaper through letterbox bars), or a hex colour like "#101014".
+  // (see the wallpaper through letterbox bars), or a hex color like "#101014".
   // "background": "transparent",
 
-  // The info card, keys bar, crop caption and toasts take their accent and text colours and
+  // The info card, keys bar, crop caption and toasts take their accent and text colors and
   // their font family from colors.jsonc, shared by every Vanta app. To set them for the viewer
   // alone:
   // "color": {
@@ -662,8 +676,12 @@ read a Microsoft calendar.
   // "overlayOpacity": 0.7, // 0..1, the card background opacity
   // "fontSize": 11.0, // overlay base point size
 
-  // Behaviour.
+  // Behavior.
   // "infoOverlay": true, // show the info card and keys bar by default
+  // "gallery": false, // show the other images in the folder along the bottom by default
+  // "gallerySize": 160, // how big each picture in it is, in points (48..480)
+  // "cropShape": "free", // the shape cropping starts in: "free", "original", "16:9",
+  //                      // "21:9", "4:3", "3:2", "1:1", "9:16" or "16:10"
   // "windowWidth": 1280,
   // "windowHeight": 800,
   // "fullscreen": false,
@@ -682,15 +700,21 @@ read a Microsoft calendar.
 
 ```jsonc
 // Vanta Viewer keybindings. Each action takes a chord or a list of them, like "Ctrl+S"
-// or ["0", "="]; an action left out keeps its default. Letters are written as they
+// or ["+", "="]; an action left out keeps its default. Letters are written as they
 // are typed on your layout ("ø", "æ" on a Danish keyboard).
 //
 // Lines starting with // are options left at their default: remove the // to use one.
 {
   // "next":           ["Right", "space"],
   // "prev":           "Left",
-  // "fit":            ["0", "="],
+  // "fit":            "0",
   // "oneToOne":       "1",
+  // "zoomIn":         ["+", "="],
+  // "zoomOut":        "-",
+  // "panUp":          "Up",
+  // "panDown":        "Down",
+  // "panLeft":        "Shift+Left",
+  // "panRight":       "Shift+Right",
   // "rotateCW":       "]",
   // "rotateCCW":      "[",
   // "rotate180":      "r",
@@ -702,7 +726,12 @@ read a Microsoft calendar.
   // "cropRatioPrev":  "z",
   // "save":           "Ctrl+S",
   // "saveAs":         "Ctrl+Shift+S",
+  // "trash":          "Delete",
+  // "copy":           "Ctrl+C",
+  // "showInFolder":   "Ctrl+O",
+  // "wallpaper":      "w",
   // "info":           "i",
+  // "gallery":        "g",
   // "fullscreen":     "f",
   // "quit":           ["q", "Escape"],
 }

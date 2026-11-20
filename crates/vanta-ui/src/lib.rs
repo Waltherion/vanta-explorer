@@ -6,6 +6,7 @@
 //! meet. Keeping one implementation here is what makes that possible.
 
 pub mod band;
+pub mod ease;
 pub mod font;
 pub mod style;
 pub mod theme;

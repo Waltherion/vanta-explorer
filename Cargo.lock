@@ -4467,6 +4467,7 @@ dependencies = [
  "pkg-config",
  "png",
  "rayon",
+ "sha1",
 ]
 
 [[package]]
@@ -4504,7 +4505,6 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_json",
- "sha1",
  "syntect",
  "trash",
  "vanta-config",

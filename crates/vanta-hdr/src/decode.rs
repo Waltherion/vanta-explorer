@@ -275,6 +275,53 @@ fn code_table(tf: Tf) -> std::sync::Arc<Vec<f16>> {
     t
 }
 
+/// Decodes through the `image` crate with the file's own orientation applied. A phone stores a
+/// portrait photo as landscape pixels plus an EXIF Orientation tag, and `ImageReader::decode`
+/// ignores that tag, so every such photo would show up lying on its side. The rotation happens
+/// here, before any thumbnail scaling, so the caller's size math sees the upright dimensions.
+pub(crate) fn decode_oriented<R: std::io::BufRead + std::io::Seek>(
+    reader: image::ImageReader<R>,
+) -> Result<image::DynamicImage, DecodeError> {
+    decode_oriented_with_profile(reader).map(|(img, _)| img)
+}
+
+/// `decode_oriented`, with the ICC profile the file carries, if any.
+pub(crate) fn decode_oriented_with_profile<R: std::io::BufRead + std::io::Seek>(
+    reader: image::ImageReader<R>,
+) -> Result<(image::DynamicImage, Option<Vec<u8>>), DecodeError> {
+    use image::ImageDecoder;
+    let mut decoder = reader.into_decoder().map_err(|e| DecodeError::Decode(e.to_string()))?;
+    let icc = decoder.icc_profile().ok().flatten().filter(|p| !p.is_empty());
+    // Broken EXIF is common in files that went through odd editors. The pixels are still fine,
+    // so a tag that cannot be read means "upright" rather than a failed decode.
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Decode(e.to_string()))?;
+    img.apply_orientation(orientation);
+    Ok((img, icc))
+}
+
+/// Rotates or mirrors a finished image, for decoders whose library reports the orientation but
+/// leaves the pixels as stored (libavif). The half-floats travel as their raw 16 bits, so the
+/// `image` crate's tested transforms do the work and no value is converted on the way.
+#[cfg_attr(not(feature = "avif"), allow(dead_code))]
+pub(crate) fn orient(img: HdrImage, orientation: image::metadata::Orientation) -> HdrImage {
+    use half::vec::{HalfBitsVecExt, HalfFloatVecExt};
+    if orientation == image::metadata::Orientation::NoTransforms || !img.valid() {
+        return img;
+    }
+    let HdrImage { w, h, rgba16f, hdr, kind, primaries, pages } = img;
+    let buf = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(w, h, rgba16f.reinterpret_into())
+        .expect("valid() guarantees w * h * 4 samples");
+    let mut dynimg = image::DynamicImage::ImageRgba16(buf);
+    dynimg.apply_orientation(orientation);
+    let (w, h) = (dynimg.width(), dynimg.height());
+    let bits = match dynimg {
+        image::DynamicImage::ImageRgba16(b) => b.into_raw(),
+        other => other.to_rgba16().into_raw(),
+    };
+    HdrImage { w, h, rgba16f: bits.reinterpret_into(), hdr, kind, primaries, pages }
+}
+
 /// The size a thumbnail of (w, h) is decoded at: neither side above `max_dim` (0: no limit).
 pub(crate) fn scaled_size(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
     if max_dim == 0 || (w <= max_dim && h <= max_dim) {
@@ -319,6 +366,98 @@ mod misnamed_tests {
         let path = tiny(image::ImageFormat::Jpeg, "really-a-jpeg.png");
         let img = decode_image(&path, 0, 0).expect("content decides, not the extension");
         assert_eq!((img.w, img.h), (4, 3));
+    }
+
+    /// A minimal EXIF block holding only Orientation, big-endian TIFF, as phones write it.
+    fn exif_orientation(value: u16) -> Vec<u8> {
+        let mut t = b"MM\x00\x2a\x00\x00\x00\x08".to_vec();
+        t.extend_from_slice(&1u16.to_be_bytes()); // one IFD entry
+        t.extend_from_slice(&0x0112u16.to_be_bytes()); // Orientation
+        t.extend_from_slice(&3u16.to_be_bytes()); // SHORT
+        t.extend_from_slice(&1u32.to_be_bytes());
+        t.extend_from_slice(&value.to_be_bytes());
+        t.extend_from_slice(&[0, 0]);
+        t.extend_from_slice(&0u32.to_be_bytes()); // no next IFD
+        t
+    }
+
+    /// A 6x2 picture whose left column is red and the rest black, so where the red ends up
+    /// tells which way it was turned.
+    fn marked() -> image::RgbImage {
+        image::RgbImage::from_fn(6, 2, |x, _| if x == 0 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 0]) })
+    }
+
+    fn red(img: &HdrImage, x: u32, y: u32) -> bool {
+        let i = ((y * img.w + x) * 4) as usize;
+        img.rgba16f[i].to_f32() > 0.5 && img.rgba16f[i + 1].to_f32() < 0.2
+    }
+
+    #[test]
+    fn jpeg_exif_orientation_is_applied() {
+        let mut jpeg = Vec::new();
+        marked().write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        // APP1 goes straight after SOI.
+        let mut app1 = b"Exif\x00\x00".to_vec();
+        app1.extend_from_slice(&exif_orientation(6));
+        let mut file = jpeg[..2].to_vec();
+        file.extend_from_slice(&[0xFF, 0xE1]);
+        file.extend_from_slice(&(app1.len() as u16 + 2).to_be_bytes());
+        file.extend_from_slice(&app1);
+        file.extend_from_slice(&jpeg[2..]);
+        let dir = std::env::temp_dir().join("vanta-hdr-misnamed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portrait.jpg");
+        std::fs::write(&path, &file).unwrap();
+
+        // Orientation 6 means "turn 90 degrees clockwise to view": the left column becomes the top row.
+        let img = decode_image(&path, 0, 0).unwrap();
+        assert_eq!((img.w, img.h), (2, 6));
+        assert!(red(&img, 0, 0) && red(&img, 1, 0), "left column should now be the top row");
+        assert!(!red(&img, 0, 5));
+
+        // A thumbnail is sized from the upright picture: 2x6 capped at 3 is 1x3, not 3x1.
+        let thumb = decode_image(&path, 3, 0).unwrap();
+        assert_eq!((thumb.w, thumb.h), (1, 3));
+    }
+
+    #[test]
+    fn png_exif_orientation_is_applied() {
+        let mut png = Vec::new();
+        marked().write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        // eXIf has to come before IDAT; right after IHDR (8 + 25 bytes) is always allowed.
+        let data = exif_orientation(8);
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        let mut crc = flate2::Crc::new();
+        crc.update(b"eXIf");
+        crc.update(&data);
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(&data);
+        chunk.extend_from_slice(&crc.sum().to_be_bytes());
+        let mut file = png[..33].to_vec();
+        file.extend_from_slice(&chunk);
+        file.extend_from_slice(&png[33..]);
+        let dir = std::env::temp_dir().join("vanta-hdr-misnamed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("portrait.png");
+        std::fs::write(&path, &file).unwrap();
+
+        // Orientation 8 is a quarter turn anticlockwise: the left column becomes the bottom row.
+        let img = decode_image(&path, 0, 0).unwrap();
+        assert_eq!((img.w, img.h), (2, 6));
+        assert!(red(&img, 0, 5) && red(&img, 1, 5), "left column should now be the bottom row");
+        assert!(!red(&img, 0, 0));
+    }
+
+    #[test]
+    fn orient_turns_half_floats_without_touching_them() {
+        let src = HdrImage::from_linear_f32(3, 1, &[0.1, 0.2, 0.3, 1.0, 4.0, 5.0, 6.0, 1.0, 7.0, 8.0, 9.0, 0.5], Tf::Linear, Primaries::Bt2020);
+        let before = src.rgba16f.clone();
+        let out = orient(src, image::metadata::Orientation::Rotate90);
+        assert_eq!((out.w, out.h), (1, 3));
+        assert_eq!(out.rgba16f, before, "a 3x1 strip turned clockwise reads the same top to bottom");
+        assert!(out.hdr && out.primaries == Primaries::Bt2020);
+        let back = orient(out, image::metadata::Orientation::Rotate180);
+        assert_eq!(&back.rgba16f[..4], &before[8..]);
     }
 
     #[test]

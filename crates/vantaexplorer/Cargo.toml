@@ -35,7 +35,6 @@ xdg-mime = "0.4.0"
 rustix = { version = "1.1.4", features = ["fs"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 half = "2.7.1"
-sha1 = "0.11.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 poppler-rs = "0.26.0"
 cairo-rs = "0.22.0"

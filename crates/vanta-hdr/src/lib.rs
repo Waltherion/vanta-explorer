@@ -14,6 +14,7 @@ pub(crate) mod avif_sys;
 pub mod color;
 pub mod decode;
 pub mod encode;
+pub mod thumb;
 
 pub use color::{Primaries, Tf};
 pub use decode::{decode_image, DecodeError, HdrImage, HdrKind};

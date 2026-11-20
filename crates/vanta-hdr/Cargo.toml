@@ -19,6 +19,7 @@ raw = []                      # system libraw via bindgen (build.rs): camera RAW
 [dependencies]
 ffmpeg-next = { version = "9.0.0", optional = true }
 flate2 = "1.1.9"
+sha1 = "0.11.0"
 half = "2"
 image = "0.25.10"
 jpegxl-rs = { version = "0.15.0", optional = true }
