@@ -1,16 +1,18 @@
-//! Dragging files OUT of the window, to other applications, and taking files dropped INTO it
-//! from another window (another Explorer, another file manager, or our own drag come back).
+//! Drag and drop and the system clipboard for a winit window on Wayland, which winit does not
+//! offer: dragging files OUT of the window to other applications, taking files dropped INTO it
+//! from another window, and text and files on the clipboard. Vanta Explorer uses all of it,
+//! Vanta Viewer the drags.
 //!
-//! `VANTAEXPLORER_DND_DEBUG=1` logs the handshake: which serial was used, what the target asked for,
-//! how much was written, and how it ended. Kept rather than removed once the feature worked,
-//! because whether a drop LANDS depends on the receiving application, Krita and kitty
-//! accepted this drag while Zed at first did not, and that is not diagnosable from here
-//! without seeing the exchange.
+//! `VANTA_DND_DEBUG=1` (or the older `VANTAEXPLORER_DND_DEBUG=1`) logs the handshake: which
+//! serial was used, what the target asked for, how much was written, and how it ended. Kept
+//! rather than removed once the feature worked, because whether a drop LANDS depends on the
+//! receiving application, Krita and kitty accepted this drag while Zed at first did not, and
+//! that is not diagnosable from here without seeing the exchange.
 //!
 //! winit has no API for starting a drag-and-drop operation, `Window::drag_window` moves the
 //! window itself, so we speak `wl_data_device` directly, on winit's own Wayland connection.
-//! Internal drags between panes stay on egui's own machinery; this takes over only once the
-//! pointer leaves the window (see `App::window_event`).
+//! The app starts a drag once the pointer, with the button still down, leaves the window: the
+//! implicit grab, and the serial of the press that began it, are still valid then.
 //!
 //! The awkward part is the serial. `start_drag` must be given the serial of the implicit grab
 //! that began the gesture, i.e. the pointer button press, and winit exposes no serials at
@@ -19,17 +21,16 @@
 //! every bound object, and serials are per-connection, so what we observe is what start_drag
 //! will accept.
 //!
-//! The system clipboard (text) goes through here too. Hyprland gives a program's drags AND
-//! its clipboard to the first wl_data_device that program made, and only to that one: with
-//! egui-winit's own clipboard device beside ours, whichever was made first got both, and the
-//! other got nothing, so drops in or clipboard paste failed depending on a race at startup.
-//! One device for both is the only arrangement that works everywhere; egui-winit's clipboard
-//! is off (Cargo.toml) and `main` routes copy and paste here.
+//! The system clipboard goes through here too, for an app that wants it. Hyprland gives a
+//! program's drags AND its clipboard to the first wl_data_device that program made, and only to
+//! that one: with egui-winit's own clipboard device beside ours, whichever was made first got
+//! both, and the other got nothing, so drops in or clipboard paste failed depending on a race at
+//! startup. So make this before anything else that could make a data device, and route copy and
+//! paste here rather than through egui-winit.
 //!
 //! A drag coming IN is read as it enters (the paths, from `text/uri-list`, on a thread of its
-//! own), so the window can show what it would do while the pointer is still moving; `main`
-//! feeds the position and the release to egui as pointer events, and the drop lands in the
-//! same code as a drag between panes.
+//! own), so the window can show what it would do while the pointer is still moving; the drop is
+//! handed over once its paths are in.
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -57,9 +58,15 @@ const URI_LIST: &str = "text/uri-list";
 const TEXT_UTF8: &str = "text/plain;charset=utf-8";
 const TEXT: &str = "text/plain";
 /// Offered beside the files when the drag was made with the right button: the window it lands
-/// in asks Copy or Move, as a right-button drag between panes does. A drag carries no button,
-/// so this is how the other window knows.
+/// in asks Copy or Move, as a right-button drag between Explorer's panes does. A drag carries no
+/// button, so this is how the other window knows. The name is what Explorer windows already
+/// look for, so it stays.
 const ASK: &str = "application/x-vanta-explorer-ask";
+
+/// Whether the handshake is logged, see the module note.
+fn debug() -> bool {
+    std::env::var_os("VANTA_DND_DEBUG").is_some() || std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some()
+}
 /// Clipboard text formats, best first. The X11 names are what XWayland programs look for.
 const CLIPBOARD_FORMATS: [&str; 5] = [TEXT_UTF8, "UTF8_STRING", TEXT, "STRING", "TEXT"];
 /// Copied or cut files as GNOME (Nautilus) writes them: "copy" or "cut", then one URI a line.
@@ -98,7 +105,7 @@ struct Incoming {
     dropped: bool,
 }
 
-/// What `main` needs to know about a drag coming in.
+/// What the app needs to know about a drag coming in.
 pub struct IncomingView {
     pub pos: (f64, f64),
     pub paths: Option<Vec<PathBuf>>,
@@ -196,11 +203,21 @@ impl Dnd {
         self.state.in_flight
     }
 
-    /// Hand `paths` to the compositor as a drag. No-op if one is already running, or if no
-    /// button press has been seen to borrow a serial from.
+    /// Hand `paths` to the compositor as a drag, to be copied or moved as the target likes. No-op
+    /// if one is already running, or if no button press has been seen to borrow a serial from.
     pub fn start(&mut self, paths: &[PathBuf], ask: bool) {
-        if std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some() {
-            log::info!(
+        self.start_with(paths, ask, DndAction::Copy | DndAction::Move);
+    }
+
+    /// The same, but the files may only be copied: a viewer's picture dropped in a file manager
+    /// must not be moved out from under it.
+    pub fn start_copy(&mut self, paths: &[PathBuf]) {
+        self.start_with(paths, false, DndAction::Copy);
+    }
+
+    fn start_with(&mut self, paths: &[PathBuf], ask: bool, actions: DndAction) {
+        if debug() {
+            eprintln!(
                 "dnd start: in_flight={} serial={:?} manager={} device={} paths={}",
                 self.state.in_flight,
                 self.state.press_serial,
@@ -244,11 +261,11 @@ impl Dnd {
         if source.version() >= 3 {
             // Copy first: dropping a file into a chat or an editor should not move it off
             // the disk. The target picks from what we offer.
-            source.set_actions(DndAction::Copy | DndAction::Move);
+            source.set_actions(actions);
         }
         device.start_drag(Some(&source), &self.surface, None, serial);
-        if std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some() {
-            log::info!("dnd: start_drag issued, serial={serial}, uris={:?}", self.state.uri_payload);
+        if debug() {
+            eprintln!("dnd: start_drag issued, serial={serial}, uris={:?}", self.state.uri_payload);
         }
         self.state.in_flight = true;
         let _ = self.conn.flush();
@@ -451,7 +468,7 @@ impl Dnd {
 
 /// The local files in a `text/uri-list` (RFC 2483): one URI per line, `#` lines are comments.
 /// Anything not a `file://` URI on this machine is left out.
-fn parse_uri_list(list: &str) -> Vec<PathBuf> {
+pub fn parse_uri_list(list: &str) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     list.lines()
         .map(str::trim)
@@ -512,7 +529,7 @@ fn read_offer(conn: &Connection, offer: &WlDataOffer, mime: &str) -> Option<mpsc
 ///
 /// Listing paths are already absolute, and they are used as-is: canonicalising would resolve
 /// symlinks, so dragging a link would hand over its target instead of the link itself.
-fn file_uri(path: &Path) -> Option<String> {
+pub fn file_uri(path: &Path) -> Option<String> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -629,8 +646,8 @@ impl Dispatch<WlDataSource, SourceKind> for State {
         match event {
             // The target accepted and is asking for one of the formats we advertised.
             wl_data_source::Event::Send { mime_type, fd } => {
-                if std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some() {
-                    log::info!("dnd: target asked for {mime_type}");
+                if debug() {
+                    eprintln!("dnd: target asked for {mime_type}");
                 }
                 let body = if mime_type == URI_LIST {
                     &state.uri_payload
@@ -642,16 +659,16 @@ impl Dispatch<WlDataSource, SourceKind> for State {
                 let mut file = std::fs::File::from(fd);
                 match file.write_all(body.as_bytes()) {
                     Ok(()) => {
-                        if std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some() {
-                            log::info!("dnd: wrote {bytes} bytes of {mime_type}");
+                        if debug() {
+                            eprintln!("dnd: wrote {bytes} bytes of {mime_type}");
                         }
                     }
                     Err(e) => log::warn!("dnd: writing {mime_type} failed: {e}"),
                 }
             }
             wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
-                if std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some() {
-                    log::info!("dnd: drag ended ({event:?})");
+                if debug() {
+                    eprintln!("dnd: drag ended ({event:?})");
                 }
                 source.destroy();
                 state.in_flight = false;
@@ -708,7 +725,7 @@ impl Dispatch<WlDataDevice, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         use wl_data_device::Event;
-        let debug = std::env::var_os("VANTAEXPLORER_DND_DEBUG").is_some();
+        let debug = debug();
         match event {
             Event::Enter { serial, surface, x, y, id } => {
                 let Some(offer) = id else { return };
@@ -721,7 +738,7 @@ impl Dispatch<WlDataDevice, ()> for State {
                         old.destroy();
                     }
                     if debug {
-                        log::info!("dnd in: declined (ours={ours}, accepting={}, formats={mimes:?})", state.accepting);
+                        eprintln!("dnd in: declined (ours={ours}, accepting={}, formats={mimes:?})", state.accepting);
                     }
                     return;
                 }
@@ -740,7 +757,7 @@ impl Dispatch<WlDataDevice, ()> for State {
                 };
                 let ask = mimes.iter().any(|m| m == ASK) || (state.in_flight && state.drag_ask);
                 if debug {
-                    log::info!("dnd in: enter at {x},{y}, own drag={}, copy only={copy_only}, ask={ask}", state.in_flight);
+                    eprintln!("dnd in: enter at {x},{y}, own drag={}, copy only={copy_only}, ask={ask}", state.in_flight);
                 }
                 state.incoming = Some(Incoming { offer, pos: (x, y), paths, reading, copy_only, ask, dropped: false });
                 state.changed = true;
@@ -770,7 +787,7 @@ impl Dispatch<WlDataDevice, ()> for State {
                     inc.dropped = true;
                     state.changed = true;
                     if debug {
-                        log::info!("dnd in: dropped at {:?}", inc.pos);
+                        eprintln!("dnd in: dropped at {:?}", inc.pos);
                     }
                 }
             }

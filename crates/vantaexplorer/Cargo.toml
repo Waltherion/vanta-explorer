@@ -23,11 +23,13 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 egui-ash-renderer = "0.13.0"
 log = "0.4.34"
+# Drag and drop and the clipboard only, without the toolkit side.
+vanta-wl = { path = "../vanta-wl", default-features = false }
 env_logger = "0.11.11"
 json5 = "1.3.1"
 serde = { version = "1.0.229", features = ["derive"] }
 egui = "0.36"
-egui-winit = { version = "0.36", default-features = false, features = ["wayland", "links"] }  # clipboard: our own, see dnd.rs
+egui-winit = { version = "0.36", default-features = false, features = ["wayland", "links"] }  # clipboard: our own, see vanta-wl/src/dnd.rs
 serde_json = "1.0.151"
 resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts"] }
 freedesktop-icons = "0.4.0"

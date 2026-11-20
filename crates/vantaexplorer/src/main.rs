@@ -11,7 +11,6 @@ mod chooser;
 mod config;
 mod dir_size;
 mod help;
-mod dnd;
 mod docs;
 mod drives;
 mod fileops;
@@ -29,6 +28,7 @@ mod thumbs;
 mod vk;
 mod watch;
 
+use vanta_wl::dnd;
 use anyhow::{anyhow, Context, Result};
 use egui_ash_renderer::{Options, RenderMode};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
@@ -489,7 +489,7 @@ impl ApplicationHandler for App {
                 if is_v {
                     self.paste_key = true;
                     self.needs_draw = true;
-                    // Text for a text field. egui-winit's own clipboard is off (see dnd.rs), so
+                    // Text for a text field. egui-winit's own clipboard is off (see vanta_wl::dnd), so
                     // the paste event is ours to make.
                     gfx.pending_paste = gfx.dnd.as_mut().and_then(|d| d.clipboard()).filter(|t| !t.is_empty());
                 }
@@ -1005,7 +1005,7 @@ impl App {
 
         // Best-effort: no drag and drop is a missing feature, not a reason to fail startup.
         // Made BEFORE egui-winit's state: Hyprland gives drags and the clipboard to the first
-        // data device a program makes, and egui-winit may make one of its own (see dnd.rs).
+        // data device a program makes, and egui-winit may make one of its own (see vanta_wl::dnd).
         let dnd = match wayland_handles(&window).and_then(|(d, s)| dnd::Dnd::new(d, s)) {
             Ok(d) => Some(d),
             Err(e) => {
@@ -1409,7 +1409,7 @@ fn draw(
         .map(|v| v.repaint_delay)
         .unwrap_or(Duration::MAX);
 
-    // Copied text goes on the system clipboard through our own data device (see dnd.rs).
+    // Copied text goes on the system clipboard through our own data device (see vanta_wl::dnd).
     if let Some(d) = &mut gfx.dnd {
         output.platform_output.commands.retain(|c| match c {
             egui::OutputCommand::CopyText(text) => {

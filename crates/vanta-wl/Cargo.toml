@@ -1,0 +1,21 @@
+[package]
+name = "vanta-wl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wayland client helpers shared by the vanta apps: fractional-scale parking, sctk input to egui translation, drag and drop and the clipboard, re-exports pinning one wayland stack."
+
+[features]
+# The toolkit side: sctk input to egui, fractional scale, and the re-exports of sctk and the
+# protocols. A winit app that only wants drag and drop (Vanta Explorer, Vanta Viewer) goes
+# without it and builds none of it.
+default = ["toolkit"]
+toolkit = ["dep:egui", "dep:smithay-client-toolkit", "dep:wayland-protocols"]
+
+[dependencies]
+anyhow = "1"
+log = "0.4.34"
+egui = { version = "0.36", optional = true }
+smithay-client-toolkit = { version = "0.20", optional = true }
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"], optional = true }
