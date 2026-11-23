@@ -36,6 +36,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Delete", "Delete for good (asks first)"),
             ("Ctrl+Z, Ctrl+Y", "Undo, redo"),
             ("Alt+Enter", "Properties (of the folder, when nothing is marked)"),
+            ("Ctrl+E", "Edit a text file in the preview; Ctrl+S saves, Escape stops"),
             ("Drag", "Move; with Ctrl: copy; with the right button: ask"),
         ],
     ),

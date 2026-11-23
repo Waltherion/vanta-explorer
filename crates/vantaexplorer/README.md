@@ -38,6 +38,10 @@ the desktop theme changes, without restarting and without losing your open tabs.
   sheets (.xlsx, .ods) as a grid, a sheet at a time. No office suite is needed. SVG is drawn
   on a checkerboard so both dark and light artwork read, and source in some fifty text
   formats is syntax-highlighted.
+- **Quick edits in the preview.** Edit (Ctrl+E) turns a text file or a small config into
+  editable text with line numbers and highlighting; Ctrl+S saves. It writes through a symlink
+  to the file behind it, keeps its permissions and line endings, and asks before unsaved
+  changes are left or a file changed on disk is overwritten.
 - **A `file(1)` line under the image**, so you see what a file actually is rather than what
   its extension claims.
 - **Folder sizes on demand**, and selection totals that include folder contents, computed

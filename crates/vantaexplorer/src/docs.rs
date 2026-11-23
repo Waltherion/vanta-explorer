@@ -8,7 +8,7 @@ use egui::text::LayoutJob;
 use std::path::Path;
 use std::sync::OnceLock;
 
-const TEXT_LIMIT_BYTES: usize = 256 * 1024;
+pub const TEXT_LIMIT_BYTES: usize = 256 * 1024;
 const TEXT_LIMIT_LINES: usize = 3000;
 
 pub enum DocContent {
@@ -272,6 +272,17 @@ fn ooxml_thumbnail(path: &Path) -> Result<egui::ColorImage, String> {
     Err("no embedded thumbnail (Office writes one only when asked to)".into())
 }
 
+/// The syntax to borrow for config formats syntect has none of: JSON with comments reads as JSON,
+/// and the `key = value` files with `#` comments (TOML, INI, .conf, .desktop) read well enough
+/// as shell, which colors their comments, strings and numbers.
+fn borrowed_syntax(ext: &str) -> Option<&'static str> {
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "jsonc" | "json5" => "json",
+        "conf" | "cfg" | "ini" | "toml" | "desktop" | "service" | "env" | "rules" | "properties" => "sh",
+        _ => return None,
+    })
+}
+
 fn syntaxes() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::Theme) {
     static SETS: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::Theme)> =
         OnceLock::new();
@@ -288,9 +299,6 @@ fn syntaxes() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::T
 
 /// Capped, syntax-highlighted text as an egui LayoutJob (plain data, safe to build off-thread).
 fn highlight_text(path: &Path) -> Result<LayoutJob, String> {
-    use syntect::easy::HighlightLines;
-    use syntect::util::LinesWithEndings;
-
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let truncated = bytes.len() > TEXT_LIMIT_BYTES;
     let slice = &bytes[..bytes.len().min(TEXT_LIMIT_BYTES)];
@@ -298,12 +306,32 @@ fn highlight_text(path: &Path) -> Result<LayoutJob, String> {
         return Err("binary file".into());
     }
     let text = String::from_utf8_lossy(slice);
+    let mut job = highlight(path, &text, TEXT_LIMIT_LINES);
+    if truncated {
+        job.append(
+            "\n… (truncated)",
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::monospace(12.0),
+                color: egui::Color32::GRAY,
+                ..Default::default()
+            },
+        );
+    }
+    Ok(job)
+}
+
+/// `text` highlighted as the kind of file `path` is (by its extension, else its first line), up to
+/// `max_lines` lines. Shared by the preview and the editor.
+pub fn highlight(path: &Path, text: &str, max_lines: usize) -> LayoutJob {
+    use syntect::easy::HighlightLines;
+    use syntect::util::LinesWithEndings;
 
     let (ss, theme) = syntaxes();
     let syntax = path
         .extension()
         .and_then(|e| e.to_str())
-        .and_then(|e| ss.find_syntax_by_extension(e))
+        .and_then(|e| ss.find_syntax_by_extension(e).or_else(|| ss.find_syntax_by_extension(borrowed_syntax(e)?)))
         .or_else(|| ss.find_syntax_by_first_line(text.lines().next().unwrap_or("")))
         .unwrap_or_else(|| ss.find_syntax_plain_text());
 
@@ -311,11 +339,12 @@ fn highlight_text(path: &Path) -> Result<LayoutJob, String> {
     let mut job = LayoutJob::default();
     let font = egui::FontId::monospace(12.0);
 
-    for (n, line) in LinesWithEndings::from(&text).enumerate() {
-        if n >= TEXT_LIMIT_LINES {
+    for (n, line) in LinesWithEndings::from(text).enumerate() {
+        if n >= max_lines {
             break;
         }
         let Ok(regions) = hl.highlight_line(line, ss) else {
+            job.append(line, 0.0, egui::TextFormat { font_id: font.clone(), color: egui::Color32::LIGHT_GRAY, ..Default::default() });
             continue;
         };
         for (style, span) in regions {
@@ -331,16 +360,5 @@ fn highlight_text(path: &Path) -> Result<LayoutJob, String> {
             );
         }
     }
-    if truncated {
-        job.append(
-            "\n… (truncated)",
-            0.0,
-            egui::TextFormat {
-                font_id: font,
-                color: egui::Color32::GRAY,
-                ..Default::default()
-            },
-        );
-    }
-    Ok(job)
+    job
 }

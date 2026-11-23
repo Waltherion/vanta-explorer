@@ -13,6 +13,7 @@ mod dir_size;
 mod help;
 mod docs;
 mod drives;
+mod editor;
 mod fileops;
 mod glyph;
 mod hdrmon;
@@ -214,6 +215,11 @@ fn main() -> Result<()> {
             redo: Vec::new(),
             reversing: std::collections::HashMap::new(),
             toast: None,
+            editor: None,
+            editor_prompt: None,
+            edit_next: false,
+            close_now: false,
+            refresh_preview: false,
         },
         thumbs: std::cell::RefCell::new(thumbs::Thumbs::new()),
         dir_size: dir_size::DirSize::new(),
@@ -306,6 +312,36 @@ struct OpsState {
     reversing: std::collections::HashMap<u64, Reversal>,
     /// Short-lived status-bar message after an undo/redo.
     toast: Option<(String, std::time::Instant)>,
+    /// A file open for editing in the preview pane.
+    editor: Option<editor::Editor>,
+    /// A question about the edits: unsaved when leaving, or changed on disk at save.
+    editor_prompt: Option<EditorPrompt>,
+    /// Ctrl+E opened the preview; the editor opens in it on the next frame.
+    edit_next: bool,
+    /// The window was asked to close and the edits are settled: close it now.
+    close_now: bool,
+    /// A file was saved or reloaded in the editor: the preview reads it again.
+    refresh_preview: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EditorAsk {
+    /// Unsaved edits, and the editor is being left.
+    Unsaved,
+    /// The file changed on disk since it was opened, and Save was pressed.
+    Conflict,
+}
+
+/// A question about the edits, and what was being done when it came up.
+#[derive(Clone, Copy)]
+struct EditorPrompt {
+    ask: EditorAsk,
+    /// Another file was chosen, or the preview closed: Cancel goes back to the file.
+    moved: bool,
+    /// The window is closing: it closes once the question is answered (unless cancelled).
+    close: bool,
+    /// The editor itself is being left (Cancel, Escape).
+    leave: bool,
 }
 
 /// State of the "Open with..." modal.
@@ -583,6 +619,12 @@ impl ApplicationHandler for App {
                 match &mut self.chooser {
                     // Closing the chooser is saying no; about_to_wait answers and leaves.
                     Some(c) => c.cancel(),
+                    None if self.ops_state.editor.as_ref().is_some_and(|e| e.dirty()) => {
+                        // Unsaved edits: ask first; the window closes once they are settled.
+                        self.ops_state.editor_prompt = Some(EditorPrompt { ask: EditorAsk::Unsaved, moved: false, close: true, leave: true });
+                        self.needs_draw = true;
+                        gfx.window.request_redraw();
+                    }
                     None => {
                         if self.session.is_some() {
                             panes::save(&self.ws, true);
@@ -618,6 +660,12 @@ impl ApplicationHandler for App {
                     Err(e) => log::error!("draw failed: {e:#}"),
                 }
                 self.last_draw = Instant::now();
+                if std::mem::take(&mut self.ops_state.close_now) {
+                    if self.session.is_some() {
+                        panes::save(&self.ws, true);
+                    }
+                    event_loop.exit();
+                }
             }
             _ => {}
         }
@@ -1397,6 +1445,9 @@ fn draw(
         }
     }
 
+    if std::mem::take(&mut app_ops.refresh_preview) {
+        preview.clear();
+    }
     match want_preview.take() {
         Some((path, page)) => preview.request(&path, page, &gfx.egui_ctx),
         None => {
@@ -1525,6 +1576,7 @@ fn app_ui(
         || app_ops.pending_error.is_some()
         || app_ops.open_with.is_some()
         || app_ops.properties.is_some()
+        || app_ops.editor_prompt.is_some()
         || chooser.as_ref().is_some_and(|c| c.replace.is_some());
 
     // Escape says no to the program that asked, once there is nothing smaller for it to close:
@@ -1711,6 +1763,19 @@ fn app_ui(
         ),
     ); }
 
+    // Ctrl+E edits the selected file in the preview pane, opening the pane first if it is shut.
+    let mut edit_key = std::mem::take(&mut app_ops.edit_next);
+    if chooser.is_none() && !modal_open && !root.ctx().text_edit_focused() && root.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
+        if ws.preview_open {
+            edit_key = true;
+        } else {
+            ws.preview_open = true;
+            app_ops.edit_next = true;
+        }
+    }
+    let editor_cell = std::cell::RefCell::new(app_ops.editor.take());
+    let editor_event = std::cell::Cell::new(None);
+
     let sidebar_targets = sidebar.targets();
     let view = browser::View {
         theme,
@@ -1727,6 +1792,9 @@ fn app_ui(
         paste_key,
         chooser: chooser.as_ref(),
         sidebar_targets: &sidebar_targets,
+        editor: &editor_cell,
+        editor_event: &editor_event,
+        edit_key,
     };
 
     // --- preview panel (right, window-level) ---
@@ -1785,6 +1853,8 @@ fn app_ui(
         let active = &ws.panes[ws.active.min(ws.panes.len() - 1)];
         browser::show_preview(&mut pui, active, &view);
     }
+    app_ops.editor = editor_cell.into_inner();
+    editor_after_frame(root.ctx(), ws, app_ops, editor_event.take(), want_preview);
 
     // --- Drag overlay ---
     if root.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2065,6 +2135,142 @@ fn open_with_state(paths: Vec<std::path::PathBuf>) -> OpenWithState {
 }
 
 /// Progress + conflict windows, drawn on top of everything.
+/// What the editor asked for this frame, whether it was left with edits unsaved, and the
+/// question about them when there is one.
+fn editor_after_frame(
+    ctx: &egui::Context,
+    ws: &mut panes::Workspace,
+    app_ops: &mut OpsState,
+    event: Option<editor::Event>,
+    want_preview: &std::cell::Cell<Option<(std::path::PathBuf, u32)>>,
+) {
+    let toast = |app_ops: &mut OpsState, msg: String| app_ops.toast = Some((msg, std::time::Instant::now()));
+    match event {
+        Some(editor::Event::Failed(why)) => toast(app_ops, why),
+        Some(editor::Event::Save) => {
+            if let Some(ed) = app_ops.editor.as_mut() {
+                if ed.changed_on_disk() {
+                    app_ops.editor_prompt = Some(EditorPrompt { ask: EditorAsk::Conflict, moved: false, close: false, leave: false });
+                } else {
+                    let name = ed.file_name();
+                    match ed.save() {
+                        Ok(()) => {
+                            app_ops.refresh_preview = true;
+                            toast(app_ops, format!("Saved {name}"))
+                        }
+                        Err(e) => toast(app_ops, format!("Could not save {name}: {e}")),
+                    }
+                }
+            }
+        }
+        Some(editor::Event::Cancel) => match &app_ops.editor {
+            Some(ed) if ed.dirty() => app_ops.editor_prompt = Some(EditorPrompt { ask: EditorAsk::Unsaved, moved: false, close: false, leave: true }),
+            _ => app_ops.editor = None,
+        },
+        None => {}
+    }
+
+    // The preview moved on (another file, several, none, the pane shut): the editor goes with it,
+    // after asking when there are edits.
+    if app_ops.editor_prompt.is_none() {
+        let wanted = want_preview.take();
+        let here = app_ops.editor.as_ref().is_some_and(|ed| wanted.as_ref().is_some_and(|(p, _)| *p == ed.path));
+        want_preview.set(wanted);
+        match &app_ops.editor {
+            Some(ed) if !here && ed.dirty() => app_ops.editor_prompt = Some(EditorPrompt { ask: EditorAsk::Unsaved, moved: true, close: false, leave: true }),
+            Some(_) if !here => app_ops.editor = None,
+            _ => {}
+        }
+    }
+
+    let (Some(prompt), Some(ed)) = (app_ops.editor_prompt, app_ops.editor.as_mut()) else {
+        app_ops.editor_prompt = None;
+        return;
+    };
+    let name = ed.file_name();
+    #[derive(PartialEq)]
+    enum Answer {
+        First,
+        Second,
+        Cancel,
+    }
+    let mut answer = None;
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(Answer::Cancel);
+    }
+    egui::Modal::new(egui::Id::new("editor-question")).show(ctx, |ui| {
+        let (heading, text, first, second) = match prompt.ask {
+            EditorAsk::Unsaved => ("Unsaved changes", format!("'{name}' has changes that are not saved."), "Save", "Discard"),
+            EditorAsk::Conflict => ("Changed on disk", format!("'{name}' was changed by something else since you opened it."), "Overwrite", "Reload"),
+        };
+        ui.heading(heading);
+        ui.label(text);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(first).clicked() {
+                answer = Some(Answer::First);
+            }
+            if ui.button(second).clicked() {
+                answer = Some(Answer::Second);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(Answer::Cancel);
+            }
+        });
+    });
+    let Some(answer) = answer else { return };
+    app_ops.editor_prompt = None;
+    let settled = match (prompt.ask, answer) {
+        (_, Answer::Cancel) => {
+            if prompt.moved {
+                // Back to the file, so the edits are on screen again.
+                let path = ed.path.clone();
+                if let (Some(dir), Some(file)) = (path.parent(), path.file_name()) {
+                    let tab = ws.active_pane().tab();
+                    if tab.path() != dir {
+                        tab.navigate(dir.to_path_buf());
+                    }
+                    tab.pending_reveal = Some(file.to_string_lossy().into_owned());
+                }
+                ws.preview_open = true;
+            }
+            false
+        }
+        (EditorAsk::Unsaved, Answer::First) if ed.changed_on_disk() => {
+            app_ops.editor_prompt = Some(EditorPrompt { ask: EditorAsk::Conflict, ..prompt });
+            false
+        }
+        (EditorAsk::Unsaved, Answer::First) | (EditorAsk::Conflict, Answer::First) => match ed.save() {
+            Ok(()) => {
+                app_ops.toast = Some((format!("Saved {name}"), std::time::Instant::now()));
+                app_ops.refresh_preview = true;
+                true
+            }
+            Err(e) => {
+                app_ops.toast = Some((format!("Could not save {name}: {e}"), std::time::Instant::now()));
+                false
+            }
+        },
+        (EditorAsk::Unsaved, Answer::Second) => true,
+        (EditorAsk::Conflict, Answer::Second) => {
+            if let Err(e) = ed.reload() {
+                app_ops.toast = Some((format!("Could not read {name}: {e}"), std::time::Instant::now()));
+            }
+            app_ops.refresh_preview = true;
+            prompt.leave
+        }
+    };
+    if settled {
+        if prompt.leave || prompt.moved || prompt.close {
+            app_ops.editor = None;
+        }
+        if prompt.close {
+            app_ops.close_now = true;
+        }
+    }
+    ctx.request_repaint();
+}
+
 fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::Theme) {
     if let Some(mut p) = app_ops.properties.take() {
         let (open, wants) = p.show(ctx, theme.accent);

@@ -113,6 +113,12 @@ pub struct View<'a> {
     pub chooser: Option<&'a crate::chooser::State>,
     /// The sidebar sections a folder can be added to, for "Add to sidebar".
     pub sidebar_targets: &'a [crate::sidebar::Target],
+    /// The file open for editing in the preview pane, if any.
+    pub editor: &'a std::cell::RefCell<Option<crate::editor::Editor>>,
+    /// What the editor asked for this frame.
+    pub editor_event: &'a std::cell::Cell<Option<crate::editor::Event>>,
+    /// Ctrl+E was pressed: edit the selected file.
+    pub edit_key: bool,
 }
 
 /// Whether an entry is listed: not hidden (unless asked for), matching what is typed, and let
@@ -2818,7 +2824,28 @@ pub fn show_preview(ui: &mut egui::Ui, pane: &Pane, view: &View) {
             ui.weak("Nothing selected");
         }
         [e] => {
-            ui.label(egui::RichText::new(&e.name).strong());
+            let editable = !e.is_dir && view.chooser.is_none() && crate::docs::is_text(&e.path) && !e.path.extension().is_some_and(|x| x.eq_ignore_ascii_case("svg"));
+            let editing = view.editor.borrow().as_ref().is_some_and(|ed| ed.path == e.path);
+            // One row, as high as a line: a right-to-left layout on its own would take all the
+            // height there is and push the preview out of sight.
+            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), row_h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if editable && !editing {
+                    let why = crate::editor::refusal(&e.path);
+                    let button = ui.add_enabled(why.is_none(), egui::Button::new("Edit").small());
+                    let button = match why {
+                        Some(w) => button.on_disabled_hover_text(w),
+                        None => button.on_hover_text("Edit the text here (Ctrl+E)"),
+                    };
+                    if button.clicked() || view.edit_key {
+                        match crate::editor::Editor::open(&e.path) {
+                            Ok(ed) => *view.editor.borrow_mut() = Some(ed),
+                            Err(why) => view.editor_event.set(Some(crate::editor::Event::Failed(why))),
+                        }
+                    }
+                }
+                ui.add(egui::Label::new(egui::RichText::new(&e.name).strong()).truncate());
+            });
             if !e.is_dir {
                 ui.label(human_size(e.size));
             } else {
@@ -2842,6 +2869,17 @@ pub fn show_preview(ui: &mut egui::Ui, pane: &Pane, view: &View) {
             }
             ui.add_space(6.0);
 
+            if let Some(ed) = view.editor.borrow_mut().as_mut().filter(|ed| ed.path == e.path) {
+                // Still the preview's subject, so leaving the file is noticed.
+                view.want_preview.set(Some((e.path.clone(), 0)));
+                let asked = crate::editor::show(ui, ed, view.theme);
+                if asked.save {
+                    view.editor_event.set(Some(crate::editor::Event::Save));
+                } else if asked.cancel {
+                    view.editor_event.set(Some(crate::editor::Event::Cancel));
+                }
+                return;
+            }
             if !e.is_dir && crate::preview::supported(&e.path) {
                 let current_page = if view.preview.current_path() == Some(&e.path) {
                     view.preview.current_page().unwrap_or(0)
@@ -2957,7 +2995,10 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                     .id_salt("preview-text")
                     .auto_shrink([false, false])
                     .show(&mut child, |ui| {
-                        ui.label(egui::text::LayoutJob::clone(job));
+                        ui.horizontal_top(|ui| {
+                            line_numbers(ui, &job.text, view.theme);
+                            ui.label(egui::text::LayoutJob::clone(job));
+                        });
                     });
             }
             crate::preview::Shown::Rich(rich) => crate::office::view::show(ui, rect, rich, view.theme),
@@ -3141,4 +3182,13 @@ mod tests {
         assert!(c.show_size && c.show_modified);
         assert!(c.size_w >= need.size && c.modified_w >= need.modified);
     }
+}
+
+/// Line numbers for `text`, in the monospace size the text is drawn in, to stand beside it.
+pub fn line_numbers(ui: &mut egui::Ui, text: &str, theme: &Theme) {
+    let lines = text.split('\n').count().max(1);
+    let digits = lines.to_string().len();
+    let numbers: String = (1..=lines).map(|n| format!("{n:>digits$}")).collect::<Vec<_>>().join("\n");
+    ui.add(egui::Label::new(egui::RichText::new(numbers).font(egui::FontId::monospace(12.0)).color(theme.text.gamma_multiply(0.35))).selectable(false));
+    ui.add_space(6.0);
 }
