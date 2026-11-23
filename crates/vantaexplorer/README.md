@@ -33,9 +33,11 @@ the desktop theme changes, without restarting and without losing your open tabs.
 - **Video, with a seek slider.** Any container ffmpeg reads: mp4, mkv, webm, mov and the
   rest. Drag the slider under the preview to scrub through the file in 1% steps; each stop
   is decoded on demand, in the video's own color space.
-- **Documents.** PDF pages with previous/next, ODF and OOXML thumbnails, SVG drawn on a
-  checkerboard so both dark and light artwork read, and syntax-highlighted source for some
-  fifty text formats.
+- **Documents.** PDF pages with previous/next; Word and Writer documents (.docx, .odt) read
+  by Explorer itself, with headings, formatting, lists, tables and pictures; Excel and Calc
+  sheets (.xlsx, .ods) as a grid, a sheet at a time. No office suite is needed. SVG is drawn
+  on a checkerboard so both dark and light artwork read, and source in some fifty text
+  formats is syntax-highlighted.
 - **A `file(1)` line under the image**, so you see what a file actually is rather than what
   its extension claims.
 - **Folder sizes on demand**, and selection totals that include folder contents, computed

@@ -4587,6 +4587,7 @@ dependencies = [
  "poppler-rs",
  "raw-window-handle",
  "resvg",
+ "roxmltree 0.21.1",
  "rustix 1.1.4",
  "serde",
  "serde_json",

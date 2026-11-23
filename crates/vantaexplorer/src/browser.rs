@@ -2900,7 +2900,7 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
     }
     
     // Text fills the pane; images/rasters keep a square-ish stage.
-    let is_text = matches!(view.preview.shown, crate::preview::Shown::Text(_));
+    let is_text = matches!(view.preview.shown, crate::preview::Shown::Text(_) | crate::preview::Shown::Rich(_));
     let height = if is_text { avail.y.max(48.0) } else { avail.x.min(avail.y).max(48.0) };
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
 
@@ -2960,6 +2960,7 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                         ui.label(egui::text::LayoutJob::clone(job));
                     });
             }
+            crate::preview::Shown::Rich(rich) => crate::office::view::show(ui, rect, rich, view.theme),
             crate::preview::Shown::Nothing => {}
         },
         PreviewState::Failed(p, err) if p == path => {
@@ -3000,8 +3001,26 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
             if let Some(info) = file_info {
                 ui.weak(info);
             }
+            let sheet = match &view.preview.shown {
+                crate::preview::Shown::Rich(r) if r.doc.sheets.is_some() => Some(r.clone()),
+                _ => None,
+            };
             if *total_pages > 1 {
-                if *total_pages == 100 {
+                if let Some(book) = sheet {
+                    // A workbook: the pages are its sheets, by name.
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(asked_page > 0, egui::Button::new("<")).clicked() {
+                            view.want_preview.set(Some((p.clone(), asked_page - 1)));
+                            ui.ctx().request_repaint();
+                        }
+                        let name = book.sheet_name(asked_page).unwrap_or("");
+                        ui.label(format!("{name} ({} of {})", asked_page + 1, total_pages));
+                        if ui.add_enabled(asked_page + 1 < *total_pages, egui::Button::new(">")).clicked() {
+                            view.want_preview.set(Some((p.clone(), asked_page + 1)));
+                            ui.ctx().request_repaint();
+                        }
+                    });
+                } else if *total_pages == 100 {
                     ui.horizontal(|ui| {
                         ui.label("Seek:");
                         let mut pct = asked_page as f32;

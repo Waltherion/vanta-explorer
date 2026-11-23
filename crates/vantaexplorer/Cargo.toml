@@ -37,7 +37,9 @@ xdg-mime = "0.4.0"
 rustix = { version = "1.1.4", features = ["fs"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 half = "2.7.1"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+# Office documents are XML in a zip; read with the same parser resvg already brings in.
+roxmltree = "0.21"
 poppler-rs = "0.26.0"
 cairo-rs = "0.22.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

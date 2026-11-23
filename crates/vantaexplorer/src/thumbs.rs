@@ -251,7 +251,7 @@ fn load_or_make(key: &str, path: &Path) -> Option<egui::ColorImage> {
     }
 
     if crate::docs::is_doc(path) {
-        let crate::docs::DocContent::Raster { img, .. } = crate::docs::render(path, THUMB_PX, 0).ok()? else {
+        let crate::docs::DocContent::Raster { img, .. } = crate::docs::thumbnail(path, THUMB_PX).ok()? else {
             return None;
         };
         let pixels: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();

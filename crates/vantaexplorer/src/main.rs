@@ -18,6 +18,7 @@ mod glyph;
 mod hdrmon;
 mod icons;
 mod model;
+mod office;
 mod panes;
 mod preview;
 mod props;
@@ -117,6 +118,18 @@ fn main() -> Result<()> {
                     job.sections.len(),
                     t.elapsed()
                 ),
+                Ok(docs::DocContent::Rich(doc)) => {
+                    let count = |f: fn(&office::Block) -> bool| doc.blocks.iter().filter(|b| f(b)).count();
+                    let rows: usize = doc.blocks.iter().map(|b| if let office::Block::Sheet(s) = b { s.rows.len() } else { 0 }).sum();
+                    println!(
+                        "{path}: document, {} paragraphs, {} tables, {rows} sheet rows, {} pictures{} in {:?}",
+                        count(|b| matches!(b, office::Block::Para(_))),
+                        count(|b| matches!(b, office::Block::Table(_))),
+                        doc.images.len(),
+                        doc.sheets.as_ref().map(|s| format!(", sheets {}", s.join(", "))).unwrap_or_default(),
+                        t.elapsed()
+                    );
+                }
                 Err(e) => println!("{path}: FAILED: {e}"),
             }
         }
@@ -1134,27 +1147,33 @@ fn feed_incoming_drag(gfx: &mut Gfx, raw: &mut egui::RawInput) {
 }
 
 /// Resolve the theme font and hand it to egui. Re-applied on config reload.
+///
+/// Besides the text font there is a bold family for documents (`office::view::BOLD`): the
+/// theme font's bold cut, or the text font again when it has none. It is always registered,
+/// also when the theme font is missing, because egui panics on a family it was never given.
 fn apply_font(ctx: &egui::Context, cfg: &config::Config, current: &mut Option<String>) {
     if current.as_deref() == Some(cfg.font.family.as_str()) {
         return;
     }
-    // The installed font, or the built-in Poppins when that is the family and it is missing.
-    let Some(bytes) = vanta_ui::font::file_bytes(&cfg.font.family) else {
-        log::warn!("font {} not found; keeping the built-in one", cfg.font.family);
-        return;
-    };
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("theme".into(), Arc::new(egui::FontData::from_owned(bytes)));
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "theme".into());
+    // The installed font, or the built-in Poppins when that is the family and it is missing.
+    match vanta_ui::font::file_bytes(&cfg.font.family) {
+        Some(bytes) => {
+            fonts.font_data.insert("theme".into(), Arc::new(egui::FontData::from_owned(bytes)));
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "theme".into());
+            log::info!("font: {}", cfg.font.family);
+        }
+        None => log::warn!("font {} not found; keeping the built-in one", cfg.font.family),
+    }
+    let mut bold = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    // Fontconfig's weight 200 is bold.
+    if let Some(bytes) = vanta_ui::font::file_bytes(&format!("{}:weight=200", cfg.font.family)) {
+        fonts.font_data.insert("theme-bold".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        bold.insert(0, "theme-bold".into());
+    }
+    fonts.families.insert(egui::FontFamily::Name(office::view::BOLD.into()), bold);
     ctx.set_fonts(fonts);
     *current = Some(cfg.font.family.clone());
-    log::info!("font: {}", cfg.font.family);
 }
 
 /// Returns how long egui wants before the next frame.

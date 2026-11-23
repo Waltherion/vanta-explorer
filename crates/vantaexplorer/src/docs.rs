@@ -1,4 +1,5 @@
-//! Document previews: PDF first page, ODF/OOXML embedded thumbnails, highlighted text.
+//! Document previews: PDF pages, Word, Writer, Excel and Calc documents read by `office`,
+//! ODF/OOXML embedded thumbnails for the rest, highlighted text.
 //!
 //! Documents are SDR by nature, so unlike images they do not go through the HDR layer, they
 //! come back as plain raster (or a text layout) and draw in the egui layer.
@@ -13,6 +14,8 @@ const TEXT_LIMIT_LINES: usize = 3000;
 pub enum DocContent {
     Raster { img: egui::ColorImage, total_pages: u32 },
     Text(LayoutJob),
+    /// An office document's own content: text, tables, pictures, or a sheet.
+    Rich(crate::office::RichDoc),
 }
 
 /// Formats that render to a bitmap rather than to text. Gates BOTH the preview panel and
@@ -105,10 +108,28 @@ fn ext(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// Render on a worker thread; every branch here can block on IO.
+/// Render for the preview, on a worker thread; every branch here can block on IO. Office
+/// documents show their content; when it cannot be read, the picture they carry of themselves,
+/// and when there is none, why the content could not be read.
 pub fn render(path: &Path, max_px: u32, page: u32) -> Result<DocContent, String> {
+    let e = ext(path);
+    if crate::office::handles(&e) {
+        return match crate::office::render(path, &e, page) {
+            Ok(doc) => Ok(DocContent::Rich(doc)),
+            Err(why) => thumbnail(path, max_px).map_err(|_| why),
+        };
+    }
+    if e == "pdf" {
+        return render_pdf(path, max_px, page).map(|(img, total_pages)| DocContent::Raster { img, total_pages });
+    }
+    thumbnail(path, max_px)
+}
+
+/// A picture of the file for the grid: the first PDF page, an SVG drawn, an office document by
+/// the thumbnail it carries; text highlighted.
+pub fn thumbnail(path: &Path, max_px: u32) -> Result<DocContent, String> {
     match ext(path).as_str() {
-        "pdf" => render_pdf(path, max_px, page).map(|(img, total_pages)| DocContent::Raster { img, total_pages }),
+        "pdf" => render_pdf(path, max_px, 0).map(|(img, total_pages)| DocContent::Raster { img, total_pages }),
         "odt" | "ods" | "odp" | "odg" => {
             zip_thumbnail(path, "Thumbnails/thumbnail.png").map(|img| DocContent::Raster { img, total_pages: 1 })
         }

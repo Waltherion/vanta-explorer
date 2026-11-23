@@ -32,6 +32,8 @@ pub enum Shown {
     Raster(egui::TextureHandle),
     /// Highlighted text.
     Text(std::sync::Arc<egui::text::LayoutJob>),
+    /// An office document's content, its pictures uploaded.
+    Rich(std::sync::Arc<crate::office::view::Rich>),
 }
 
 /// Everything previewable, not just HDR formats.
@@ -180,6 +182,14 @@ impl Preview {
                     ));
                     let current_page = self.current_page().unwrap_or(0);
                     self.state = PreviewState::Ready(loaded.path, current_page, total_pages, loaded.file_info);
+                }
+                Ok(Content::Doc(DocContent::Rich(doc))) => {
+                    let pages = doc.sheets.as_ref().map_or(1, |s| s.len() as u32);
+                    self.texture_size = None;
+                    self.is_hdr = false;
+                    self.shown = Shown::Rich(std::sync::Arc::new(crate::office::view::Rich::new(ctx, doc)));
+                    let current_page = self.current_page().unwrap_or(0);
+                    self.state = PreviewState::Ready(loaded.path, current_page, pages, loaded.file_info);
                 }
                 Ok(Content::Doc(DocContent::Text(job))) => {
                     self.texture_size = None;
