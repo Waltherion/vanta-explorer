@@ -38,7 +38,7 @@ pub fn read(pkg: &mut Package, page: u32) -> Result<RichDoc, String> {
     let text = pkg.text(&part).ok_or("a sheet the workbook lists is missing")?;
     let doc = super::xml(&text)?;
     let sheet = sheet(&doc, &shared, &formats, date1904);
-    Ok(RichDoc { blocks: vec![Block::Sheet(sheet)], images: Vec::new(), sheets: Some(sheets.into_iter().map(|(n, _)| n).collect()), note: None })
+    Ok(RichDoc { blocks: vec![Block::Sheet(sheet)], images: Vec::new(), sheets: Some(sheets.into_iter().map(|(n, _)| n).collect()), note: None, page: Default::default(), base_pt: 11.0 })
 }
 
 /// The text of every shared string, in order. Rich text is flattened; phonetic runs are left out.

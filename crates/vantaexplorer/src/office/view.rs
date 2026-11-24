@@ -1,5 +1,5 @@
-//! Drawing a `RichDoc` in the preview pane: text in the theme's font, scaled so the document's
-//! normal size is the pane's, its own colors kept where they can be read on the window.
+//! Drawing a `RichDoc` in the preview pane: a text document on its pages, as it would print, a
+//! workbook's sheet as a grid.
 
 use super::{Align, Block, Inline, Para, RichDoc, Sheet, SpanStyle, Table};
 use crate::browser::Theme;
@@ -31,106 +31,318 @@ impl Rich {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme) {
+/// The lightness of paper and of ink on a dark page, which white and black become.
+const NIGHT_PAPER: f32 = 0.13;
+const NIGHT_INK: f32 = 0.86;
+
+/// A color for a dark page: its lightness turned round (white paper becomes dark gray, black ink
+/// light), its hue and how colorful it is kept, so blue text stays blue, only light.
+pub fn night(c: egui::Color32) -> egui::Color32 {
+    let [r, g, b, a] = night_px([c.r(), c.g(), c.b(), c.a()]);
+    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn night_px([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    let (rf, gf, bf) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let y = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+    let to = NIGHT_PAPER + (NIGHT_INK - NIGHT_PAPER) * (1.0 - y);
+    let d = to - y;
+    let ch = |v: f32| ((v + d).clamp(0.0, 1.0) * 255.0).round() as u8;
+    [ch(rf), ch(gf), ch(bf), a]
+}
+
+/// A rendered page made dark the same way: everything on it, pictures included.
+pub fn night_image(mut img: egui::ColorImage) -> egui::ColorImage {
+    for px in &mut img.pixels {
+        let [r, g, b, a] = px.to_srgba_unmultiplied();
+        let [r, g, b, a] = night_px([r, g, b, a]);
+        *px = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+    }
+    img
+}
+
+/// Space around and between the pages, in pixels.
+const PAGE_GAP: f32 = 10.0;
+/// The ink of text whose color is automatic.
+const INK: egui::Color32 = egui::Color32::from_rgb(20, 20, 20);
+/// The hairlines of tables.
+const RULE: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+/// How far a list's marker stands left of its text, in points.
+const HANG: f32 = 18.0;
+/// A list level's indent, in points.
+const INDENT: f32 = 36.0;
+/// A single line's height as a multiple of its text size.
+const LINE: f32 = 1.17;
+
+/// A text document as its pages: paper of the document's size with its margins, scaled to the
+/// pane's width, the text set and broken into pages at that scale. `dark`: on dark paper, its
+/// colors turned round by `night`, its pictures as they are.
+pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme, dark: bool) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
-    let body = egui::TextStyle::Body.resolve(child.style()).size;
     if let [Block::Sheet(sheet)] = rich.doc.blocks.as_slice() {
+        let body = egui::TextStyle::Body.resolve(child.style()).size;
         sheet_view(&mut child, sheet, theme, body);
         return;
     }
-    egui::ScrollArea::vertical().id_salt("preview-doc").auto_shrink([false, false]).show(&mut child, |ui| {
-        let width = (ui.available_width() - 8.0).max(60.0);
-        let d = Drawer { theme, textures: &rich.textures, body };
-        d.blocks(ui, &rich.doc.blocks, width);
+    let page = rich.doc.page;
+    let mut shown_page = None;
+    let out = egui::ScrollArea::vertical().id_salt("preview-doc").auto_shrink([false, false]).show(&mut child, |ui| {
+        let width = ui.available_width();
+        let s = ((width - 2.0 * PAGE_GAP) / page.width).max(0.05);
+        let [mt, mr, mb, ml] = page.margin.map(|m| m * s);
+        let (pw, ph) = (page.width * s, page.height * s);
+        let lay = Lay { painter: ui.painter().clone(), textures: &rich.textures, s, base: rich.doc.base_pt, dark };
+        let paper = lay.tone(egui::Color32::WHITE);
+        let ink = lay.tone(INK);
+        let pieces = lay.blocks(&rich.doc.blocks, pw - ml - mr);
+        let (placed, pages) = paginate(&pieces, ph - mt - mb);
+        let note_h = if rich.doc.note.is_some() { 24.0 } else { 0.0 };
+        let total = PAGE_GAP + pages as f32 * (ph + PAGE_GAP) + note_h;
+        let (area, _) = ui.allocate_exact_size(egui::vec2(width, total), egui::Sense::hover());
+        let visible = ui.clip_rect();
+        let page_rect = |i: usize| egui::Rect::from_min_size(egui::pos2(area.min.x + (width - pw) / 2.0, area.min.y + PAGE_GAP + i as f32 * (ph + PAGE_GAP)), egui::vec2(pw, ph));
+        let painter = ui.painter();
+        for i in 0..pages {
+            let r = page_rect(i);
+            if !r.expand(8.0).intersects(visible) {
+                continue;
+            }
+            painter.rect_filled(r.translate(egui::vec2(0.0, 2.0)).expand(1.0), 2.0, egui::Color32::from_black_alpha(70));
+            painter.rect_filled(r, 0.0, paper);
+            if dark {
+                // Dark paper on a dark window needs an edge the shadow cannot give it.
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(28)), egui::StrokeKind::Outside);
+            }
+        }
+        for p in &placed {
+            let r = page_rect(p.page);
+            if !r.intersects(visible) {
+                continue;
+            }
+            let top = r.min + egui::vec2(ml, mt + p.at);
+            let piece = &pieces[p.piece];
+            let whole = p.y0 <= 0.0 && p.y1 >= piece.h;
+            let clip = if whole { r } else { egui::Rect::from_min_max(egui::pos2(r.min.x, top.y), egui::pos2(r.max.x, top.y + p.y1 - p.y0)).intersect(r) };
+            let pt = painter.with_clip_rect(clip.intersect(visible));
+            let offset = top.to_vec2() - egui::vec2(0.0, p.y0);
+            for item in &piece.items {
+                item.paint(&pt, offset, ink);
+            }
+        }
         if let Some(note) = &rich.doc.note {
-            ui.add_space(body * 0.6);
-            ui.weak(note);
+            let y = area.min.y + PAGE_GAP + pages as f32 * (ph + PAGE_GAP);
+            painter.text(egui::pos2(area.center().x, y + 4.0), egui::Align2::CENTER_TOP, note, egui::TextStyle::Small.resolve(ui.style()), theme.text.gamma_multiply(0.6));
+        }
+        if pages > 1 {
+            let middle = visible.center().y - area.min.y - PAGE_GAP / 2.0;
+            shown_page = Some((((middle / (ph + PAGE_GAP)).floor().max(0.0) as usize).min(pages - 1) + 1, pages));
         }
     });
+    if let Some((n, of)) = shown_page {
+        // Which page is in view, in the corner as a PDF reader says it.
+        let painter = child.painter();
+        let font = egui::TextStyle::Small.resolve(child.style());
+        let galley = painter.layout_no_wrap(format!("{n} / {of}"), font, egui::Color32::WHITE);
+        let at = out.inner_rect.right_bottom() - galley.size() - egui::vec2(18.0, 10.0);
+        painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(6.0, 3.0)), 4.0, egui::Color32::from_black_alpha(160));
+        painter.galley(at, galley, egui::Color32::WHITE);
+    }
 }
 
-struct Drawer<'a> {
-    theme: &'a Theme,
+/// Something drawn, relative to the top left of the piece it is in.
+enum Item {
+    Text(egui::Pos2, std::sync::Arc<egui::Galley>),
+    Image(egui::TextureId, egui::Rect),
+    Fill(egui::Rect, egui::Color32),
+    Frame(egui::Rect, f32, egui::Color32),
+}
+
+impl Item {
+    fn paint(&self, p: &egui::Painter, offset: egui::Vec2, ink: egui::Color32) {
+        match self {
+            Item::Text(pos, g) => p.galley(*pos + offset, g.clone(), ink),
+            Item::Image(tex, r) => {
+                p.image(*tex, r.translate(offset), egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            }
+            Item::Fill(r, c) => {
+                p.rect_filled(r.translate(offset), 0.0, *c);
+            }
+            Item::Frame(r, w, c) => {
+                p.rect_stroke(r.translate(offset), 0.0, egui::Stroke::new(*w, *c), egui::StrokeKind::Middle);
+            }
+        }
+    }
+
+    fn shift(self, by: egui::Vec2) -> Self {
+        match self {
+            Item::Text(pos, g) => Item::Text(pos + by, g),
+            Item::Image(t, r) => Item::Image(t, r.translate(by)),
+            Item::Fill(r, c) => Item::Fill(r.translate(by), c),
+            Item::Frame(r, w, c) => Item::Frame(r.translate(by), w, c),
+        }
+    }
+}
+
+/// A paragraph or a table row: what a page holds or, at the lines in `cuts`, splits.
+#[derive(Default)]
+struct Piece {
+    items: Vec<Item>,
+    h: f32,
+    /// Where it may be split across pages: the tops of its lines.
+    cuts: Vec<f32>,
+    before: f32,
+    after: f32,
+    contextual: bool,
+    /// Starts a new page.
+    page_break: bool,
+}
+
+/// The space between two pieces one above the other.
+fn between(above: &Piece, below: &Piece) -> f32 {
+    if above.contextual && below.contextual { 0.0 } else { above.after + below.before }
+}
+
+/// Where a piece, or the part of it from `y0` to `y1`, stands: on which page, how far below the
+/// top margin.
+struct Placed {
+    page: usize,
+    piece: usize,
+    y0: f32,
+    y1: f32,
+    at: f32,
+}
+
+/// The pieces on pages `room` high. A piece that does not fit is split at the last line that
+/// does, or moved to the next page; one taller than a page with nowhere to split it is cut.
+fn paginate(pieces: &[Piece], room: f32) -> (Vec<Placed>, usize) {
+    let mut placed = Vec::new();
+    let (mut page, mut y) = (0usize, 0.0f32);
+    let mut prev: Option<&Piece> = None;
+    for (i, p) in pieces.iter().enumerate() {
+        if p.page_break && y > 0.0 {
+            page += 1;
+            y = 0.0;
+        }
+        if y > 0.0 {
+            y += prev.map_or(0.0, |q| between(q, p));
+        }
+        let mut start = 0.0;
+        loop {
+            let rest = p.h - start;
+            if y + rest <= room + 0.5 {
+                placed.push(Placed { page, piece: i, y0: start, y1: p.h, at: y });
+                y += rest;
+                break;
+            }
+            let fits = room - y;
+            match p.cuts.iter().copied().filter(|c| *c > start + 0.5 && *c - start <= fits).max_by(f32::total_cmp) {
+                Some(cut) => {
+                    placed.push(Placed { page, piece: i, y0: start, y1: cut, at: y });
+                    start = cut;
+                }
+                None if y > 0.0 => {}
+                None => {
+                    let cut = start + room;
+                    placed.push(Placed { page, piece: i, y0: start, y1: cut, at: 0.0 });
+                    start = cut;
+                }
+            }
+            page += 1;
+            y = 0.0;
+        }
+        prev = Some(p);
+    }
+    (placed, page + 1)
+}
+
+/// Sets text at a scale: `s` pixels to the point.
+struct Lay<'a> {
+    painter: egui::Painter,
     textures: &'a [egui::TextureHandle],
-    /// The pane's text size, which the document's normal size is drawn at.
-    body: f32,
+    s: f32,
+    /// The document's normal text size, points.
+    base: f32,
+    /// Set on dark paper.
+    dark: bool,
 }
 
-/// How much bigger than normal text a heading is drawn when the document does not say.
+/// How much bigger than normal text a heading is when the document does not say.
 fn heading_scale(h: Option<u8>) -> f32 {
     match h {
-        Some(0) => 1.9,
-        Some(1) => 1.5,
-        Some(2) => 1.3,
-        Some(3) => 1.15,
+        Some(0) => 2.2,
+        Some(1) => 1.6,
+        Some(2) => 1.35,
+        Some(3) => 1.2,
         Some(_) => 1.05,
         None => 1.0,
     }
 }
 
-fn luminance(c: [u8; 3]) -> f32 {
-    (0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32) / 255.0
-}
+impl Lay<'_> {
+    /// A color of the page as it is drawn: turned round on dark paper.
+    fn tone(&self, c: egui::Color32) -> egui::Color32 {
+        if self.dark { night(c) } else { c }
+    }
 
-impl Drawer<'_> {
-    fn blocks(&self, ui: &mut egui::Ui, blocks: &[Block], width: f32) {
-        for (i, b) in blocks.iter().enumerate() {
+    fn blocks(&self, blocks: &[Block], width: f32) -> Vec<Piece> {
+        let mut out = Vec::new();
+        let mut page_break = false;
+        for b in blocks {
+            let at = out.len();
             match b {
-                Block::Para(p) => self.para(ui, p, width, i == 0),
-                Block::Table(t) => {
-                    self.table(ui, t, width);
-                    ui.add_space(self.body * 0.5);
-                }
-                Block::Sheet(s) => {
-                    // Only a workbook has sheets, and it is drawn by `sheet_view`.
-                    ui.weak(format!("({} rows of a sheet)", s.rows.len()));
-                }
-                Block::PageBreak => {
-                    ui.add_space(self.body * 0.6);
-                    let y = ui.cursor().min.y;
-                    let x = ui.cursor().min.x;
-                    let stroke = egui::Stroke::new(1.0, self.theme.text.gamma_multiply(0.25));
-                    let dashes = egui::Shape::dashed_line(&[egui::pos2(x, y), egui::pos2(x + width, y)], stroke, 6.0, 4.0);
-                    ui.painter().extend(dashes);
-                    ui.add_space(self.body * 0.6);
+                Block::Para(p) => out.push(self.para(p, width)),
+                Block::Table(t) => self.table(t, width, &mut out),
+                // Only a workbook has sheets, and it is drawn by `sheet_view`.
+                Block::Sheet(_) => {}
+                Block::PageBreak => page_break = true,
+            }
+            if page_break {
+                if let Some(first) = out.get_mut(at) {
+                    first.page_break = true;
+                    page_break = false;
                 }
             }
         }
+        out
     }
 
-    /// The document's color when it reads on the window, else the theme's text color: black text
-    /// on a dark theme (or white on a light one) would be invisible.
-    fn color(&self, c: Option<[u8; 3]>) -> egui::Color32 {
-        let text = self.theme.text;
-        let Some(c) = c else { return text };
-        let dark_window = luminance([text.r(), text.g(), text.b()]) > 0.5;
-        let l = luminance(c);
-        if (dark_window && l < 0.3) || (!dark_window && l > 0.7) {
-            text
-        } else {
-            egui::Color32::from_rgb(c[0], c[1], c[2])
+    /// Pieces stacked as one, for a table cell.
+    fn stack(pieces: Vec<Piece>) -> (Vec<Item>, f32) {
+        let mut items = Vec::new();
+        let mut y = 0.0;
+        let mut prev: Option<Piece> = None;
+        for mut p in pieces {
+            if let Some(q) = &prev {
+                y += between(q, &p);
+            }
+            items.extend(std::mem::take(&mut p.items).into_iter().map(|i| i.shift(egui::vec2(0.0, y))));
+            y += p.h;
+            prev = Some(p);
         }
+        (items, y)
     }
 
-    fn format(&self, st: &SpanStyle, heading: Option<u8>) -> egui::TextFormat {
-        let size = (self.body * st.size.unwrap_or_else(|| heading_scale(heading))).clamp(self.body * 0.6, self.body * 2.6);
-        let bold = st.bold || heading.is_some();
+    fn format(&self, st: &SpanStyle, heading: Option<u8>, line: f32) -> egui::TextFormat {
+        let pt = (self.base * st.size.unwrap_or_else(|| heading_scale(heading))).clamp(3.0, 200.0);
+        let size = pt * self.s;
+        let bold = st.bold || (heading.is_some() && st.size.is_none());
         let family = if bold { egui::FontFamily::Name(BOLD.into()) } else { egui::FontFamily::Proportional };
-        let color = self.color(st.color);
-        let line = egui::Stroke::new(1.0, color);
+        let color = self.tone(st.color.map_or(INK, |c| egui::Color32::from_rgb(c[0], c[1], c[2])));
+        let stroke = egui::Stroke::new((pt * self.s / 14.0).max(0.6), color);
         egui::TextFormat {
-            font_id: egui::FontId::new(size, family),
+            font_id: egui::FontId::new(size.max(1.0), family),
             color,
             italics: st.italic,
-            underline: if st.underline { line } else { egui::Stroke::NONE },
-            strikethrough: if st.strike { line } else { egui::Stroke::NONE },
+            underline: if st.underline { stroke } else { egui::Stroke::NONE },
+            strikethrough: if st.strike { stroke } else { egui::Stroke::NONE },
+            line_height: Some(size * LINE * line),
             ..Default::default()
         }
     }
 
     fn new_job(width: f32, align: Align) -> LayoutJob {
         let mut job = LayoutJob::default();
-        job.wrap.max_width = width;
+        job.wrap.max_width = width.max(4.0);
         job.halign = match align {
             Align::Center => egui::Align::Center,
             Align::Right => egui::Align::RIGHT,
@@ -140,123 +352,145 @@ impl Drawer<'_> {
         job
     }
 
-    fn para(&self, ui: &mut egui::Ui, p: &Para, width: f32, first: bool) {
-        if p.heading.is_some() && !first {
-            ui.add_space(self.body * 0.5);
-        }
-        let indent = (p.level as f32 * self.body * 1.4).min(width * 0.5);
-        let avail = (width - indent).max(30.0);
+    fn para(&self, p: &Para, width: f32) -> Piece {
+        let s = self.s;
+        let line = p.line.unwrap_or(1.0).clamp(0.5, 4.0);
+        let heading_gap = if p.heading.is_some() { self.base * 0.9 } else { 0.0 };
+        let mut piece = Piece {
+            before: p.before.unwrap_or(heading_gap) * s,
+            after: p.after.unwrap_or(heading_gap / 3.0) * s,
+            contextual: p.contextual,
+            ..Default::default()
+        };
+        let indent = (p.level as f32 * INDENT * s).min(width * 0.6);
+        let avail = (width - indent).max(20.0);
+        let first_style = p.inlines.iter().find_map(|i| if let Inline::Text(t) = i { Some(t.style.clone()) } else { None }).unwrap_or_default();
+        let mut y = 0.0f32;
         let mut job = Self::new_job(avail, p.align);
-        let mut drew = false;
-        if let Some(m) = &p.marker {
-            let st = p.inlines.iter().find_map(|i| if let Inline::Text(s) = i { Some(s.style.clone()) } else { None }).unwrap_or_default();
-            job.append(&format!("{m}  "), 0.0, self.format(&SpanStyle { underline: false, strike: false, ..st }, p.heading));
-        }
         for inline in &p.inlines {
             match inline {
-                Inline::Text(s) => job.append(&s.text, 0.0, self.format(&s.style, p.heading)),
+                Inline::Text(t) => job.append(&t.text, 0.0, self.format(&t.style, p.heading, line)),
                 Inline::Missing(what) => {
-                    let mut f = self.format(&SpanStyle { italic: true, ..Default::default() }, None);
-                    f.color = self.theme.text.gamma_multiply(0.5);
+                    let mut f = self.format(&SpanStyle { italic: true, ..Default::default() }, None, line);
+                    f.color = self.tone(egui::Color32::from_gray(120));
                     job.append(&format!("[{what}]"), 0.0, f);
                 }
                 Inline::Image { idx, w, h } => {
-                    self.flush(ui, &mut job, indent, avail, p.align);
-                    self.image(ui, *idx, (*w, *h), indent, avail, p.align);
-                    drew = true;
+                    self.flush(&mut piece, &mut y, &mut job, indent, avail, p.align);
+                    self.image(&mut piece, &mut y, *idx, (*w, *h), indent, avail, p.align);
+                    job = Self::new_job(avail, p.align);
                 }
             }
         }
-        drew |= self.flush(ui, &mut job, indent, avail, p.align);
-        if !drew {
+        self.flush(&mut piece, &mut y, &mut job, indent, avail, p.align);
+        if y == 0.0 {
             // An empty paragraph is an empty line in the document.
-            ui.add_space(self.body * heading_scale(p.heading));
+            y = self.base * first_style.size.unwrap_or_else(|| heading_scale(p.heading)) * LINE * line * s;
         }
-        ui.add_space(self.body * if p.heading.is_some() { 0.3 } else { 0.45 });
+        if let Some(m) = &p.marker {
+            let f = self.format(&SpanStyle { underline: false, strike: false, ..first_style }, p.heading, line);
+            let mut mj = LayoutJob::default();
+            mj.append(m, 0.0, f);
+            let g = self.painter.layout_job(mj);
+            let x = (indent - HANG * s).max(0.0);
+            // A marker wider than the hang pushes nothing: it is drawn over the space before.
+            piece.items.insert(0, Item::Text(egui::pos2(x.min(indent - g.size().x - 2.0).max(0.0), 0.0), g));
+        }
+        piece.h = y;
+        piece
     }
 
-    /// Lays out and draws what is in `job`, leaving it empty for what follows. True when there was
-    /// something.
-    fn flush(&self, ui: &mut egui::Ui, job: &mut LayoutJob, indent: f32, avail: f32, align: Align) -> bool {
+    /// Lays out and adds what is in `job`, leaving it empty for what follows.
+    fn flush(&self, piece: &mut Piece, y: &mut f32, job: &mut LayoutJob, indent: f32, avail: f32, align: Align) {
         if job.text.trim().is_empty() {
             *job = Self::new_job(avail, align);
-            return false;
+            return;
         }
         let taken = std::mem::replace(job, Self::new_job(avail, align));
-        let galley = ui.painter().layout_job(taken);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(indent + avail, galley.size().y), egui::Sense::hover());
+        let g = self.painter.layout_job(taken);
         let x = match align {
-            Align::Center => rect.min.x + indent + avail / 2.0,
-            Align::Right => rect.min.x + indent + avail,
-            _ => rect.min.x + indent,
+            Align::Center => indent + avail / 2.0,
+            Align::Right => indent + avail,
+            _ => indent,
         };
-        ui.painter().galley(egui::pos2(x, rect.min.y), galley, self.theme.text);
-        true
+        for row in g.rows.iter().skip(1) {
+            piece.cuts.push(*y + row.pos.y);
+        }
+        if *y > 0.0 {
+            piece.cuts.push(*y);
+        }
+        let h = g.size().y;
+        piece.items.push(Item::Text(egui::pos2(x, *y), g));
+        *y += h;
     }
 
-    /// A picture at the size the document gives it (`size`, points), which may stretch it; at its
-    /// own size when the document gives none.
-    fn image(&self, ui: &mut egui::Ui, idx: usize, size: (f32, f32), indent: f32, avail: f32, align: Align) {
+    /// A picture at the size the document gives it, no wider than the text; at its own size, as
+    /// pixels at 96 dpi, when the document gives none.
+    #[allow(clippy::too_many_arguments)]
+    fn image(&self, piece: &mut Piece, y: &mut f32, idx: usize, size: (f32, f32), indent: f32, avail: f32, align: Align) {
         let Some(tex) = self.textures.get(idx) else { return };
         let [tw, th] = tex.size();
         if tw == 0 || th == 0 {
             return;
         }
         let (w_pt, h_pt) = size;
-        // The document's size, at the scale its text is drawn at (11 pt is Word's normal size).
-        let want = if w_pt > 0.0 { w_pt * self.body / 11.0 } else { tw as f32 };
-        let dw = want.min(avail).max(8.0);
+        let want = if w_pt > 0.0 { w_pt } else { tw as f32 * 0.75 } * self.s;
+        let dw = want.min(avail).max(4.0);
         let aspect = if w_pt > 0.0 && h_pt > 0.0 { h_pt / w_pt } else { th as f32 / tw as f32 };
         let dh = dw * aspect;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(indent + avail, dh), egui::Sense::hover());
         let x = match align {
-            Align::Center => rect.min.x + indent + (avail - dw) / 2.0,
-            Align::Right => rect.min.x + indent + avail - dw,
-            _ => rect.min.x + indent,
+            Align::Center => indent + (avail - dw) / 2.0,
+            Align::Right => indent + avail - dw,
+            _ => indent,
         };
-        let r = egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(dw, dh));
-        ui.painter().image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-        ui.add_space(2.0);
+        if *y > 0.0 {
+            piece.cuts.push(*y);
+        }
+        piece.items.push(Item::Image(tex.id(), egui::Rect::from_min_size(egui::pos2(x, *y), egui::vec2(dw, dh))));
+        *y += dh;
     }
 
-    fn table(&self, ui: &mut egui::Ui, t: &Table, width: f32) {
+    /// A table as one piece per row, so a page can break between rows.
+    fn table(&self, t: &Table, width: f32, out: &mut Vec<Piece>) {
+        let s = self.s;
         let ncols = t.rows.iter().map(|r| r.iter().map(|c| c.span).sum::<usize>()).max().unwrap_or(0).max(1);
         let mut widths: Vec<f32> = if t.widths.len() == ncols && t.widths.iter().all(|w| *w > 0.0) { t.widths.clone() } else { vec![1.0; ncols] };
         let total: f32 = widths.iter().sum();
         for w in &mut widths {
             *w *= width / total;
         }
-        let pad = 4.0;
-        let stroke = egui::Stroke::new(1.0, self.theme.text.gamma_multiply(0.25));
+        // Word's default cell margins: a little over 5 pt at the sides, none above and below.
+        let (pad_x, pad_y) = (5.4 * s, 1.0 * s);
+        let rule = (0.5 * s).max(1.0);
         for row in &t.rows {
-            let top = ui.cursor().min;
-            let mut x = top.x;
+            let mut x = 0.0;
             let mut col = 0;
-            let mut row_h = self.body + 2.0 * pad;
-            let mut placed = Vec::new();
+            let mut row_h = self.base * LINE * s + 2.0 * pad_y;
+            let mut cells = Vec::new();
             for cell in row {
                 let end = (col + cell.span).min(ncols);
-                let cw: f32 = widths[col.min(ncols)..end].iter().sum::<f32>().max(12.0);
+                let cw: f32 = widths[col.min(ncols)..end].iter().sum::<f32>().max(4.0);
                 col = end;
-                // Kept free for the fill, which is only known to be wanted once the row's height is.
-                let slot = ui.painter().add(egui::Shape::Noop);
-                let inner = egui::Rect::from_min_size(egui::pos2(x + pad, top.y + pad), egui::vec2((cw - 2.0 * pad).max(8.0), f32::INFINITY));
-                let mut cu = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)));
-                self.blocks(&mut cu, &cell.blocks, inner.width());
-                row_h = row_h.max(cu.min_rect().height() + 2.0 * pad);
-                placed.push((slot, x, cw, cell.fill));
+                let (items, h) = Self::stack(self.blocks(&cell.blocks, (cw - 2.0 * pad_x).max(4.0)));
+                row_h = row_h.max(h + 2.0 * pad_y);
+                cells.push((x, cw, cell.fill, items));
                 x += cw;
             }
-            for (slot, x, cw, fill) in placed {
-                let r = egui::Rect::from_min_size(egui::pos2(x, top.y), egui::vec2(cw, row_h));
+            let mut piece = Piece { h: row_h, ..Default::default() };
+            let mut frames = Vec::new();
+            for (x, cw, fill, items) in cells {
+                let r = egui::Rect::from_min_size(egui::pos2(x, 0.0), egui::vec2(cw, row_h));
                 if let Some(f) = fill {
-                    // A tint of the document's shading: at full strength a light gray header would
-                    // put the theme's light text on a light ground.
-                    ui.painter().set(slot, egui::Shape::rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(f[0], f[1], f[2], 40)));
+                    piece.items.push(Item::Fill(r, self.tone(egui::Color32::from_rgb(f[0], f[1], f[2]))));
                 }
-                ui.painter().rect_stroke(r, 0.0, stroke, egui::StrokeKind::Inside);
+                piece.items.extend(items.into_iter().map(|i| i.shift(egui::vec2(x + pad_x, pad_y))));
+                frames.push(Item::Frame(r, rule, self.tone(RULE)));
             }
-            ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
+            piece.items.extend(frames);
+            out.push(piece);
+        }
+        if let Some(last) = out.last_mut() {
+            last.after = self.base * 0.5 * s;
         }
     }
 }
@@ -320,4 +554,60 @@ fn sheet_view(ui: &mut egui::Ui, s: &Sheet, theme: &Theme, body: f32) {
             p.line_segment([rect.left_bottom(), rect.right_bottom()], line);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn piece(h: f32, cuts: &[f32]) -> Piece {
+        Piece { h, cuts: cuts.to_vec(), ..Default::default() }
+    }
+
+    fn pages_of(placed: &[Placed]) -> Vec<(usize, usize, f32, f32)> {
+        placed.iter().map(|p| (p.page, p.piece, p.y0, p.y1)).collect()
+    }
+
+    #[test]
+    fn night_turns_lightness_round_and_keeps_the_hue() {
+        let white = night(egui::Color32::WHITE);
+        let black = night(egui::Color32::BLACK);
+        assert!(white.r() < 50 && white.r() == white.g() && white.g() == white.b(), "white paper is dark gray: {white:?}");
+        assert!(black.r() > 200, "black ink is light: {black:?}");
+        let blue = night(egui::Color32::from_rgb(0, 0, 160));
+        assert!(blue.b() > blue.r() && blue.r() > 120, "dark blue is light blue: {blue:?}");
+        assert_eq!(night(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 0)).a(), 0, "transparency is kept");
+    }
+
+    #[test]
+    fn pieces_fill_a_page_then_split_at_a_line_or_move_on() {
+        // 60 fits, 50 more does not: split at its line at 30. The rest starts page two.
+        let (placed, pages) = paginate(&[piece(60.0, &[]), piece(50.0, &[30.0])], 100.0);
+        assert_eq!(pages_of(&placed), vec![(0, 0, 0.0, 60.0), (0, 1, 0.0, 30.0), (1, 1, 30.0, 50.0)]);
+        assert_eq!(pages, 2);
+        // With no line to split at it moves whole.
+        let (placed, _) = paginate(&[piece(60.0, &[]), piece(50.0, &[])], 100.0);
+        assert_eq!(pages_of(&placed), vec![(0, 0, 0.0, 60.0), (1, 1, 0.0, 50.0)]);
+    }
+
+    #[test]
+    fn spacing_page_breaks_and_pieces_taller_than_a_page() {
+        let mut a = piece(40.0, &[]);
+        a.after = 10.0;
+        let mut b = piece(40.0, &[]);
+        b.before = 5.0;
+        let (placed, _) = paginate(&[a, b], 100.0);
+        assert_eq!(placed[1].at, 55.0);
+        // A page break starts a page, but not an empty one at the very start.
+        let mut first = piece(10.0, &[]);
+        first.page_break = true;
+        let mut c = piece(10.0, &[]);
+        c.page_break = true;
+        let (placed, pages) = paginate(&[first, c], 100.0);
+        assert_eq!((placed[0].page, placed[1].page, pages), (0, 1, 2));
+        // Too tall and nowhere to split: cut at the page's height.
+        let (placed, pages) = paginate(&[piece(250.0, &[])], 100.0);
+        assert_eq!(pages_of(&placed), vec![(0, 0, 0.0, 100.0), (1, 0, 100.0, 200.0), (2, 0, 200.0, 250.0)]);
+        assert_eq!(pages, 3);
+    }
 }

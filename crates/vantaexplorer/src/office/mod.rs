@@ -35,6 +35,39 @@ pub struct RichDoc {
     pub sheets: Option<Vec<String>>,
     /// Said under the document, e.g. that it was cut short.
     pub note: Option<String>,
+    /// The page the text is set on.
+    pub page: PageSetup,
+    /// The size of the document's normal text, in points.
+    pub base_pt: f32,
+}
+
+/// A page's size and margins, in points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageSetup {
+    pub width: f32,
+    pub height: f32,
+    /// Top, right, bottom, left.
+    pub margin: [f32; 4],
+}
+
+impl Default for PageSetup {
+    /// A4 with an inch all round, what a document that does not say is printed on here.
+    fn default() -> Self {
+        Self { width: 595.3, height: 841.9, margin: [72.0; 4] }
+    }
+}
+
+impl PageSetup {
+    /// The setup unless it is nonsense (no room for text, a page a meter wide), else the default.
+    fn sane(self) -> Self {
+        let [t, r, b, l] = self.margin;
+        let ok = (100.0..=3000.0).contains(&self.width)
+            && (100.0..=3000.0).contains(&self.height)
+            && self.margin.iter().all(|m| (0.0..=self.width.min(self.height) / 2.5).contains(m))
+            && self.width - l - r >= 50.0
+            && self.height - t - b >= 50.0;
+        if ok { self } else { Self::default() }
+    }
 }
 
 pub enum Block {
@@ -54,6 +87,13 @@ pub struct Para {
     pub level: u8,
     /// The bullet or number in front of a list item.
     pub marker: Option<String>,
+    /// Space above and below, in points; `None` is the view's default.
+    pub before: Option<f32>,
+    pub after: Option<f32>,
+    /// Line spacing as a multiple of single spacing.
+    pub line: Option<f32>,
+    /// No space between this and a neighbor of the same kind (Word's list paragraphs).
+    pub contextual: bool,
 }
 
 pub enum Inline {

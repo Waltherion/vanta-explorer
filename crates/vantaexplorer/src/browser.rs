@@ -142,6 +142,12 @@ impl Theme {
         let folder = parse32(&cfg.folder).unwrap_or(accent);
         Self { accent, text, icon_tint: [text.r(), text.g(), text.b()], folder: [folder.r(), folder.g(), folder.b()] }
     }
+
+    /// A dark theme: light text on the window.
+    pub fn is_dark(&self) -> bool {
+        let t = self.text;
+        0.2126 * t.r() as f32 + 0.7152 * t.g() as f32 + 0.0722 * t.b() as f32 > 128.0
+    }
 }
 
 fn parse32(hex: &str) -> Option<egui::Color32> {
@@ -3001,7 +3007,10 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                         });
                     });
             }
-            crate::preview::Shown::Rich(rich) => crate::office::view::show(ui, rect, rich, view.theme),
+            crate::preview::Shown::Rich(rich) => {
+                let dark = view.settings.dark_pages.applies(false, view.theme.is_dark()) && !view.preview.show_original.get();
+                crate::office::view::show(ui, rect, rich, view.theme, dark)
+            }
             crate::preview::Shown::Nothing => {}
         },
         PreviewState::Failed(p, err) if p == path => {
@@ -3037,6 +3046,20 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                 }
                 if let Some((w, h)) = view.preview.texture_size {
                     ui.weak(format!("• {}x{} px", w, h));
+                }
+                let dark_theme = view.theme.is_dark();
+                let mode = view.settings.dark_pages;
+                let offered = match &view.preview.shown {
+                    crate::preview::Shown::Raster(_) => mode.applies(true, dark_theme),
+                    crate::preview::Shown::Rich(r) => r.doc.sheets.is_none() && mode.applies(false, dark_theme),
+                    _ => false,
+                };
+                if offered {
+                    let mut dark = !view.preview.show_original.get();
+                    if ui.toggle_value(&mut dark, "Dark pages").on_hover_text("Off: the pages as they print (darkPages in explorer.local.jsonc)").changed() {
+                        view.preview.show_original.set(!dark);
+                        ui.ctx().request_repaint();
+                    }
                 }
             });
             if let Some(info) = file_info {
@@ -3103,6 +3126,15 @@ fn shellexpand_home(s: &str) -> String {
 
 fn _test_drag_btn(resp: &egui::Response) {
     let _b = resp.drag_started_by(egui::PointerButton::Secondary);
+}
+
+/// Line numbers for `text`, in the monospace size the text is drawn in, to stand beside it.
+pub fn line_numbers(ui: &mut egui::Ui, text: &str, theme: &Theme) {
+    let lines = text.split('\n').count().max(1);
+    let digits = lines.to_string().len();
+    let numbers: String = (1..=lines).map(|n| format!("{n:>digits$}")).collect::<Vec<_>>().join("\n");
+    ui.add(egui::Label::new(egui::RichText::new(numbers).font(egui::FontId::monospace(12.0)).color(theme.text.gamma_multiply(0.35))).selectable(false));
+    ui.add_space(6.0);
 }
 
 #[cfg(test)]
@@ -3182,13 +3214,4 @@ mod tests {
         assert!(c.show_size && c.show_modified);
         assert!(c.size_w >= need.size && c.modified_w >= need.modified);
     }
-}
-
-/// Line numbers for `text`, in the monospace size the text is drawn in, to stand beside it.
-pub fn line_numbers(ui: &mut egui::Ui, text: &str, theme: &Theme) {
-    let lines = text.split('\n').count().max(1);
-    let digits = lines.to_string().len();
-    let numbers: String = (1..=lines).map(|n| format!("{n:>digits$}")).collect::<Vec<_>>().join("\n");
-    ui.add(egui::Label::new(egui::RichText::new(numbers).font(egui::FontId::monospace(12.0)).color(theme.text.gamma_multiply(0.35))).selectable(false));
-    ui.add_space(6.0);
 }

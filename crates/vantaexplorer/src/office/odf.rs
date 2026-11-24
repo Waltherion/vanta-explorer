@@ -1,7 +1,7 @@
 //! OpenDocument (.odt, .ods), as LibreOffice and OnlyOffice write it: `content.xml`, with the
 //! styles of `styles.xml` behind its own.
 
-use super::{Align, Block, Cell, Inline, Package, Para, Pictures, RichDoc, Sheet, SheetCell, SpanStyle, Table};
+use super::{Align, Block, Cell, Inline, PageSetup, Package, Para, Pictures, RichDoc, Sheet, SheetCell, SpanStyle, Table};
 use roxmltree::Node;
 use std::collections::HashMap;
 
@@ -35,6 +35,11 @@ struct Props {
     size: Option<Size>,
     align: Option<Align>,
     outline: Option<u8>,
+    /// Space above and below a paragraph, points.
+    before: Option<f32>,
+    after: Option<f32>,
+    /// Line spacing, a multiple of single.
+    line: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +62,9 @@ impl Props {
         };
         self.align = o.align.or(self.align);
         self.outline = o.outline.or(self.outline);
+        self.before = o.before.or(self.before);
+        self.after = o.after.or(self.after);
+        self.line = o.line.or(self.line);
     }
 
     fn style(&self, normal_pt: f32) -> SpanStyle {
@@ -103,6 +111,13 @@ fn read_props(style: Node) -> Props {
                         "start" | "left" => Align::Left,
                         _ => return None,
                     })
+                });
+                p.before = attr(c, "fo", "margin-top").and_then(length_pt);
+                p.after = attr(c, "fo", "margin-bottom").and_then(length_pt);
+                p.line = attr(c, "fo", "line-height").and_then(|v| match v.strip_suffix('%') {
+                    Some(pc) => pc.parse::<f32>().ok().map(|p| p / 100.0),
+                    // A fixed height: as a multiple of a 12 pt line.
+                    None => length_pt(v).map(|pt| pt / 12.0 / 1.17),
                 });
             }
             _ => {}
@@ -230,7 +245,31 @@ pub fn text(pkg: &mut Package) -> Result<RichDoc, String> {
     let mut blocks = Vec::new();
     r.body(body, &mut blocks, None, 0);
     let note = (r.blocks > super::MAX_BLOCKS).then(|| "The rest of the document is not shown.".to_string());
-    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note })
+    let page = styles_doc.as_ref().map(page_setup).unwrap_or_default();
+    let base_pt = r.styles.normal_pt;
+    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note, page, base_pt })
+}
+
+/// The page of the master page called Standard (the one a document starts on), or of the first.
+fn page_setup(styles: &roxmltree::Document) -> PageSetup {
+    let masters = || styles.descendants().filter(|n| is(*n, "style", "master-page"));
+    let layout_name = masters().find(|m| attr(*m, "style", "name") == Some("Standard")).or_else(|| masters().next()).and_then(|m| attr(m, "style", "page-layout-name"));
+    let layouts = || styles.descendants().filter(|n| is(*n, "style", "page-layout"));
+    let Some(layout) = layouts().find(|l| layout_name.is_some() && attr(*l, "style", "name") == layout_name).or_else(|| layouts().next()) else {
+        return PageSetup::default();
+    };
+    let Some(props) = layout.children().find(|c| is(*c, "style", "page-layout-properties")) else { return PageSetup::default() };
+    let mut page = PageSetup::default();
+    let len = |name: &str| attr(props, "fo", name).and_then(length_pt);
+    page.width = len("page-width").unwrap_or(page.width);
+    page.height = len("page-height").unwrap_or(page.height);
+    let all = len("margin");
+    for (i, name) in ["margin-top", "margin-right", "margin-bottom", "margin-left"].iter().enumerate() {
+        if let Some(v) = len(name).or(all) {
+            page.margin[i] = v;
+        }
+    }
+    page.sane()
 }
 
 impl Reader<'_> {
@@ -307,7 +346,16 @@ impl Reader<'_> {
         } else {
             props.outline.filter(|o| *o > 0).map(|o| o.min(6))
         };
-        let mut para = Para { heading, align: props.align.unwrap_or_default(), level: depth, marker, ..Default::default() };
+        let mut para = Para {
+            heading,
+            align: props.align.unwrap_or_default(),
+            level: depth,
+            marker,
+            before: props.before,
+            after: props.after,
+            line: props.line,
+            ..Default::default()
+        };
         let mut extra = Vec::new();
         self.inline(p, &props, &mut para.inlines, &mut extra);
         out.push(Block::Para(para));
@@ -423,7 +471,7 @@ pub fn sheet(pkg: &mut Package, page: u32) -> Result<RichDoc, String> {
     }
     let names = tables.iter().enumerate().map(|(i, t)| attr(*t, "table", "name").map(str::to_string).unwrap_or_else(|| format!("Sheet{}", i + 1))).collect();
     let t = tables[(page as usize).min(tables.len() - 1)];
-    Ok(RichDoc { blocks: vec![Block::Sheet(calc_sheet(t))], images: Vec::new(), sheets: Some(names), note: None })
+    Ok(RichDoc { blocks: vec![Block::Sheet(calc_sheet(t))], images: Vec::new(), sheets: Some(names), note: None, page: PageSetup::default(), base_pt: 11.0 })
 }
 
 fn calc_sheet(t: Node) -> Sheet {

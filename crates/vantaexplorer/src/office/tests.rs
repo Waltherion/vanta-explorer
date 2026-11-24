@@ -242,3 +242,49 @@ fn the_small_helpers() {
     assert_eq!(bullet("\u{F0B7}"), "•");
     assert_eq!(bullet("o"), "◦");
 }
+
+#[test]
+fn a_word_document_gives_its_page_and_paragraph_spacing() {
+    let styles = format!(
+        r#"<w:styles {W}><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>
+        <w:style w:type="paragraph" w:styleId="List"><w:name w:val="List Paragraph"/><w:pPr><w:contextualSpacing/></w:pPr></w:style></w:styles>"#
+    );
+    let document = format!(
+        r#"<w:document {W}><w:body>
+          <w:p><w:r><w:t>normal</w:t></w:r></w:p>
+          <w:p><w:pPr><w:spacing w:before="240"/></w:pPr><w:r><w:t>luft</w:t></w:r></w:p>
+          <w:p><w:pPr><w:pStyle w:val="List"/></w:pPr><w:r><w:t>punkt</w:t></w:r></w:p>
+          <w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="-1440" w:left="1800"/></w:sectPr>
+        </w:body></w:document>"#
+    );
+    let path = package("page.docx", &[("word/document.xml", s(&document)), ("word/styles.xml", s(&styles))]);
+    let doc = render(&path, "docx", 0).unwrap();
+    assert_eq!(doc.page, PageSetup { width: 612.0, height: 792.0, margin: [72.0, 72.0, 72.0, 90.0] });
+    assert_eq!(doc.base_pt, 11.0);
+    let p = paras(&doc.blocks);
+    assert_eq!((p[0].before, p[0].after), (None, Some(8.0)));
+    assert!((p[0].line.unwrap() - 259.0 / 240.0).abs() < 1e-4);
+    assert_eq!(p[1].before, Some(12.0));
+    assert!(!p[1].contextual && p[2].contextual);
+}
+
+#[test]
+fn a_writer_document_gives_its_page() {
+    let styles = format!(
+        r#"<office:document-styles {ODF}><office:automatic-styles>
+          <style:page-layout style:name="pm1"><style:page-layout-properties fo:page-width="21cm" fo:page-height="29.7cm" fo:margin="2cm" fo:margin-left="2.54cm"/></style:page-layout>
+        </office:automatic-styles><office:master-styles><style:master-page style:name="Standard" style:page-layout-name="pm1"/></office:master-styles></office:document-styles>"#
+    );
+    let content = format!(r#"<office:document-content {ODF}><office:body><office:text><text:p>x</text:p></office:text></office:body></office:document-content>"#);
+    let path = package("page.odt", &[("content.xml", s(&content)), ("styles.xml", s(&styles))]);
+    let doc = render(&path, "odt", 0).unwrap();
+    let cm = 72.0 / 2.54;
+    assert!((doc.page.width - 21.0 * cm).abs() < 0.01 && (doc.page.height - 29.7 * cm).abs() < 0.01);
+    assert!((doc.page.margin[0] - 2.0 * cm).abs() < 0.01 && (doc.page.margin[3] - 72.0).abs() < 0.01);
+}
+
+#[test]
+fn a_nonsense_page_is_the_default_one() {
+    assert_eq!(PageSetup { width: 600.0, height: 800.0, margin: [500.0, 0.0, 0.0, 0.0] }.sane(), PageSetup::default());
+    assert_eq!(PageSetup { width: 20.0, height: 800.0, margin: [0.0; 4] }.sane(), PageSetup::default());
+}

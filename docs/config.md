@@ -646,6 +646,13 @@ read a Microsoft calendar.
   // Folders before files, whichever column the list is sorted by. false: folders sort in
   // among the files, by name, size or date like everything else.
   // "foldersFirst": true,
+
+  // Document previews on a dark theme: dark pages with light text, the document's colors turned
+  // round with their hue kept (dark blue text is light blue). "documents": Word and Writer
+  // documents, their pictures as they are. "all": PDFs too, whose pages are pictures, so photos
+  // in them are turned as well. "off": pages as they print. "Dark pages" under the preview
+  // switches it off for a look at the real thing. A light theme always shows pages as they are.
+  // "darkPages": "off",
 }
 ```
 

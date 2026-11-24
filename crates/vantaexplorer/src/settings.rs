@@ -21,6 +21,42 @@ pub struct Settings {
     pub keep_dates: bool,
     /// Folders sort before files, whatever the column; false: in among them.
     pub folders_first: bool,
+    /// Document pages shown dark on a dark theme.
+    #[serde(deserialize_with = "dark_pages")]
+    pub dark_pages: DarkPages,
+}
+
+/// Which previews of documents are drawn dark, with light text, when the theme is dark.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum DarkPages {
+    #[default]
+    Off,
+    /// Word and Writer documents, which are drawn by us: their pictures stay as they are.
+    Documents,
+    /// PDFs too, whose pages are pictures: everything on them is turned, photos included.
+    All,
+}
+
+impl DarkPages {
+    /// Whether a preview is drawn dark: `rendered` for a page that is a picture (a PDF's).
+    pub fn applies(self, rendered: bool, dark_theme: bool) -> bool {
+        dark_theme && (self == DarkPages::All || (self == DarkPages::Documents && !rendered))
+    }
+}
+
+/// A word the setting does not know is left off, rather than losing every other setting.
+fn dark_pages<'de, D: serde::Deserializer<'de>>(d: D) -> Result<DarkPages, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v.as_str() {
+        Some("documents") => DarkPages::Documents,
+        Some("all") => DarkPages::All,
+        Some("off") => DarkPages::Off,
+        None if v.is_null() => DarkPages::Off,
+        _ => {
+            log::warn!("settings: darkPages {v} is not \"off\", \"documents\" or \"all\"; off");
+            DarkPages::Off
+        }
+    })
 }
 
 impl Default for Settings {
@@ -32,6 +68,7 @@ impl Default for Settings {
             icon_themes: Vec::new(),
             keep_dates: true,
             folders_first: true,
+            dark_pages: DarkPages::Off,
         }
     }
 }

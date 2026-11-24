@@ -64,6 +64,11 @@ pub struct Preview {
     /// Everything that means "the current subject" reads this: request dedupe, the stale
     /// result guard in poll, and the page controls.
     requested: Option<(PathBuf, u32)>,
+    /// "Dark pages" switched off in the pane: documents as they print.
+    pub show_original: std::cell::Cell<bool>,
+    /// The rendered document page as it came, to make dark or light again without a decode.
+    raster_src: Option<egui::ColorImage>,
+    raster_dark: bool,
 }
 
 impl Preview {
@@ -114,6 +119,9 @@ impl Preview {
             primaries: Primaries::Bt709,
             is_hdr: false,
             requested: None,
+            show_original: std::cell::Cell::new(false),
+            raster_src: None,
+            raster_dark: false,
         }
     }
 
@@ -143,6 +151,18 @@ impl Preview {
             self.shown = Shown::Nothing;
         }
         let _ = self.tx.send((path.to_path_buf(), page, ctx.clone()));
+    }
+
+    /// Whether a rendered document page (a PDF's) is shown dark; uploaded again when that changes.
+    pub fn set_dark_raster(&mut self, dark: bool) {
+        if dark == self.raster_dark {
+            return;
+        }
+        self.raster_dark = dark;
+        if let (Shown::Raster(tex), Some(src)) = (&mut self.shown, &self.raster_src) {
+            let img = if dark { crate::office::view::night_image(src.clone()) } else { src.clone() };
+            tex.set(img, egui::TextureOptions::LINEAR);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -175,9 +195,11 @@ impl Preview {
                 Ok(Content::Doc(DocContent::Raster { img, total_pages })) => {
                     self.texture_size = Some((img.width() as u32, img.height() as u32));
                     self.is_hdr = false;
+                    let upload = if self.raster_dark { crate::office::view::night_image(img.clone()) } else { img.clone() };
+                    self.raster_src = Some(img);
                     self.shown = Shown::Raster(ctx.load_texture(
                         "preview-doc",
-                        img,
+                        upload,
                         egui::TextureOptions::LINEAR,
                     ));
                     let current_page = self.current_page().unwrap_or(0);

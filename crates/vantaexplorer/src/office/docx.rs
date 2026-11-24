@@ -1,7 +1,7 @@
 //! Word documents (.docx): `word/document.xml` with the styles, list numbering and pictures it
 //! refers to. Headers, footers, footnotes and comments are left out.
 
-use super::{Align, Block, Cell, Inline, Package, Para, Pictures, RichDoc, SpanStyle, Table};
+use super::{Align, Block, Cell, Inline, PageSetup, Package, Para, Pictures, RichDoc, SpanStyle, Table};
 use roxmltree::Node;
 use std::collections::HashMap;
 
@@ -88,6 +88,50 @@ impl RProps {
     }
 }
 
+/// Paragraph spacing, each unset until something sets it.
+#[derive(Clone, Copy, Default, Debug)]
+struct Spacing {
+    /// Points.
+    before: Option<f32>,
+    after: Option<f32>,
+    /// A multiple of single spacing.
+    line: Option<f32>,
+    contextual: Option<bool>,
+}
+
+impl Spacing {
+    /// `w:spacing` and `w:contextualSpacing` of a `w:pPr`.
+    fn read(ppr: Node) -> Self {
+        let mut s = Spacing::default();
+        if let Some(sp) = child(ppr, "spacing") {
+            let twips = |name: &str| attr(sp, name).and_then(|v| v.parse::<f32>().ok()).map(|t| t / 20.0);
+            let auto = |name: &str| attr(sp, name).is_some_and(|v| v == "1" || v == "true" || v == "on");
+            // Automatic spacing is what a web page gets: a blank line's worth.
+            s.before = if auto("beforeAutospacing") { Some(14.0) } else { twips("before") };
+            s.after = if auto("afterAutospacing") { Some(14.0) } else { twips("after") };
+            if let Some(line) = attr(sp, "line").and_then(|v| v.parse::<f32>().ok()) {
+                s.line = match attr(sp, "lineRule") {
+                    // In 240ths of a line.
+                    None | Some("auto") => Some(line / 240.0),
+                    // Exact or at least, in twentieths of a point: as a multiple of a 12 pt line.
+                    Some(_) => Some(line / 20.0 / 12.0 / 1.17),
+                };
+            }
+        }
+        if let Some(c) = child(ppr, "contextualSpacing") {
+            s.contextual = Some(on(c));
+        }
+        s
+    }
+
+    fn over(&mut self, o: &Spacing) {
+        self.before = o.before.or(self.before);
+        self.after = o.after.or(self.after);
+        self.line = o.line.or(self.line);
+        self.contextual = o.contextual.or(self.contextual);
+    }
+}
+
 #[derive(Default)]
 struct Style {
     name: String,
@@ -96,10 +140,11 @@ struct Style {
     jc: Option<Align>,
     num: Option<(String, u8)>,
     outline: Option<u8>,
+    spacing: Spacing,
 }
 
-/// Run properties, alignment, list (id and level) and heading level of a paragraph style.
-type ParaStyle = (RProps, Option<Align>, Option<(String, u8)>, Option<u8>);
+/// Run properties, alignment, list (id and level), heading level and spacing of a paragraph style.
+type ParaStyle = (RProps, Option<Align>, Option<(String, u8)>, Option<u8>, Spacing);
 
 #[derive(Default)]
 struct Styles {
@@ -107,6 +152,7 @@ struct Styles {
     chars: HashMap<String, Style>,
     default_para: Option<String>,
     defaults: RProps,
+    default_spacing: Spacing,
 }
 
 fn align(v: &str) -> Option<Align> {
@@ -138,6 +184,9 @@ impl Styles {
                     if let Some(rpr) = n.descendants().find(|d| w(*d, "rPr")) {
                         s.defaults = RProps::read(rpr);
                     }
+                    if let Some(ppr) = n.descendants().find(|d| w(*d, "pPr")) {
+                        s.default_spacing = Spacing::read(ppr);
+                    }
                 }
                 "style" => {
                     let Some(id) = attr(n, "styleId") else { continue };
@@ -151,6 +200,7 @@ impl Styles {
                         st.jc = child(ppr, "jc").and_then(val).and_then(align);
                         st.num = num_pr(ppr);
                         st.outline = child(ppr, "outlineLvl").and_then(val).and_then(|v| v.parse().ok());
+                        st.spacing = Spacing::read(ppr);
                     }
                     match attr(n, "type") {
                         Some("paragraph") | None => {
@@ -190,17 +240,19 @@ impl Styles {
     /// What a paragraph style gives: run properties, alignment, numbering and heading level.
     fn paragraph(&self, id: Option<&str>) -> ParaStyle {
         let mut rpr = self.defaults.clone();
+        let mut spacing = self.default_spacing;
         let (mut jc, mut num, mut heading) = (None, None, None);
-        let Some(id) = id.or(self.default_para.as_deref()) else { return (rpr, jc, num, heading) };
+        let Some(id) = id.or(self.default_para.as_deref()) else { return (rpr, jc, num, heading, spacing) };
         for st in Self::chain(&self.para, id) {
             rpr.over(&st.rpr);
+            spacing.over(&st.spacing);
             jc = st.jc.or(jc);
             num = st.num.clone().or(num);
             if let Some(h) = heading_of(&st.name, st.outline) {
                 heading = Some(h);
             }
         }
-        (rpr, jc, num, heading)
+        (rpr, jc, num, heading, spacing)
     }
 
     fn character(&self, id: &str) -> RProps {
@@ -333,7 +385,29 @@ pub fn read(pkg: &mut Package) -> Result<RichDoc, String> {
     let mut blocks = Vec::new();
     r.body(body, &mut blocks);
     let note = (r.blocks > super::MAX_BLOCKS).then(|| "The rest of the document is not shown.".to_string());
-    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note })
+    let page = page_setup(body);
+    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note, page, base_pt: normal_pt })
+}
+
+/// The page of the document's last section, the one `w:body` ends with; a document with several
+/// is shown on the last one's pages throughout.
+fn page_setup(body: Node) -> PageSetup {
+    let mut page = PageSetup::default();
+    let Some(sect) = body.children().rfind(|c| w(*c, "sectPr")) else { return page };
+    let twips = |n: Node, name: &str| attr(n, name).and_then(|v| v.parse::<f32>().ok()).map(|t| t / 20.0);
+    if let Some(sz) = child(sect, "pgSz") {
+        page.width = twips(sz, "w").unwrap_or(page.width);
+        page.height = twips(sz, "h").unwrap_or(page.height);
+    }
+    if let Some(m) = child(sect, "pgMar") {
+        // A negative top or bottom margin means the text may not push it; its size is the same.
+        for (i, name) in ["top", "right", "bottom", "left"].iter().enumerate() {
+            if let Some(v) = twips(m, name) {
+                page.margin[i] = v.abs();
+            }
+        }
+    }
+    page.sane()
 }
 
 /// Where the document text is: the package says so in `_rels/.rels`; `word/document.xml` is what
@@ -394,7 +468,7 @@ impl Reader<'_> {
         self.blocks += 1;
         let ppr = child(p, "pPr");
         let style_id = ppr.and_then(|pp| child(pp, "pStyle")).and_then(val);
-        let (rpr, mut jc, mut num, heading) = self.styles.paragraph(style_id);
+        let (rpr, mut jc, mut num, heading, mut spacing) = self.styles.paragraph(style_id);
         let mut ind = 0.0f32;
         if let Some(pp) = ppr {
             if let Some(j) = child(pp, "jc").and_then(val).and_then(align) {
@@ -403,11 +477,20 @@ impl Reader<'_> {
             if let Some(n) = num_pr(pp) {
                 num = Some(n);
             }
+            spacing.over(&Spacing::read(pp));
             if let Some(i) = child(pp, "ind") {
                 ind = attr(i, "left").or(attr(i, "start")).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
             }
         }
-        let mut para = Para { heading, align: jc.unwrap_or_default(), ..Default::default() };
+        let mut para = Para {
+            heading,
+            align: jc.unwrap_or_default(),
+            before: spacing.before,
+            after: spacing.after,
+            line: spacing.line,
+            contextual: spacing.contextual.unwrap_or(false),
+            ..Default::default()
+        };
         if let Some((id, lvl)) = num.filter(|(id, _)| id != "0") {
             para.marker = self.numbering.marker(&id, lvl);
             para.level = lvl + 1;

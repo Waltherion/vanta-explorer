@@ -868,6 +868,8 @@ impl ApplicationHandler for App {
         }
         dirty |= self.thumbs.borrow_mut().poll(&gfx.egui_ctx);
 
+        let dark_raster = self.settings.dark_pages.applies(true, self.theme.is_dark()) && !self.preview.show_original.get();
+        self.preview.set_dark_raster(dark_raster);
         if let Some(img) = self.preview.poll(&gfx.egui_ctx) {
             match gfx.renderer.upload_hdr(img.w, img.h, &img.rgba16f) {
                 Ok(()) => log::debug!(
