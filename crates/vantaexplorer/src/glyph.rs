@@ -19,6 +19,8 @@ pub enum Glyph {
     Eject,
     /// A pencil, for editing the path as text.
     Edit,
+    /// A window with a column at its left: the sidebar, filled while it is shown.
+    Sidebar(bool),
 }
 
 pub fn paint(p: &egui::Painter, rect: egui::Rect, glyph: Glyph, col: egui::Color32) {
@@ -80,6 +82,17 @@ pub fn paint(p: &egui::Painter, rect: egui::Rect, glyph: Glyph, col: egui::Color
         Glyph::Plus => {
             p.line_segment([egui::pos2(c.x - r, c.y), egui::pos2(c.x + r, c.y)], stroke);
             p.line_segment([egui::pos2(c.x, c.y - r), egui::pos2(c.x, c.y + r)], stroke);
+        }
+        Glyph::Sidebar(shown) => {
+            let frame = egui::Rect::from_center_size(c, egui::vec2(r * 3.4, r * 2.8));
+            let thin = egui::Stroke::new(1.3, col);
+            let column = egui::Rect::from_min_max(frame.min, egui::pos2(frame.min.x + frame.width() * 0.36, frame.max.y));
+            if shown {
+                p.rect_filled(column, egui::CornerRadius { nw: 2, sw: 2, ne: 0, se: 0 }, col);
+            } else {
+                p.line_segment([column.right_top(), column.right_bottom()], thin);
+            }
+            p.rect_stroke(frame, 2.0, thin, egui::StrokeKind::Middle);
         }
         Glyph::Edit => {
             // A pencil lying corner to corner: a thick body with a pointed tip at the lower left.

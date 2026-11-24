@@ -266,8 +266,14 @@ pub fn show_workspace(
         .map(|(i, r)| (*i, r.min.x, r.min.y))
         .collect();
 
+    // The sidebar's button is in the pane that stands against it, the top left one. The chooser
+    // has no sidebar toggle (F9 does nothing there either).
+    let beside_sidebar = ws.visual_order().first().copied().filter(|_| view.chooser.is_none());
+    let sidebar_hidden = ws.sidebar_hidden;
+
     for (idx, r) in pane_rects {
         let is_active = idx == active;
+        let sidebar = (beside_sidebar == Some(idx)).then_some(sidebar_hidden);
         let pane = &mut ws.panes[idx];
         // Its own id per pane: without it both panes' widgets got the same ids, and a click on
         // one pane's button (the path pencil, back, forward) counted in the other as well.
@@ -277,7 +283,7 @@ pub fn show_workspace(
         // escapes the pane. Clip so a pane can never smear over its neighbour or under the
         // preview panel, whatever the split tree hands us.
         child.shrink_clip_rect(r);
-        let act = show_pane(&mut child, pane, idx, is_active, pane_count, icons, view);
+        let act = show_pane(&mut child, pane, idx, is_active, pane_count, sidebar, icons, view);
         if let Some(a) = act {
             actions.push(a);
         }
@@ -293,6 +299,7 @@ pub fn show_workspace(
     for act in actions {
         match act {
             PaneAction::Focus(i) => ws.active = i,
+            PaneAction::ToggleSidebar => ws.sidebar_hidden = !ws.sidebar_hidden,
             PaneAction::Split(i, dir) => ws.split(i, dir),
             PaneAction::Close(i) => ws.close(i),
         }
@@ -301,6 +308,7 @@ pub fn show_workspace(
 
 enum PaneAction {
     Focus(usize),
+    ToggleSidebar,
     Split(usize, SplitDir),
     Close(usize),
 }
@@ -353,6 +361,8 @@ fn show_pane(
     idx: usize,
     is_active: bool,
     pane_count: usize,
+    // Whether the sidebar is hidden, when this pane carries the button that shows and hides it.
+    sidebar: Option<bool>,
     icons: &mut IconCache,
     view: &View,
 ) -> Option<PaneAction> {
@@ -465,6 +475,12 @@ fn show_pane(
         let tab = pane.tab();
         let (can_back, can_fwd, has_parent) =
             (tab.can_back(), tab.can_forward(), tab.path().parent().is_some() && !crate::fileops::in_trash(tab.path()));
+        if let Some(hidden) = sidebar {
+            let tip = if hidden { "Show the sidebar (F9)" } else { "Hide the sidebar (F9)" };
+            if glyph::button(ui, Glyph::Sidebar(!hidden), true, tip, n, h) {
+                action = Some(PaneAction::ToggleSidebar);
+            }
+        }
         if glyph::button(ui, Glyph::ChevronLeft, can_back, "Back", n, h) {
             tab.back();
         }
