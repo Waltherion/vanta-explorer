@@ -844,13 +844,13 @@ fn show_pane(
                     tab.search_open = false;
                 }
                 // Backspace does double duty: erase from the filter while there is one, and
-                // go to the parent folder when there is not, the reflex every other file
-                // manager has taught people. Two arms with a pure guard, so the side effect
-                // is never hidden inside a match condition.
+                // go back a step when there is not, as in Dolphin and Windows Explorer (the
+                // parent folder is Left in the list, and Alt+Up). Two arms with a pure guard, so
+                // the side effect is never hidden inside a match condition.
                 egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. }
                     if tab.typeahead.is_empty() =>
                 {
-                    tab.up();
+                    tab.back();
                 }
                 egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
                     tab.typeahead.pop();

@@ -14,9 +14,10 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Arrows, Page Up/Down, Home/End", "Move the selection (with Shift: extend it)"),
             ("Enter", "Open"),
-            ("Backspace, Alt+Up", "Parent folder"),
+            ("Alt+Up", "Parent folder"),
             ("Right, Left (list)", "Into the marked folder, out to the parent"),
-            ("Alt+Left, Alt+Right", "Back, forward"),
+            ("Backspace, Alt+Left", "Back"),
+            ("Alt+Right", "Forward"),
             ("Alt+Home", "Home folder"),
             ("Ctrl+L", "Type a path"),
             ("F5", "Reload"),
