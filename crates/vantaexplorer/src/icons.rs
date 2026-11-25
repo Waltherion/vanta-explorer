@@ -284,7 +284,7 @@ fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], folder: &str
         return bitmap(themes, name, &path, px);
     }
     let svg = std::fs::read_to_string(&path).ok()?;
-    let svg = if from_own_theme(&path) { paint_own(&svg, &path, folder) } else { svg };
+    let svg = if from_own_theme(&path) { paint_own(&svg, &path, folder, &on_folder(tint, folder)) } else { svg };
     // usvg does not resolve CSS currentColor, and breeze icons rely on it, so the theme's text
     // color is substituted in before the SVG is parsed.
     let svg = svg.replace("currentColor", &hex(tint));
@@ -354,19 +354,32 @@ fn from_own_theme(path: &Path) -> bool {
 /// The white Breeze Dark draws the symbol on a colored folder in (Documents, Music, ...).
 const ON_FOLDER: &str = "#fcfcfc";
 
+/// What the symbol on a colored folder is drawn in. Breeze Dark draws it white and Breeze Light
+/// in its dark text color, so a dark palette keeps the white, and a light one takes its text
+/// color unless the folder is too dark for that to read on it.
+fn on_folder(tint: [u8; 3], folder: &str) -> String {
+    use vanta_ui::theme::{color32, contrast, is_light};
+    let text = egui::Color32::from_rgb(tint[0], tint[1], tint[2]);
+    let white = egui::Color32::from_rgb(0xfc, 0xfc, 0xfc);
+    match vanta_config::palette::parse_color(folder).map(color32) {
+        Some(body) if is_light(text) && contrast(text, body) >= contrast(white, body) => hex(tint),
+        _ => ON_FOLDER.into(),
+    }
+}
+
 /// Explorer's own icons in the folder color. Breeze marks the colored part of an icon (the body
 /// of a folder) with the class `ColorScheme-Accent` and fills it with `currentColor`, which KDE
 /// replaces with the desktop's accent. The same is done here with `folder`, element by element,
-/// and the symbol on such a folder stays white as Breeze has it. The small one-color folders
-/// (the sidebar's) have no colored part: they are drawn in the folder color as a whole. Anything
-/// else keeps `currentColor`, which becomes the text color, as in any other theme.
-fn paint_own(svg: &str, path: &Path, folder: &str) -> String {
+/// and the symbol on such a folder is drawn in `symbol` (see `on_folder`). The small one-color
+/// folders (the sidebar's) have no colored part: they are drawn in the folder color as a whole.
+/// Anything else keeps `currentColor`, which becomes the text color, as in any other theme.
+fn paint_own(svg: &str, path: &Path, folder: &str, symbol: &str) -> String {
     if svg.contains("ColorScheme-Accent") {
         return paint_tags(svg, |tag| {
             if tag.contains("ColorScheme-Accent") {
                 Some(folder)
             } else if tag.contains("ColorScheme-Text") {
-                Some(ON_FOLDER)
+                Some(symbol)
             } else {
                 None
             }
@@ -502,7 +515,7 @@ mod tests {
     #[test]
     fn a_folder_body_is_painted_and_its_symbol_stays_white() {
         let svg = r#"<svg><path style="fill:currentColor" class="ColorScheme-Accent"/><path style="fill-opacity:0.33"/><path class="ColorScheme-Text" style="fill:currentColor"/></svg>"#;
-        let out = paint_own(svg, Path::new("/nowhere/folder.svg"), "#e68e0d");
+        let out = paint_own(svg, Path::new("/nowhere/folder.svg"), "#e68e0d", ON_FOLDER);
         assert_eq!(
             out,
             r##"<svg><path style="fill:#e68e0d" class="ColorScheme-Accent"/><path style="fill-opacity:0.33"/><path class="ColorScheme-Text" style="fill:#fcfcfc"/></svg>"##
@@ -526,9 +539,19 @@ mod tests {
 
         assert!(from_own_theme(&link));
         assert!(!from_own_theme(Path::new("/usr/share/icons/breeze-dark/places/22/folder.svg")));
-        assert!(paint_own(svg, &theme.join("places/22/folder.svg"), "#7aa2f7").contains("#7aa2f7"));
-        assert!(paint_own(svg, &link, "#7aa2f7").contains("#7aa2f7"));
-        assert_eq!(paint_own(svg, &theme.join("mimetypes/22/text-plain.svg"), "#7aa2f7"), svg);
+        assert!(paint_own(svg, &theme.join("places/22/folder.svg"), "#7aa2f7", ON_FOLDER).contains("#7aa2f7"));
+        assert!(paint_own(svg, &link, "#7aa2f7", ON_FOLDER).contains("#7aa2f7"));
+        assert_eq!(paint_own(svg, &theme.join("mimetypes/22/text-plain.svg"), "#7aa2f7", ON_FOLDER), svg);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The symbol on a colored folder: white on any dark palette, Breeze Dark's included, and
+    /// the text color on a light one, as Breeze Light draws it, unless the folder is too dark.
+    #[test]
+    fn the_symbol_on_a_folder_follows_the_palette() {
+        assert_eq!(on_folder([0xfc, 0xfc, 0xfc], "#3daee9"), ON_FOLDER);
+        assert_eq!(on_folder([0xbd, 0x97, 0xf7], "#bd97f7"), ON_FOLDER);
+        assert_eq!(on_folder([0x23, 0x26, 0x29], "#3daee9"), "#232629");
+        assert_eq!(on_folder([0x23, 0x26, 0x29], "#1d2a3a"), ON_FOLDER);
     }
 }

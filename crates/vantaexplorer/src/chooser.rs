@@ -399,7 +399,7 @@ impl State {
             ui.heading("Replace the file?");
             ui.add_space(4.0);
             ui.label(format!("'{name}' is already in this folder."));
-            ui.label(egui::RichText::new("Saving replaces what is in it.").color(egui::Color32::LIGHT_RED));
+            ui.label(egui::RichText::new("Saving replaces what is in it.").color(theme.error));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| {
@@ -411,7 +411,7 @@ impl State {
                     };
                     ui.add(btn).clicked()
                 };
-                if button(ui, egui::RichText::new("Replace").color(egui::Color32::LIGHT_RED), on_replace) {
+                if button(ui, egui::RichText::new("Replace").color(theme.error), on_replace) {
                     decision = Some(true);
                 }
                 if button(ui, egui::RichText::new("Cancel"), !on_replace) {

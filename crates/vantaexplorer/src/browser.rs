@@ -163,6 +163,13 @@ pub struct Theme {
     pub icon_tint: [u8; 3],
     /// The folders in Explorer's own icons.
     pub folder: [u8; 3],
+    /// The accent where it is drawn as text or as a thin glyph. On a dark palette the accent
+    /// itself; on a light one it is darkened until it reads on the window, because a light
+    /// theme's accent (Breeze's blue) is made for fills and frames and is too pale for letters.
+    pub accent_text: egui::Color32,
+    /// Failures, and what cannot be undone. On a dark palette the light red it has always been;
+    /// on a light one the palette's error color, darkened until it reads when it does not.
+    pub error: egui::Color32,
 }
 
 impl Theme {
@@ -170,13 +177,18 @@ impl Theme {
         let text = parse32(&cfg.text).unwrap_or(egui::Color32::WHITE);
         let accent = parse32(&cfg.accent).unwrap_or(text);
         let folder = parse32(&cfg.folder).unwrap_or(accent);
-        Self { accent, text, icon_tint: [text.r(), text.g(), text.b()], folder: [folder.r(), folder.g(), folder.b()] }
+        let light = vanta_ui::theme::is_light(text);
+        let (accent_text, error) = if light {
+            (vanta_ui::theme::legible(accent, true), vanta_ui::theme::legible(vanta_ui::theme::color32(cfg.colors.error), true))
+        } else {
+            (accent, egui::Color32::LIGHT_RED)
+        };
+        Self { accent, text, icon_tint: [text.r(), text.g(), text.b()], folder: [folder.r(), folder.g(), folder.b()], accent_text, error }
     }
 
     /// A dark theme: light text on the window.
     pub fn is_dark(&self) -> bool {
-        let t = self.text;
-        0.2126 * t.r() as f32 + 0.7152 * t.g() as f32 + 0.0722 * t.b() as f32 > 128.0
+        !vanta_ui::theme::is_light(self.text)
     }
 }
 
@@ -482,7 +494,7 @@ fn show_pane(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (n, h) = (theme.text.gamma_multiply(0.75), theme.accent);
+            let (n, h) = (theme.text.gamma_multiply(0.75), theme.accent_text);
             if pane_count > 1
                 && glyph::button(ui, Glyph::Cross, true, "Close pane", n, h)
             {
@@ -501,7 +513,7 @@ fn show_pane(
     // --- nav toolbar ---
     let mut navigate: Option<PathBuf> = None;
     ui.horizontal(|ui| {
-        let (n, h) = (theme.text.gamma_multiply(0.75), theme.accent);
+        let (n, h) = (theme.text.gamma_multiply(0.75), theme.accent_text);
         let tab = pane.tab();
         let (can_back, can_fwd, has_parent) =
             (tab.can_back(), tab.can_forward(), tab.path().parent().is_some() && !crate::fileops::in_trash(tab.path()));
@@ -725,14 +737,13 @@ fn show_pane(
         action = Some(PaneAction::Focus(idx));
     }
 
-    // Active-pane accent line under the toolbar.
+    // Active-pane accent line under the toolbar. Under the others a quiet line: the dark gray
+    // it has always been on a dark theme, the text color faded on a light one, where that gray
+    // would stand out as much as the accent.
     let line = ui.available_rect_before_wrap();
     let line = egui::Rect::from_min_size(line.min, egui::vec2(line.width(), 2.0));
-    ui.painter().rect_filled(
-        line,
-        0.0,
-        if is_active { theme.accent } else { egui::Color32::from_gray(60) },
-    );
+    let quiet = if theme.is_dark() { egui::Color32::from_gray(60) } else { theme.text.gamma_multiply(0.25) };
+    ui.painter().rect_filled(line, 0.0, if is_active { theme.accent } else { quiet });
     ui.add_space(4.0);
 
     // --- content: the list fills the pane; the preview lives at window level ---
@@ -1383,7 +1394,7 @@ fn entry_context_menu(
         ui.close();
     }
     if ui
-        .button(egui::RichText::new("Delete permanently").color(egui::Color32::LIGHT_RED))
+        .button(egui::RichText::new("Delete permanently").color(view.theme.error))
         .clicked()
     {
         push(Action::ConfirmDelete(paths.clone()));
@@ -1405,7 +1416,7 @@ fn trash_context_menu(ui: &mut egui::Ui, paths: Vec<PathBuf>, view: &View) {
         ui.close();
     }
     if ui
-        .button(egui::RichText::new("Delete permanently").color(egui::Color32::LIGHT_RED))
+        .button(egui::RichText::new("Delete permanently").color(view.theme.error))
         .clicked()
     {
         push(Action::ConfirmDelete(paths));
@@ -1413,7 +1424,7 @@ fn trash_context_menu(ui: &mut egui::Ui, paths: Vec<PathBuf>, view: &View) {
     }
     ui.separator();
     if ui
-        .button(egui::RichText::new("Empty Trash").color(egui::Color32::LIGHT_RED))
+        .button(egui::RichText::new("Empty Trash").color(view.theme.error))
         .clicked()
     {
         push(Action::EmptyTrash);
@@ -1456,7 +1467,7 @@ fn folder_context_menu(ui: &mut egui::Ui, tab: &mut crate::panes::Tab, view: &Vi
         if ui
             .add_enabled(
                 !empty,
-                egui::Button::new(egui::RichText::new("Empty Trash").color(egui::Color32::LIGHT_RED)),
+                egui::Button::new(egui::RichText::new("Empty Trash").color(view.theme.error)),
             )
             .clicked()
         {
@@ -1934,7 +1945,7 @@ fn show_rows_view(
                     ui.painter(),
                     mark,
                     if spec.ascending { Glyph::Up } else { Glyph::ChevronDown },
-                    theme.accent,
+                    theme.accent_text,
                 );
             }
         }
@@ -1991,7 +2002,7 @@ fn show_rows_view(
     match tab.listing.state {
         ListingState::Error => {
             ui.colored_label(
-                egui::Color32::LIGHT_RED,
+                theme.error,
                 tab.listing.error.clone().unwrap_or_else(|| "Error".into()),
             );
             return interacted;
@@ -2042,6 +2053,20 @@ fn show_rows_view(
             select_index(tab, &visible, vi);
         }
         interacted = true;
+    }
+    // In the list Left and Right walk the tree, as in yazi: Right into the marked folder, Left
+    // up to the parent with the folder left marked. A file is never opened by an arrow, only by
+    // Enter. (The grid's arrows move the selection sideways instead.)
+    if is_active && !ui.ctx().text_edit_focused() {
+        let (left, right) = ui.input(|i| (i.modifiers.is_none() && i.key_pressed(egui::Key::ArrowLeft), i.modifiers.is_none() && i.key_pressed(egui::Key::ArrowRight)));
+        if right {
+            if let Some(entry) = current_vi.and_then(|vi| visible.get(vi)).and_then(|&ei| tab.listing.entries.get(ei)).filter(|e| e.is_dir) {
+                open_dir = Some(entry.path.clone());
+            }
+        } else if left {
+            tab.up();
+            interacted = true;
+        }
     }
     if is_active {
         interacted |= handle_shortcuts(ui, tab, view, &visible);
@@ -2470,7 +2495,7 @@ fn show_grid(
 
     if tab.listing.state == ListingState::Error {
         ui.colored_label(
-            egui::Color32::LIGHT_RED,
+            theme.error,
             tab.listing.error.clone().unwrap_or_else(|| "Error".into()),
         );
         return interacted;
@@ -2863,7 +2888,7 @@ pub fn show_preview(ui: &mut egui::Ui, pane: &Pane, view: &View) {
     let theme = view.theme;
     let settings = view.settings;
     ui.separator();
-    ui.heading(egui::RichText::new("Preview").color(theme.accent).size(14.0));
+    ui.heading(egui::RichText::new("Preview").color(theme.accent_text).size(14.0));
 
     let tab = pane.tab_ref();
     let selected: Vec<&crate::model::Entry> = tab
@@ -3017,7 +3042,7 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                             egui::Align2::RIGHT_TOP,
                             "HDR",
                             egui::FontId::proportional(10.0),
-                            view.theme.accent,
+                            view.theme.accent_text,
                         );
                     }
                 }
@@ -3067,7 +3092,7 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                 egui::Align2::CENTER_CENTER,
                 crate::text::elide_end(ui, err, rect.width() - 8.0),
                 egui::TextStyle::Body.resolve(ui.style()),
-                egui::Color32::LIGHT_RED,
+                view.theme.error,
             );
         }
         _ => {
@@ -3188,6 +3213,20 @@ pub fn line_numbers(ui: &mut egui::Ui, text: &str, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dark palette keeps the light red and its own accent for letters; a light one gets its
+    /// own error color and an accent dark enough to read on the window.
+    #[test]
+    fn letters_in_the_accent_and_errors_follow_the_palette() {
+        let theme = |json: serde_json::Value| Theme::from_config(&Config::from_value(&json));
+        let dark = theme(serde_json::json!({ "color": { "background": "#ff202326", "text": "#fcfcfc", "accent": "#3daee9", "error": "#da4453" } }));
+        assert_eq!((dark.accent_text, dark.error), (dark.accent, egui::Color32::LIGHT_RED));
+        let light = theme(serde_json::json!({ "color": { "background": "#ffeff0f1", "text": "#232629", "accent": "#3daee9", "error": "#da4453" } }));
+        let window = egui::Color32::from_rgb(0xef, 0xf0, 0xf1);
+        assert_eq!(light.accent, egui::Color32::from_rgb(0x3d, 0xae, 0xe9), "fills keep the accent");
+        assert!(vanta_ui::theme::contrast(light.accent_text, window) >= 3.0);
+        assert_eq!(light.error, egui::Color32::from_rgb(0xda, 0x44, 0x53));
+    }
 
     fn cols_for(width: f32) -> Cols {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 20.0));

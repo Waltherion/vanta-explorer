@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use vanta_config::hypr::SdrWhite;
-use vanta_config::palette::Palette;
+use vanta_config::palette::{Colors, Palette};
 use vanta_config::{layers, Color};
 
 use crate::settings::Settings;
@@ -148,6 +148,9 @@ pub struct Config {
     pub accent: String,
     /// `color.folder`, else the accent: the folders in Explorer's own icons.
     pub folder: String,
+    /// The palette's colors as read: what egui's own widgets are made from (see
+    /// `vanta_ui::theme::visuals`), and the error color.
+    pub colors: Colors,
     pub font: Font,
     pub ui: Ui,
 }
@@ -191,6 +194,7 @@ impl Config {
                 .and_then(|v| v.as_str())
                 .and_then(Color::parse)
                 .map_or_else(|| hex(p.color.accent), hex),
+            colors: p.color,
             font: Font { family: p.font.family, size: p.font.size },
             ui,
         }

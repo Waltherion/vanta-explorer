@@ -15,6 +15,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Arrows, Page Up/Down, Home/End", "Move the selection (with Shift: extend it)"),
             ("Enter", "Open"),
             ("Backspace, Alt+Up", "Parent folder"),
+            ("Right, Left (list)", "Into the marked folder, out to the parent"),
             ("Alt+Left, Alt+Right", "Back, forward"),
             ("Alt+Home", "Home folder"),
             ("Ctrl+L", "Type a path"),
@@ -89,10 +90,11 @@ pub fn show(ctx: &egui::Context, theme: &crate::browser::Theme, date_format: &st
     }
     let resp = egui::Modal::new(egui::Id::new("help")).show(ctx, |ui| {
         ui.set_max_width(560.0);
-        // The window is drawn in egui's own (dark) style, like every menu, whatever the theme;
-        // the theme's text color would be dark on it with a light theme.
+        // The window is drawn in egui's own look, like every menu: its dark look on a dark
+        // theme, where the strong text is white whatever the theme's text, and the look made
+        // from the palette on a light one (`vanta_ui::theme::visuals`).
         let text = ui.visuals().strong_text_color();
-        ui.heading(egui::RichText::new("Vanta Explorer").color(theme.accent));
+        ui.heading(egui::RichText::new("Vanta Explorer").color(theme.accent_text));
         let mut version = format!("{} (commit {COMMIT}", env!("CARGO_PKG_VERSION"));
         if let Some(t) = when(COMMIT_TIME, date_format) {
             version.push_str(&format!(", from {t}"));
@@ -106,7 +108,7 @@ pub fn show(ctx: &egui::Context, theme: &crate::browser::Theme, date_format: &st
         egui::ScrollArea::vertical().max_height(ctx.content_rect().height() * 0.7).show(ui, |ui| {
             for (title, keys) in GROUPS {
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(*title).color(theme.accent).strong());
+                ui.label(egui::RichText::new(*title).color(theme.accent_text).strong());
                 egui::Grid::new(title).num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
                     for (key, what) in *keys {
                         ui.label(egui::RichText::new(*key).color(text));

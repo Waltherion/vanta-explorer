@@ -159,6 +159,17 @@ pub fn paint(p: &egui::Painter, rect: egui::Rect, glyph: Glyph, col: egui::Color
     }
 }
 
+/// The faint wash behind a small button under the pointer: white on a dark palette, as it has
+/// always been, and the text color on a light one, where white would not show. Read from egui's
+/// look, which follows the palette (`vanta_ui::theme::visuals`).
+pub fn hover_wash(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_white_alpha(20)
+    } else {
+        ui.visuals().text_color().gamma_multiply(0.1)
+    }
+}
+
 /// A compact icon-only button. `tint` supplies the theme's normal/hover colours.
 pub fn button(
     ui: &mut egui::Ui,
@@ -177,8 +188,7 @@ pub fn button(
         normal
     };
     if enabled && resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 2.0, egui::Color32::from_white_alpha(20));
+        ui.painter().rect_filled(rect, 2.0, hover_wash(ui));
     }
     paint(ui.painter(), rect, glyph, col);
     if !tip.is_empty() {

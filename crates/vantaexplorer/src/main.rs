@@ -196,6 +196,7 @@ fn main() -> Result<()> {
         }
     };
     let theme = browser::Theme::from_config(&cfg);
+    docs::set_text_color(theme.text);
     let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
     fileops::set_keep_dates(prefs.keep_dates);
     model::set_folders_first(prefs.folders_first);
@@ -495,6 +496,7 @@ impl ApplicationHandler for App {
         match self.init(event_loop) {
             Ok(gfx) => {
                 apply_font(&gfx.egui_ctx, &self.cfg, &mut self.font_family);
+                vanta_ui::theme::apply_visuals(&gfx.egui_ctx, &self.cfg.colors);
                 self.state = Some(gfx);
             }
             Err(e) => {
@@ -761,6 +763,12 @@ impl ApplicationHandler for App {
             self.icons.clear(); // repainted per-theme SVGs get re-read
             self.icons.set_folder_color(self.theme.folder);
             apply_font(&gfx.egui_ctx, &cfg, &mut self.font_family);
+            // Menus, dialogs and fields follow a switch between a light theme and a dark one.
+            vanta_ui::theme::apply_visuals(&gfx.egui_ctx, &cfg.colors);
+            if docs::set_text_color(self.theme.text) {
+                // Highlighted text on screen is built again in the other syntax theme.
+                self.ops_state.refresh_preview = true;
+            }
             self.cfg = cfg;
             // A different icon theme means everything drawn from the old one is stale.
             self.icons.set_themes(s.icon_themes.clone());
@@ -1958,7 +1966,7 @@ fn status_bar(
     ui.add_space(8.0);
     // Undo/redo feedback: without it Ctrl+Z on a background pane looks like nothing happened.
     if let Some(msg) = toast {
-        ui.label(egui::RichText::new(msg).color(theme.accent));
+        ui.label(egui::RichText::new(msg).color(theme.accent_text));
         ui.separator();
     }
     // Selection summary for the active pane.
@@ -2312,7 +2320,7 @@ fn editor_after_frame(
 
 fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::Theme) {
     if let Some(mut p) = app_ops.properties.take() {
-        let (open, wants) = p.show(ctx, theme.accent);
+        let (open, wants) = p.show(ctx, theme.accent_text);
         if open {
             app_ops.properties = Some(p);
         }
@@ -2361,14 +2369,17 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 for op in &app_ops.active {
                     ui.horizontal(|ui| match &op.error {
                         Some(e) if op.finished => {
-                            ui.colored_label(egui::Color32::from_rgb(240, 200, 90), e);
+                            // Amber, as it has always been on a dark theme; on a light one egui's
+                            // warning color, which the palette's look has made readable there.
+                            let warn = if ui.visuals().dark_mode { egui::Color32::from_rgb(240, 200, 90) } else { ui.visuals().warn_fg_color };
+                            ui.colored_label(warn, e);
                             if ui.small_button("Dismiss").clicked() {
                                 dismiss = Some(op.id);
                             }
                         }
                         Some(e) => {
                             ui.colored_label(
-                                egui::Color32::LIGHT_RED,
+                                theme.error,
                                 format!("{} failed: {e}", op.kind.label()),
                             );
                             if ui.small_button("Dismiss").clicked() {
@@ -2458,7 +2469,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             ui.heading(heading);
             ui.add_space(4.0);
             ui.label(question);
-            ui.label(egui::RichText::new("This cannot be undone.").color(egui::Color32::LIGHT_RED));
+            ui.label(egui::RichText::new("This cannot be undone.").color(theme.error));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 // The keyboard selection is drawn, not just held: a dialog you can drive with
@@ -2475,7 +2486,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 };
                 if button(
                     ui,
-                    egui::RichText::new(verb).color(egui::Color32::LIGHT_RED),
+                    egui::RichText::new(verb).color(theme.error),
                     delete_selected,
                 ) {
                     decision = Some(true);
@@ -2559,7 +2570,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                     }
                     ui.separator();
                     if ui
-                        .button(egui::RichText::new("Cancel").color(egui::Color32::LIGHT_RED))
+                        .button(egui::RichText::new("Cancel").color(theme.error))
                         .clicked()
                     {
                         answer = Some(fileops::ConflictAnswer::Cancel);
@@ -2583,7 +2594,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label(format!("'{name}'"));
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.colored_label(theme.error, error);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Try again").clicked() {
@@ -2597,7 +2608,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                     }
                     ui.separator();
                     if ui
-                        .button(egui::RichText::new("Stop").color(egui::Color32::LIGHT_RED))
+                        .button(egui::RichText::new("Stop").color(theme.error))
                         .on_hover_text("What is done so far stays, and undo can reverse it")
                         .clicked()
                     {

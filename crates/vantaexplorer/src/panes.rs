@@ -187,7 +187,10 @@ impl Tab {
             return;
         }
         if let Some(parent) = self.listing.path.parent() {
+            // The folder just left stays marked, so Right (or Enter) goes straight back in.
+            let child = self.listing.path.file_name().map(|n| n.to_string_lossy().into_owned());
             self.navigate(parent.to_path_buf());
+            self.pending_reveal = child;
         }
     }
 

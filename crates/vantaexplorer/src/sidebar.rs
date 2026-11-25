@@ -340,7 +340,7 @@ impl Sidebar {
                                     true,
                                     "",
                                     theme.text.gamma_multiply(0.75),
-                                    theme.accent,
+                                    theme.accent_text,
                                 ) {
                                     toggle = Some(i);
                                 }
@@ -351,7 +351,7 @@ impl Sidebar {
                             let resp = ui.add(
                                 egui::Button::new(
                                     egui::RichText::new(section.title())
-                                        .color(theme.accent)
+                                        .color(theme.accent_text)
                                         .strong(),
                                 )
                                 .frame(false),
@@ -417,7 +417,7 @@ impl Sidebar {
                         resp.context_menu(|ui| {
                             // What the Trash entry is for, above the arranging every entry has.
                             if trash {
-                                if ui.button(egui::RichText::new("Empty Trash").color(egui::Color32::LIGHT_RED)).clicked() {
+                                if ui.button(egui::RichText::new("Empty Trash").color(theme.error)).clicked() {
                                     empty_trash = true;
                                     ui.close();
                                 }
@@ -446,7 +446,7 @@ impl Sidebar {
                     if custom {
                         ui.horizontal(|ui| {
                             ui.add_space(INDENT);
-                            if glyph::button(ui, Glyph::Plus, true, "", theme.text.gamma_multiply(0.75), theme.accent) {
+                            if glyph::button(ui, Glyph::Plus, true, "", theme.text.gamma_multiply(0.75), theme.accent_text) {
                                 add_path = Some(i);
                             }
                             if ui
@@ -468,7 +468,7 @@ impl Sidebar {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if glyph::button(ui, Glyph::Plus, true, "", theme.text.gamma_multiply(0.75), theme.accent) {
+                    if glyph::button(ui, Glyph::Plus, true, "", theme.text.gamma_multiply(0.75), theme.accent_text) {
                         add_section = true;
                     }
                     if ui
@@ -729,9 +729,9 @@ fn draw_row(
             egui::vec2(16.0, 16.0),
         );
         let r = ui.interact(btn, ui.id().with((&row.label, "eject")), egui::Sense::click());
-        let col = if r.hovered() { theme.accent } else { theme.text.gamma_multiply(0.7) };
+        let col = if r.hovered() { theme.accent_text } else { theme.text.gamma_multiply(0.7) };
         if r.hovered() {
-            ui.painter().rect_filled(btn, 2.0, egui::Color32::from_white_alpha(20));
+            ui.painter().rect_filled(btn, 2.0, glyph::hover_wash(ui));
         }
         glyph::paint(ui.painter(), btn, Glyph::Eject, col);
         let _ = r.clone().on_hover_text("Safely remove");

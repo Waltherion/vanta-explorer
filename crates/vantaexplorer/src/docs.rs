@@ -7,6 +7,7 @@
 
 use egui::text::LayoutJob;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 pub const TEXT_LIMIT_BYTES: usize = 256 * 1024;
@@ -284,17 +285,38 @@ fn borrowed_syntax(ext: &str) -> Option<&'static str> {
     })
 }
 
-fn syntaxes() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::Theme) {
-    static SETS: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::Theme)> =
+/// The palette's text color, packed as RGBA, when the palette is a light one; 0 for a dark one.
+/// Highlighting runs on the preview's own thread as well as the UI's, so it reads the look from
+/// here rather than having it handed down.
+static LIGHT_TEXT: AtomicU32 = AtomicU32::new(0);
+
+/// Follows the palette: on a light one, text is highlighted in a syntax theme made for a light
+/// background, and what is not highlighted is written in the palette's text color. True when
+/// that changed, so the text on screen is built again.
+pub fn set_text_color(text: egui::Color32) -> bool {
+    let packed = if vanta_ui::theme::is_light(text) { u32::from_be_bytes([text.r(), text.g(), text.b(), 255]) } else { 0 };
+    LIGHT_TEXT.swap(packed, Ordering::Relaxed) != packed
+}
+
+/// The palette's text color when the palette is a light one.
+pub fn light_text() -> Option<egui::Color32> {
+    let [r, g, b, a] = LIGHT_TEXT.load(Ordering::Relaxed).to_be_bytes();
+    (a != 0).then(|| egui::Color32::from_rgb(r, g, b))
+}
+
+/// The syntaxes, and the syntax themes for a dark palette and a light one.
+fn syntaxes() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::Theme, syntect::highlighting::Theme) {
+    static SETS: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::Theme, syntect::highlighting::Theme)> =
         OnceLock::new();
     SETS.get_or_init(|| {
         let ss = syntect::parsing::SyntaxSet::load_defaults_newlines();
-        // base16-eighties reads well on dark backgrounds; per-theme mapping can come later.
-        let theme = syntect::highlighting::ThemeSet::load_defaults()
-            .themes
-            .remove("base16-eighties.dark")
-            .expect("bundled theme");
-        (ss, theme)
+        let mut themes = syntect::highlighting::ThemeSet::load_defaults().themes;
+        // base16-eighties reads well on dark backgrounds. InspiredGitHub is GitHub's light look,
+        // and of the light themes syntect ships it is the one whose comments and strings still
+        // read on a white or near-white window.
+        let dark = themes.remove("base16-eighties.dark").expect("bundled theme");
+        let light = themes.remove("InspiredGitHub").expect("bundled theme");
+        (ss, dark, light)
     })
 }
 
@@ -314,7 +336,7 @@ fn highlight_text(path: &Path) -> Result<LayoutJob, String> {
             0.0,
             egui::TextFormat {
                 font_id: egui::FontId::monospace(12.0),
-                color: egui::Color32::GRAY,
+                color: light_text().map_or(egui::Color32::GRAY, |t| t.gamma_multiply(0.6)),
                 ..Default::default()
             },
         );
@@ -328,7 +350,9 @@ pub fn highlight(path: &Path, text: &str, max_lines: usize) -> LayoutJob {
     use syntect::easy::HighlightLines;
     use syntect::util::LinesWithEndings;
 
-    let (ss, theme) = syntaxes();
+    let (ss, dark, light) = syntaxes();
+    let plain = light_text();
+    let theme = if plain.is_some() { light } else { dark };
     let syntax = path
         .extension()
         .and_then(|e| e.to_str())
@@ -345,7 +369,7 @@ pub fn highlight(path: &Path, text: &str, max_lines: usize) -> LayoutJob {
             break;
         }
         let Ok(regions) = hl.highlight_line(line, ss) else {
-            job.append(line, 0.0, egui::TextFormat { font_id: font.clone(), color: egui::Color32::LIGHT_GRAY, ..Default::default() });
+            job.append(line, 0.0, egui::TextFormat { font_id: font.clone(), color: plain.unwrap_or(egui::Color32::LIGHT_GRAY), ..Default::default() });
             continue;
         };
         for (style, span) in regions {

@@ -104,7 +104,9 @@ mod tests {
         let mut checked = 0;
         let mut differ = Vec::new();
         for _ in 0..2 {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // No GPU here takes the font atlas the layouts fill, so its update is let go on purpose.
+            // Dropped unhandled, egui stops a debug build with an assertion.
+            ctx.run_ui(egui::RawInput::default(), |ui| {
                 for text in ["et-ret-langt-filnavn-til-test-af-afkortning-nummer-0042.txt", "Backup-Drive-2TB", "æøå ÆØÅ mixed Widths WWWiii", "short"] {
                     for w in (0..400).step_by(7) {
                         for from_start in [false, true] {
@@ -116,7 +118,9 @@ mod tests {
                         }
                     }
                 }
-            });
+            })
+            .textures_delta
+            .clear();
         }
         assert!(checked > 0);
         assert!(differ.is_empty(), "{} of {checked} differ, e.g. {:?}", differ.len(), &differ[..differ.len().min(5)]);

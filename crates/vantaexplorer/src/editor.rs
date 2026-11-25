@@ -155,7 +155,7 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, theme: &crate::browser::Theme) -
             asked.cancel = true;
         }
         if ed.dirty() {
-            ui.label(egui::RichText::new("• unsaved").color(theme.accent));
+            ui.label(egui::RichText::new("• unsaved").color(theme.accent_text));
         }
     });
     ui.add_space(4.0);
@@ -206,7 +206,8 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, theme: &crate::browser::Theme) -
 }
 
 /// The highlighted layout of `text`, remembered for the last text asked about: egui asks for the
-/// layout every frame, and the text only changes on a keystroke.
+/// layout every frame, and the text only changes on a keystroke (and its colors when the theme
+/// switches between a light palette and a dark one).
 fn highlighted(path: &Path, text: &str) -> egui::text::LayoutJob {
     use std::sync::Mutex;
     static LAST: Mutex<Option<(PathBuf, u64, egui::text::LayoutJob)>> = Mutex::new(None);
@@ -214,6 +215,7 @@ fn highlighted(path: &Path, text: &str) -> egui::text::LayoutJob {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut h);
+        crate::docs::light_text().hash(&mut h);
         h.finish()
     };
     let mut last = LAST.lock().unwrap();
