@@ -658,6 +658,11 @@ read a Microsoft calendar.
   // everything else is a list. Right-click a folder, Folder view, to use its view in its
   // subfolders too or for every folder. "pane": each pane keeps one view, whatever it shows.
   // "viewPer": "folder",
+
+  // Numbers in spreadsheet previews (1,234.56 or 1.234,56) follow this locale, e.g. "da_DK" or
+  // "de_CH". Empty: the system's (LC_NUMERIC). Calc sheets (.ods) keep the text LibreOffice
+  // saved them with.
+  // "numberLocale": "",
 }
 ```
 

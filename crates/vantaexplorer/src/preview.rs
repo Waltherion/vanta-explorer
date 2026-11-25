@@ -209,7 +209,7 @@ impl Preview {
                     let pages = doc.sheets.as_ref().map_or(1, |s| s.len() as u32);
                     self.texture_size = None;
                     self.is_hdr = false;
-                    self.shown = Shown::Rich(std::sync::Arc::new(crate::office::view::Rich::new(ctx, doc)));
+                    self.shown = Shown::Rich(std::sync::Arc::new(crate::office::view::Rich::new(ctx, *doc)));
                     let current_page = self.current_page().unwrap_or(0);
                     self.state = PreviewState::Ready(loaded.path, current_page, pages, loaded.file_info);
                 }

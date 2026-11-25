@@ -1,7 +1,7 @@
 //! Word documents (.docx): `word/document.xml` with the styles, list numbering and pictures it
 //! refers to. Headers, footers, footnotes and comments are left out.
 
-use super::{Align, Block, Cell, Inline, PageSetup, Package, Para, Pictures, RichDoc, SpanStyle, Table};
+use super::{Align, Block, Cell, Field, Inline, PageSetup, Package, Para, Pictures, RichDoc, Running, SpanStyle, Table};
 use roxmltree::Node;
 use std::collections::HashMap;
 
@@ -368,6 +368,18 @@ struct Reader<'p> {
     pictures: Pictures,
     normal_pt: f32,
     blocks: usize,
+    /// Word's complex fields being read (`w:fldChar`), innermost last.
+    fields: Vec<FieldState>,
+}
+
+/// A complex field: its instruction, and whether its shown result has begun.
+#[derive(Default)]
+struct FieldState {
+    instr: String,
+    separated: bool,
+    /// The page number or count it is, drawn in place of the result Word saved.
+    ours: Option<Field>,
+    placed: bool,
 }
 
 pub fn read(pkg: &mut Package) -> Result<RichDoc, String> {
@@ -380,13 +392,16 @@ pub fn read(pkg: &mut Package) -> Result<RichDoc, String> {
     let styles = Styles::read(pkg.text(&styles_name));
     let numbering = Numbering::read(pkg.text(&numbering_name));
     let normal_pt = styles.paragraph(None).0.sz.unwrap_or(11.0).max(4.0);
-    let mut r = Reader { pkg, styles, numbering, rels, pictures: Pictures::default(), normal_pt, blocks: 0 };
+    let mut r = Reader { pkg, styles, numbering, rels, pictures: Pictures::default(), normal_pt, blocks: 0, fields: Vec::new() };
     let body = doc.root_element().children().find(|c| w(*c, "body")).ok_or("no document body")?;
     let mut blocks = Vec::new();
     r.body(body, &mut blocks);
     let note = (r.blocks > super::MAX_BLOCKS).then(|| "The rest of the document is not shown.".to_string());
     let page = page_setup(body);
-    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note, page, base_pt: normal_pt })
+    let sect = body.children().rfind(|c| w(*c, "sectPr"));
+    let header = sect.and_then(|s| r.running(s, "headerReference", &dir));
+    let footer = sect.and_then(|s| r.running(s, "footerReference", &dir));
+    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note, page, base_pt: normal_pt, header, footer, slides: None })
 }
 
 /// The page of the document's last section, the one `w:body` ends with; a document with several
@@ -400,6 +415,8 @@ fn page_setup(body: Node) -> PageSetup {
         page.height = twips(sz, "h").unwrap_or(page.height);
     }
     if let Some(m) = child(sect, "pgMar") {
+        page.header = twips(m, "header").unwrap_or(page.header);
+        page.footer = twips(m, "footer").unwrap_or(page.footer);
         // A negative top or bottom margin means the text may not push it; its size is the same.
         for (i, name) in ["top", "right", "bottom", "left"].iter().enumerate() {
             if let Some(v) = twips(m, name) {
@@ -432,6 +449,44 @@ fn main_part(pkg: &mut Package) -> String {
 }
 
 impl Reader<'_> {
+    /// The header or footer of a section (`kind` is `headerReference` or `footerReference`): the
+    /// one for every page, and the first page's when the section gives it its own.
+    fn running(&mut self, sect: Node, kind: &str, dir: &str) -> Option<Running> {
+        let refs: Vec<(String, String)> = sect
+            .children()
+            .filter(|c| w(*c, kind))
+            .filter_map(|c| {
+                let id = c.attributes().find(|a| a.name() == "id" && a.namespace().is_some_and(|ns| ns.contains("relationships")))?.value();
+                Some((attr(c, "type").unwrap_or("default").to_string(), id.to_string()))
+            })
+            .collect();
+        let title_page = child(sect, "titlePg").is_some_and(on);
+        let mut part = |kind: &str| refs.iter().find(|(t, _)| t == kind).and_then(|(_, id)| self.rels.get(id).cloned()).map(|p| self.part_blocks(&p, dir));
+        let blocks = part("default");
+        let first = if title_page { Some(part("first").unwrap_or_default()) } else { None };
+        if blocks.is_none() && first.as_ref().is_none_or(|f| f.is_empty()) {
+            return None;
+        }
+        Some(Running { blocks: blocks.unwrap_or_default(), first })
+    }
+
+    /// The paragraphs and tables of a header or footer part, its pictures found through its own
+    /// relationships.
+    fn part_blocks(&mut self, part: &str, dir: &str) -> Vec<Block> {
+        let Some(text) = self.pkg.text(part) else { return Vec::new() };
+        let Ok(doc) = super::xml(&text) else { return Vec::new() };
+        let name = part.rsplit('/').next().unwrap_or(part);
+        let part_dir = part.rsplit_once('/').map(|(d, _)| d).unwrap_or(dir);
+        let own = super::relationships(self.pkg, &format!("{part_dir}/_rels/{name}.rels"), part_dir);
+        let doc_rels = std::mem::replace(&mut self.rels, own);
+        let mut out = Vec::new();
+        self.fields.clear();
+        self.body(doc.root_element(), &mut out);
+        self.fields.clear();
+        self.rels = doc_rels;
+        out
+    }
+
     fn full(&self) -> bool {
         self.blocks > super::MAX_BLOCKS
     }
@@ -514,7 +569,11 @@ impl Reader<'_> {
             if is_w(c) {
                 match local(c) {
                     "r" => self.run(c, base, inlines, extra, page_break),
-                    "hyperlink" | "smartTag" | "ins" | "customXml" | "fldSimple" | "sdtContent" | "bdo" | "dir" | "moveTo" => self.inline(c, base, inlines, extra, page_break),
+                    "fldSimple" => match attr(c, "instr").and_then(Field::from_instruction) {
+                        Some(field) => inlines.push(Inline::Field(field, base.style(self.normal_pt))),
+                        None => self.inline(c, base, inlines, extra, page_break),
+                    },
+                    "hyperlink" | "smartTag" | "ins" | "customXml" | "sdtContent" | "bdo" | "dir" | "moveTo" => self.inline(c, base, inlines, extra, page_break),
                     "sdt" => {
                         if let Some(content) = child(c, "sdtContent") {
                             self.inline(content, base, inlines, extra, page_break);
@@ -550,7 +609,36 @@ impl Reader<'_> {
         for c in r.children().filter(|c| c.is_element()) {
             if is_w(c) {
                 match local(c) {
+                    // The result Word saved for a page number is replaced by the real one.
+                    "t" if self.fields.iter().any(|f| f.separated && f.ours.is_some()) => {}
                     "t" => super::push_text(inlines, c.text().unwrap_or(""), style),
+                    "fldChar" => match attr(c, "fldCharType") {
+                        Some("begin") => self.fields.push(FieldState::default()),
+                        Some("separate") => {
+                            if let Some(f) = self.fields.last_mut() {
+                                f.separated = true;
+                                f.ours = Field::from_instruction(&f.instr);
+                                if let Some(field) = f.ours {
+                                    f.placed = true;
+                                    inlines.push(Inline::Field(field, style.clone()));
+                                }
+                            }
+                        }
+                        Some("end") => {
+                            if let Some(f) = self.fields.pop() {
+                                // A field Word saved no result for.
+                                if let (false, Some(field)) = (f.placed, Field::from_instruction(&f.instr)) {
+                                    inlines.push(Inline::Field(field, style.clone()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    "instrText" => {
+                        if let Some(f) = self.fields.last_mut().filter(|f| !f.separated) {
+                            f.instr.push_str(c.text().unwrap_or(""));
+                        }
+                    }
                     "tab" | "ptab" => super::push_text(inlines, "    ", style),
                     "br" => {
                         if attr(c, "type") == Some("page") {

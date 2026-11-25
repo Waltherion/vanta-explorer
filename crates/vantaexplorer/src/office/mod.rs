@@ -1,11 +1,13 @@
 //! Office documents read by ourselves: Word and Writer text with its formatting, tables and
-//! pictures, Excel and Calc sheets as a grid. No office suite is involved. A .docx, .xlsx, .odt or
-//! .ods is a zip of XML, and what a preview needs from it is a small part of either standard.
+//! pictures, Excel and Calc sheets as a grid, PowerPoint and Impress slides. No office suite is
+//! involved. Each is a zip of XML, and what a preview needs from it is a small part of either
+//! standard.
 //!
 //! Parsing gives a `RichDoc`: plain data, built on the preview thread. `view` draws it.
 
 mod docx;
 mod odf;
+mod pptx;
 pub mod view;
 mod xlsx;
 
@@ -39,6 +41,100 @@ pub struct RichDoc {
     pub page: PageSetup,
     /// The size of the document's normal text, in points.
     pub base_pt: f32,
+    /// What stands at the top and the bottom of every page.
+    pub header: Option<Running>,
+    pub footer: Option<Running>,
+    /// For a presentation: its slides, each a page of `page`'s size.
+    pub slides: Option<Vec<Slide>>,
+}
+
+/// A slide: its background and its shapes, bottom first.
+pub struct Slide {
+    pub background: [u8; 3],
+    /// A picture over the whole slide.
+    pub background_image: Option<usize>,
+    pub shapes: Vec<Shape>,
+}
+
+#[derive(Clone)]
+pub struct Shape {
+    /// Left, top, width, height in points.
+    pub rect: [f32; 4],
+    pub geom: Geom,
+    pub fill: Option<[u8; 3]>,
+    /// Color and width in points.
+    pub line: Option<([u8; 3], f32)>,
+    pub content: ShapeContent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Geom {
+    Rect,
+    RoundRect,
+    Ellipse,
+    /// From one corner of the rectangle to the other, flipped as the document says.
+    Line { flip_h: bool, flip_v: bool },
+}
+
+#[derive(Clone)]
+pub enum ShapeContent {
+    Empty,
+    Text(TextBox),
+    Image(usize),
+    Table(Table),
+    /// Something not drawn: a chart, a diagram.
+    Missing(String),
+}
+
+#[derive(Clone)]
+pub struct TextBox {
+    pub blocks: Vec<Block>,
+    pub anchor: VAnchor,
+    /// Left, top, right, bottom, points.
+    pub inset: [f32; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum VAnchor {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// A header or a footer.
+#[derive(Default)]
+pub struct Running {
+    pub blocks: Vec<Block>,
+    /// The first page's own, when the document gives the first page another (empty: none).
+    pub first: Option<Vec<Block>>,
+}
+
+impl Running {
+    pub fn for_page(&self, page: usize) -> &[Block] {
+        match (&self.first, page) {
+            (Some(first), 0) => first,
+            _ => &self.blocks,
+        }
+    }
+}
+
+/// A number filled in when the page is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Field {
+    Page,
+    Pages,
+}
+
+impl Field {
+    /// The field a Word field instruction (`PAGE`, `NUMPAGES \* Arabic`) is, if one we fill in.
+    fn from_instruction(instr: &str) -> Option<Field> {
+        match instr.split_whitespace().next()?.to_ascii_uppercase().as_str() {
+            "PAGE" => Some(Field::Page),
+            "NUMPAGES" | "SECTIONPAGES" => Some(Field::Pages),
+            _ => None,
+        }
+    }
 }
 
 /// A page's size and margins, in points.
@@ -48,12 +144,15 @@ pub struct PageSetup {
     pub height: f32,
     /// Top, right, bottom, left.
     pub margin: [f32; 4],
+    /// From the top of the page to the header, and from the bottom to the footer.
+    pub header: f32,
+    pub footer: f32,
 }
 
 impl Default for PageSetup {
     /// A4 with an inch all round, what a document that does not say is printed on here.
     fn default() -> Self {
-        Self { width: 595.3, height: 841.9, margin: [72.0; 4] }
+        Self { width: 595.3, height: 841.9, margin: [72.0; 4], header: 36.0, footer: 36.0 }
     }
 }
 
@@ -65,11 +164,14 @@ impl PageSetup {
             && (100.0..=3000.0).contains(&self.height)
             && self.margin.iter().all(|m| (0.0..=self.width.min(self.height) / 2.5).contains(m))
             && self.width - l - r >= 50.0
-            && self.height - t - b >= 50.0;
+            && self.height - t - b >= 50.0
+            && (0.0..=self.height / 3.0).contains(&self.header)
+            && (0.0..=self.height / 3.0).contains(&self.footer);
         if ok { self } else { Self::default() }
     }
 }
 
+#[derive(Clone)]
 pub enum Block {
     Para(Para),
     Table(Table),
@@ -77,7 +179,7 @@ pub enum Block {
     PageBreak,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Para {
     pub inlines: Vec<Inline>,
     /// 0 for a title, 1 to 6 for headings.
@@ -94,16 +196,24 @@ pub struct Para {
     pub line: Option<f32>,
     /// No space between this and a neighbor of the same kind (Word's list paragraphs).
     pub contextual: bool,
+    /// Where the text starts, points from the left; `None`: by `level`.
+    pub left: Option<f32>,
+    /// How far left of the text the marker hangs, points.
+    pub hang: Option<f32>,
 }
 
+#[derive(Clone)]
 pub enum Inline {
     Text(Span),
     /// A picture, by index into `RichDoc::images`, at the size the document gives it in points.
     Image { idx: usize, w: f32, h: f32 },
     /// Something there that is not shown: a chart, a picture in a format we do not read.
     Missing(String),
+    /// The page number or the number of pages.
+    Field(Field, SpanStyle),
 }
 
+#[derive(Clone)]
 pub struct Span {
     pub text: String,
     pub style: SpanStyle,
@@ -129,12 +239,14 @@ pub enum Align {
     Justify,
 }
 
+#[derive(Clone)]
 pub struct Table {
     /// Column widths, in any unit: only their proportions are used.
     pub widths: Vec<f32>,
     pub rows: Vec<Vec<Cell>>,
 }
 
+#[derive(Clone)]
 pub struct Cell {
     pub blocks: Vec<Block>,
     /// How many grid columns it covers.
@@ -142,6 +254,7 @@ pub struct Cell {
     pub fill: Option<[u8; 3]>,
 }
 
+#[derive(Clone)]
 pub struct Sheet {
     /// Row number (1-based, as the sheet numbers them) and its cells, column A first.
     pub rows: Vec<(u32, Vec<SheetCell>)>,
@@ -157,9 +270,28 @@ pub struct SheetCell {
     pub right: bool,
 }
 
+/// The locale numbers in sheets are shown for (the `numberLocale` setting); empty: the system's.
+static NUMBER_LOCALE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Sets the locale numbers are shown for. Returns whether it changed, so a sheet on screen can
+/// be read again.
+pub fn set_number_locale(name: &str) -> bool {
+    let Ok(mut current) = NUMBER_LOCALE.write() else { return false };
+    let name = name.trim();
+    if *current == name {
+        return false;
+    }
+    *current = name.to_string();
+    true
+}
+
+fn number_locale() -> String {
+    NUMBER_LOCALE.read().map(|s| s.clone()).unwrap_or_default()
+}
+
 /// Whether we read this kind of document ourselves.
 pub fn handles(ext: &str) -> bool {
-    matches!(ext, "docx" | "xlsx" | "odt" | "ods")
+    matches!(ext, "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp")
 }
 
 /// The document at `path`; `page` is the sheet of a workbook.
@@ -177,8 +309,10 @@ pub fn render(path: &Path, ext: &str, page: u32) -> Result<RichDoc, String> {
     match ext {
         "docx" => docx::read(&mut pkg),
         "xlsx" => xlsx::read(&mut pkg, page),
+        "pptx" => pptx::read(&mut pkg),
         "odt" => odf::text(&mut pkg),
         "ods" => odf::sheet(&mut pkg, page),
+        "odp" => odf::presentation(&mut pkg),
         _ => Err("not an office document".into()),
     }
 }

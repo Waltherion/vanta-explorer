@@ -27,6 +27,8 @@ pub struct Settings {
     /// Whether list or grid and its size belong to the folder or to the pane.
     #[serde(deserialize_with = "view_per")]
     pub view_per: ViewPer,
+    /// The locale numbers in sheets are written for (`da_DK`); empty: the system's.
+    pub number_locale: String,
 }
 
 /// What the view (list or grid, and how large) is remembered for.
@@ -96,6 +98,7 @@ impl Default for Settings {
             folders_first: true,
             dark_pages: DarkPages::Off,
             view_per: ViewPer::Folder,
+            number_locale: String::new(),
         }
     }
 }

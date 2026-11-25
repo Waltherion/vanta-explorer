@@ -1,7 +1,7 @@
 //! Drawing a `RichDoc` in the preview pane: a text document on its pages, as it would print, a
 //! workbook's sheet as a grid.
 
-use super::{Align, Block, Inline, Para, RichDoc, Sheet, SpanStyle, Table};
+use super::{Align, Block, Field, Geom, Inline, Para, Shape, ShapeContent, Slide, VAnchor, RichDoc, Sheet, SpanStyle, Table};
 use crate::browser::Theme;
 use egui::text::LayoutJob;
 
@@ -84,6 +84,10 @@ pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme, dar
         sheet_view(&mut child, sheet, theme, body);
         return;
     }
+    if let Some(slides) = &rich.doc.slides {
+        slides_view(&mut child, rich, slides, theme, dark);
+        return;
+    }
     let page = rich.doc.page;
     let mut shown_page = None;
     let out = egui::ScrollArea::vertical().id_salt("preview-doc").auto_shrink([false, false]).show(&mut child, |ui| {
@@ -91,7 +95,7 @@ pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme, dar
         let s = ((width - 2.0 * PAGE_GAP) / page.width).max(0.05);
         let [mt, mr, mb, ml] = page.margin.map(|m| m * s);
         let (pw, ph) = (page.width * s, page.height * s);
-        let lay = Lay { painter: ui.painter().clone(), textures: &rich.textures, s, base: rich.doc.base_pt, dark };
+        let lay = Lay { painter: ui.painter().clone(), textures: &rich.textures, s, base: rich.doc.base_pt, dark, page_no: std::cell::Cell::new((1, 1)) };
         let paper = lay.tone(egui::Color32::WHITE);
         let ink = lay.tone(INK);
         let pieces = lay.blocks(&rich.doc.blocks, pw - ml - mr);
@@ -112,6 +116,24 @@ pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme, dar
             if dark {
                 // Dark paper on a dark window needs an edge the shadow cannot give it.
                 painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(28)), egui::StrokeKind::Outside);
+            }
+        }
+        // Headers and footers, set for each page in view with its number.
+        for i in 0..pages {
+            let r = page_rect(i);
+            if !r.intersects(visible) {
+                continue;
+            }
+            lay.page_no.set((i + 1, pages));
+            let pt = painter.with_clip_rect(r.intersect(visible));
+            for (running, at_top) in [(&rich.doc.header, true), (&rich.doc.footer, false)] {
+                let Some(blocks) = running.as_ref().map(|r| r.for_page(i)).filter(|b| !b.is_empty()) else { continue };
+                let (items, h) = Lay::stack(lay.blocks(blocks, pw - ml - mr));
+                let y = if at_top { page.header * s } else { ph - page.footer * s - h };
+                let offset = (r.min + egui::vec2(ml, y)).to_vec2();
+                for item in &items {
+                    item.paint(&pt, offset, ink);
+                }
             }
         }
         for p in &placed {
@@ -139,13 +161,152 @@ pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme, dar
         }
     });
     if let Some((n, of)) = shown_page {
-        // Which page is in view, in the corner as a PDF reader says it.
-        let painter = child.painter();
-        let font = egui::TextStyle::Small.resolve(child.style());
-        let galley = painter.layout_no_wrap(format!("{n} / {of}"), font, egui::Color32::WHITE);
-        let at = out.inner_rect.right_bottom() - galley.size() - egui::vec2(18.0, 10.0);
-        painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(6.0, 3.0)), 4.0, egui::Color32::from_black_alpha(160));
-        painter.galley(at, galley, egui::Color32::WHITE);
+        page_badge(&child, out.inner_rect, n, of);
+    }
+}
+
+/// Which page is in view, in the corner as a PDF reader says it.
+fn page_badge(ui: &egui::Ui, area: egui::Rect, n: usize, of: usize) {
+    let painter = ui.painter();
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = painter.layout_no_wrap(format!("{n} / {of}"), font, egui::Color32::WHITE);
+    let at = area.right_bottom() - galley.size() - egui::vec2(18.0, 10.0);
+    painter.rect_filled(egui::Rect::from_min_size(at, galley.size()).expand2(egui::vec2(6.0, 3.0)), 4.0, egui::Color32::from_black_alpha(160));
+    painter.galley(at, galley, egui::Color32::WHITE);
+}
+
+fn rgb(c: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// A presentation: its slides one under the other, each scaled to the pane's width. On dark
+/// pages a light slide is turned dark; a slide that is dark already is left as it is.
+fn slides_view(ui: &mut egui::Ui, rich: &Rich, slides: &[Slide], theme: &Theme, dark: bool) {
+    let page = rich.doc.page;
+    let mut shown = None;
+    let out = egui::ScrollArea::vertical().id_salt("preview-slides").auto_shrink([false, false]).show(ui, |ui| {
+        let width = ui.available_width();
+        let s = ((width - 2.0 * PAGE_GAP) / page.width).max(0.02);
+        let (pw, ph) = (page.width * s, page.height * s);
+        let n = slides.len();
+        let note_h = if rich.doc.note.is_some() { 24.0 } else { 0.0 };
+        let total = PAGE_GAP + n as f32 * (ph + PAGE_GAP) + note_h;
+        let (area, _) = ui.allocate_exact_size(egui::vec2(width, total), egui::Sense::hover());
+        let visible = ui.clip_rect();
+        let page_rect = |i: usize| egui::Rect::from_min_size(egui::pos2(area.min.x + (width - pw) / 2.0, area.min.y + PAGE_GAP + i as f32 * (ph + PAGE_GAP)), egui::vec2(pw, ph));
+        let painter = ui.painter();
+        for (i, slide) in slides.iter().enumerate() {
+            let r = page_rect(i);
+            if !r.expand(8.0).intersects(visible) {
+                continue;
+            }
+            let [br, bg, bb] = slide.background;
+            let light = 0.2126 * br as f32 + 0.7152 * bg as f32 + 0.0722 * bb as f32 > 128.0;
+            let night = dark && light;
+            let lay = Lay { painter: painter.clone(), textures: &rich.textures, s, base: rich.doc.base_pt, dark: night, page_no: std::cell::Cell::new((i + 1, n)) };
+            painter.rect_filled(r.translate(egui::vec2(0.0, 2.0)).expand(1.0), 2.0, egui::Color32::from_black_alpha(70));
+            painter.rect_filled(r, 0.0, lay.tone(rgb(slide.background)));
+            let pt = painter.with_clip_rect(r.intersect(visible));
+            if let Some(tex) = slide.background_image.and_then(|i| rich.textures.get(i)) {
+                pt.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            }
+            if dark {
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_white_alpha(28)), egui::StrokeKind::Outside);
+            }
+            for shape in &slide.shapes {
+                draw_shape(&pt, &lay, r.min, shape);
+            }
+        }
+        if let Some(note) = &rich.doc.note {
+            let y = area.min.y + PAGE_GAP + n as f32 * (ph + PAGE_GAP);
+            painter.text(egui::pos2(area.center().x, y + 4.0), egui::Align2::CENTER_TOP, note, egui::TextStyle::Small.resolve(ui.style()), theme.text.gamma_multiply(0.6));
+        }
+        if n > 1 {
+            let middle = visible.center().y - area.min.y - PAGE_GAP / 2.0;
+            shown = Some((((middle / (ph + PAGE_GAP)).floor().max(0.0) as usize).min(n - 1) + 1, n));
+        }
+    });
+    if let Some((n, of)) = shown {
+        page_badge(ui, out.inner_rect, n, of);
+    }
+}
+
+/// A shape on a slide whose top left is `origin`.
+fn draw_shape(p: &egui::Painter, lay: &Lay, origin: egui::Pos2, sh: &Shape) {
+    let s = lay.s;
+    let [x, y, w, h] = sh.rect;
+    let r = egui::Rect::from_min_size(origin + egui::vec2(x * s, y * s), egui::vec2(w * s, h * s));
+    let fill = sh.fill.map(|c| lay.tone(rgb(c)));
+    let stroke = sh.line.map(|(c, w)| egui::Stroke::new((w * s).max(0.75), lay.tone(rgb(c))));
+    match sh.geom {
+        Geom::Rect => {
+            if let Some(f) = fill {
+                p.rect_filled(r, 0.0, f);
+            }
+            if let Some(st) = stroke {
+                p.rect_stroke(r, 0.0, st, egui::StrokeKind::Middle);
+            }
+        }
+        Geom::RoundRect => {
+            // PowerPoint's default corner: a sixth of the shorter side.
+            let radius = (r.width().min(r.height()) / 6.0).min(255.0) as u8;
+            if let Some(f) = fill {
+                p.rect_filled(r, radius, f);
+            }
+            if let Some(st) = stroke {
+                p.rect_stroke(r, radius, st, egui::StrokeKind::Middle);
+            }
+        }
+        Geom::Ellipse => {
+            if let Some(f) = fill {
+                p.add(egui::Shape::ellipse_filled(r.center(), r.size() / 2.0, f));
+            }
+            if let Some(st) = stroke {
+                p.add(egui::Shape::ellipse_stroke(r.center(), r.size() / 2.0, st));
+            }
+        }
+        Geom::Line { flip_h, flip_v } => {
+            let (x0, x1) = if flip_h { (r.max.x, r.min.x) } else { (r.min.x, r.max.x) };
+            let (y0, y1) = if flip_v { (r.max.y, r.min.y) } else { (r.min.y, r.max.y) };
+            let st = stroke.unwrap_or(egui::Stroke::new(1.0, lay.tone(INK)));
+            p.line_segment([egui::pos2(x0, y0), egui::pos2(x1, y1)], st);
+        }
+    }
+    let ink = lay.tone(INK);
+    match &sh.content {
+        ShapeContent::Empty => {}
+        ShapeContent::Image(idx) => {
+            if let Some(tex) = lay.textures.get(*idx) {
+                p.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            }
+        }
+        ShapeContent::Text(tb) => {
+            let [l, t, rr, b] = tb.inset.map(|v| v * s);
+            let inner_w = (r.width() - l - rr).max(4.0);
+            let (items, th) = Lay::stack(lay.blocks(&tb.blocks, inner_w));
+            let top = match tb.anchor {
+                VAnchor::Top => r.min.y + t,
+                VAnchor::Middle => (r.min.y + t + r.max.y - b) / 2.0 - th / 2.0,
+                VAnchor::Bottom => r.max.y - b - th,
+            };
+            let offset = egui::vec2(r.min.x + l, top);
+            for item in &items {
+                item.paint(p, offset, ink);
+            }
+        }
+        ShapeContent::Table(t) => {
+            let mut pieces = Vec::new();
+            lay.table(t, r.width(), &mut pieces);
+            let (items, _) = Lay::stack(pieces);
+            for item in &items {
+                item.paint(p, r.min.to_vec2(), ink);
+            }
+        }
+        ShapeContent::Missing(what) => {
+            let gray = lay.tone(egui::Color32::from_gray(140));
+            p.extend(egui::Shape::dashed_line(&[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], egui::Stroke::new(1.0, gray), 6.0, 4.0));
+            p.text(r.center(), egui::Align2::CENTER_CENTER, format!("[{what}]"), egui::FontId::proportional((14.0 * s).clamp(8.0, 40.0)), gray);
+        }
     }
 }
 
@@ -264,6 +425,8 @@ struct Lay<'a> {
     base: f32,
     /// Set on dark paper.
     dark: bool,
+    /// The page being set and the number of pages, for page number fields.
+    page_no: std::cell::Cell<(usize, usize)>,
 }
 
 /// How much bigger than normal text a heading is when the document does not say.
@@ -362,7 +525,8 @@ impl Lay<'_> {
             contextual: p.contextual,
             ..Default::default()
         };
-        let indent = (p.level as f32 * INDENT * s).min(width * 0.6);
+        let indent = p.left.map_or(p.level as f32 * INDENT * s, |l| l * s).min(width * 0.6);
+        let hang = p.hang.unwrap_or(HANG) * s;
         let avail = (width - indent).max(20.0);
         let first_style = p.inlines.iter().find_map(|i| if let Inline::Text(t) = i { Some(t.style.clone()) } else { None }).unwrap_or_default();
         let mut y = 0.0f32;
@@ -370,6 +534,14 @@ impl Lay<'_> {
         for inline in &p.inlines {
             match inline {
                 Inline::Text(t) => job.append(&t.text, 0.0, self.format(&t.style, p.heading, line)),
+                Inline::Field(field, st) => {
+                    let (n, of) = self.page_no.get();
+                    let text = match field {
+                        Field::Page => n.to_string(),
+                        Field::Pages => of.to_string(),
+                    };
+                    job.append(&text, 0.0, self.format(st, p.heading, line));
+                }
                 Inline::Missing(what) => {
                     let mut f = self.format(&SpanStyle { italic: true, ..Default::default() }, None, line);
                     f.color = self.tone(egui::Color32::from_gray(120));
@@ -392,7 +564,7 @@ impl Lay<'_> {
             let mut mj = LayoutJob::default();
             mj.append(m, 0.0, f);
             let g = self.painter.layout_job(mj);
-            let x = (indent - HANG * s).max(0.0);
+            let x = (indent - hang).max(0.0);
             // A marker wider than the hang pushes nothing: it is drawn over the space before.
             piece.items.insert(0, Item::Text(egui::pos2(x.min(indent - g.size().x - 2.0).max(0.0), 0.0), g));
         }

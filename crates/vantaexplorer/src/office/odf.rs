@@ -1,7 +1,7 @@
 //! OpenDocument (.odt, .ods), as LibreOffice and OnlyOffice write it: `content.xml`, with the
 //! styles of `styles.xml` behind its own.
 
-use super::{Align, Block, Cell, Inline, PageSetup, Package, Para, Pictures, RichDoc, Sheet, SheetCell, SpanStyle, Table};
+use super::{Align, Block, Cell, Field, Geom, Inline, PageSetup, Package, Para, Running, Shape, ShapeContent, Slide, TextBox, VAnchor, Pictures, RichDoc, Sheet, SheetCell, SpanStyle, Table};
 use roxmltree::Node;
 use std::collections::HashMap;
 
@@ -19,6 +19,7 @@ fn is(n: Node, ns: &str, name: &str) -> bool {
 /// An attribute by namespace (`style`, `fo`, `svg`, `text`, `xlink`, ...) and local name. `fo` and
 /// `svg` are the "-compatible" namespaces OpenDocument borrows them as.
 fn attr<'a>(n: Node<'a, '_>, ns: &str, name: &str) -> Option<&'a str> {
+    let ns = if ns == "draw" { "drawing" } else { ns };
     n.attributes()
         .find(|a| a.name() == name && a.namespace().is_some_and(|u| u.ends_with(&format!(":{ns}:1.0")) || u.ends_with(&format!(":{ns}-compatible:1.0")) || u.ends_with(&format!("/{ns}")) || (ns == "fo" && u.ends_with("xsl-fo-compatible:1.0"))))
         .map(|a| a.value())
@@ -223,6 +224,10 @@ struct Reader<'p> {
     blocks: usize,
     /// Counters of the list being read, one per level.
     counters: Vec<u32>,
+    /// What the text being read stands on: a slide shape's style.
+    base: Props,
+    /// In a slide's outline: its master's name, whose `-outlineN` styles give each list level.
+    outline: Option<String>,
 }
 
 fn read_both(pkg: &mut Package) -> Result<(String, Option<String>), String> {
@@ -241,23 +246,330 @@ pub fn text(pkg: &mut Package) -> Result<RichDoc, String> {
     docs.push(&doc);
     let styles = Styles::read(&docs);
     let body = doc.descendants().find(|n| is(*n, "office", "text")).ok_or("no text in the document")?;
-    let mut r = Reader { pkg, styles, pictures: Pictures::default(), blocks: 0, counters: Vec::new() };
+    let mut r = Reader { pkg, styles, pictures: Pictures::default(), blocks: 0, counters: Vec::new(), base: Props::default(), outline: None };
     let mut blocks = Vec::new();
     r.body(body, &mut blocks, None, 0);
     let note = (r.blocks > super::MAX_BLOCKS).then(|| "The rest of the document is not shown.".to_string());
-    let page = styles_doc.as_ref().map(page_setup).unwrap_or_default();
+    let mut page = styles_doc.as_ref().map(page_setup).unwrap_or_default();
     let base_pt = r.styles.normal_pt;
-    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note, page, base_pt })
+    let (mut header, mut footer) = (None, None);
+    if let Some(styles) = &styles_doc {
+        if let Some(master) = standard_master(styles) {
+            header = r.running(master, "header");
+            footer = r.running(master, "footer");
+            // The margins of an OpenDocument page are outside its header and footer: the text
+            // starts below the header.
+            let room = |kind: &str| page_layout(styles).and_then(|l| l.children().find(|c| is(*c, "style", &format!("{kind}-style")))).and_then(|s| s.children().find(|c| is(*c, "style", "header-footer-properties")));
+            if header.is_some() {
+                let props = room("header");
+                let h = props.and_then(|p| attr(p, "fo", "min-height")).and_then(length_pt).unwrap_or(0.0).max(base_pt * 1.2);
+                let gap = props.and_then(|p| attr(p, "fo", "margin-bottom")).and_then(length_pt).unwrap_or(7.0);
+                page.header = page.margin[0];
+                page.margin[0] += h + gap;
+            }
+            if footer.is_some() {
+                let props = room("footer");
+                let h = props.and_then(|p| attr(p, "fo", "min-height")).and_then(length_pt).unwrap_or(0.0).max(base_pt * 1.2);
+                let gap = props.and_then(|p| attr(p, "fo", "margin-top")).and_then(length_pt).unwrap_or(7.0);
+                page.footer = page.margin[2];
+                page.margin[2] += h + gap;
+            }
+            page = page.sane();
+        }
+    }
+    Ok(RichDoc { blocks, images: r.pictures.images, sheets: None, note, page, base_pt, header, footer, slides: None })
+}
+
+/// The master page called Standard, the one a document starts on, or the first.
+fn standard_master<'a, 'i>(styles: &'a roxmltree::Document<'i>) -> Option<Node<'a, 'i>> {
+    let masters = || styles.descendants().filter(|n| is(*n, "style", "master-page"));
+    masters().find(|m| attr(*m, "style", "name") == Some("Standard")).or_else(|| masters().next())
+}
+
+/// The page layout of that master page.
+fn page_layout<'a, 'i>(styles: &'a roxmltree::Document<'i>) -> Option<Node<'a, 'i>> {
+    let name = standard_master(styles).and_then(|m| attr(m, "style", "page-layout-name"));
+    let layouts = || styles.descendants().filter(|n| is(*n, "style", "page-layout"));
+    layouts().find(|l| name.is_some() && attr(*l, "style", "name") == name).or_else(|| layouts().next())
+}
+
+/// The look of a shape or a slide: fill, outline, where its text sits.
+#[derive(Clone, Default, Debug)]
+struct Graphic {
+    fill: Option<bool>,
+    fill_color: Option<[u8; 3]>,
+    stroke: Option<bool>,
+    stroke_color: Option<[u8; 3]>,
+    /// Points.
+    stroke_width: Option<f32>,
+    valign: Option<VAnchor>,
+    /// Left, top, right, bottom, points.
+    padding: [Option<f32>; 4],
+}
+
+impl Graphic {
+    /// From a style's `style:graphic-properties` or `style:drawing-page-properties`.
+    fn read(style: Node) -> Graphic {
+        let mut g = Graphic::default();
+        for p in style.children().filter(|c| is(*c, "style", "graphic-properties") || is(*c, "style", "drawing-page-properties")) {
+            g.fill = attr(p, "draw", "fill").map(|f| f != "none").or(g.fill);
+            g.fill_color = attr(p, "draw", "fill-color").and_then(super::hex_color).or(g.fill_color);
+            g.stroke = attr(p, "draw", "stroke").map(|f| f != "none").or(g.stroke);
+            g.stroke_color = attr(p, "svg", "stroke-color").and_then(super::hex_color).or(g.stroke_color);
+            g.stroke_width = attr(p, "svg", "stroke-width").and_then(length_pt).or(g.stroke_width);
+            g.valign = attr(p, "draw", "textarea-vertical-align")
+                .map(|v| match v {
+                    "middle" => VAnchor::Middle,
+                    "bottom" => VAnchor::Bottom,
+                    _ => VAnchor::Top,
+                })
+                .or(g.valign);
+            let all = attr(p, "fo", "padding").and_then(length_pt);
+            for (i, side) in ["padding-left", "padding-top", "padding-right", "padding-bottom"].iter().enumerate() {
+                g.padding[i] = attr(p, "fo", side).and_then(length_pt).or(all).or(g.padding[i]);
+            }
+        }
+        g
+    }
+
+    fn over(&mut self, o: &Graphic) {
+        self.fill = o.fill.or(self.fill);
+        self.fill_color = o.fill_color.or(self.fill_color);
+        self.stroke = o.stroke.or(self.stroke);
+        self.stroke_color = o.stroke_color.or(self.stroke_color);
+        self.stroke_width = o.stroke_width.or(self.stroke_width);
+        self.valign = o.valign.or(self.valign);
+        for (a, b) in self.padding.iter_mut().zip(o.padding) {
+            *a = b.or(*a);
+        }
+    }
+}
+
+/// Every style's look by name, over the default graphic style.
+#[derive(Default)]
+struct Graphics {
+    styles: HashMap<String, (Option<String>, Graphic)>,
+    default: Graphic,
+}
+
+impl Graphics {
+    fn read(docs: &[&roxmltree::Document]) -> Graphics {
+        let mut g = Graphics::default();
+        for doc in docs {
+            for n in doc.descendants().filter(|n| n.is_element()) {
+                if is(n, "style", "default-style") && attr(n, "style", "family") == Some("graphic") {
+                    g.default = Graphic::read(n);
+                } else if is(n, "style", "style") {
+                    if let Some(name) = attr(n, "style", "name") {
+                        g.styles.insert(name.to_string(), (attr(n, "style", "parent-style-name").map(str::to_string), Graphic::read(n)));
+                    }
+                }
+            }
+        }
+        g
+    }
+
+    /// The look of the styles named, each with its parents, later ones over earlier ones.
+    fn of(&self, names: &[Option<&str>]) -> Graphic {
+        let mut out = self.default.clone();
+        for name in names.iter().flatten() {
+            let mut chain = Vec::new();
+            let mut cur = Some(name.to_string());
+            while let Some(n) = cur {
+                let Some((parent, g)) = self.styles.get(&n) else { break };
+                chain.push(g);
+                if chain.len() > 20 {
+                    break;
+                }
+                cur = parent.clone();
+            }
+            for g in chain.into_iter().rev() {
+                out.over(g);
+            }
+        }
+        out
+    }
+}
+
+/// More slides than this and the rest are left out.
+const MAX_SLIDES: usize = 300;
+
+/// A presentation (.odp): its slides, each with its master page's own shapes under its own.
+pub fn presentation(pkg: &mut Package) -> Result<RichDoc, String> {
+    let (content, styles_text) = read_both(pkg)?;
+    let doc = super::xml(&content)?;
+    let styles_doc = styles_text.as_deref().and_then(|t| super::xml(t).ok());
+    let mut docs = Vec::new();
+    if let Some(d) = &styles_doc {
+        docs.push(d);
+    }
+    docs.push(&doc);
+    let mut styles = Styles::read(&docs);
+    styles.normal_pt = super::pptx::BASE_PT;
+    let graphics = Graphics::read(&docs);
+    let body = doc.descendants().find(|n| is(*n, "office", "presentation")).ok_or("no slides in the presentation")?;
+    let mut page = styles_doc.as_ref().map(page_setup).unwrap_or(PageSetup { width: 793.7, height: 446.5, ..PageSetup::default() });
+    (page.margin, page.header, page.footer) = ([0.0; 4], 0.0, 0.0);
+    let mut r = Reader { pkg, styles, pictures: Pictures::default(), blocks: 0, counters: Vec::new(), base: Props::default(), outline: None };
+    let pages: Vec<Node> = body.children().filter(|c| is(*c, "draw", "page")).collect();
+    let mut slides = Vec::new();
+    for pg in pages.iter().take(MAX_SLIDES) {
+        let master_name = attr(*pg, "draw", "master-page-name").unwrap_or("Default");
+        let master = styles_doc.as_ref().and_then(|d| d.descendants().find(|m| is(*m, "style", "master-page") && attr(*m, "style", "name") == Some(master_name)));
+        let look = graphics.of(&[master.and_then(|m| attr(m, "draw", "style-name")), attr(*pg, "draw", "style-name")]);
+        let background = look.fill_color.filter(|_| look.fill != Some(false)).unwrap_or([255; 3]);
+        let mut shapes = Vec::new();
+        if let Some(m) = master {
+            r.slide_shapes(m, &graphics, master_name, true, &mut shapes);
+        }
+        r.slide_shapes(*pg, &graphics, master_name, false, &mut shapes);
+        slides.push(Slide { background, background_image: None, shapes });
+    }
+    if slides.is_empty() {
+        return Err("the presentation has no slides".into());
+    }
+    let note = (pages.len() > MAX_SLIDES).then(|| format!("The first {MAX_SLIDES} slides"));
+    Ok(RichDoc { blocks: Vec::new(), images: r.pictures.images, sheets: None, note, page, base_pt: super::pptx::BASE_PT, header: None, footer: None, slides: Some(slides) })
+}
+
+/// A shape's frame from `svg:x`, `svg:y`, `svg:width` and `svg:height`; a rotated one gives its
+/// place in `draw:transform` instead.
+fn frame_rect(n: Node) -> Option<[f32; 4]> {
+    let w = attr(n, "svg", "width").and_then(length_pt)?;
+    let h = attr(n, "svg", "height").and_then(length_pt)?;
+    let (x, y) = match (attr(n, "svg", "x").and_then(length_pt), attr(n, "svg", "y").and_then(length_pt)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
+            let t = attr(n, "draw", "transform")?;
+            let inner = t.split("translate").nth(1)?.trim().trim_start_matches('(');
+            let inner = inner.split(')').next()?;
+            let mut parts = inner.split_whitespace();
+            (length_pt(parts.next()?)?, length_pt(parts.next()?)?)
+        }
+    };
+    Some([x, y, w, h])
+}
+
+impl Reader<'_> {
+    /// The shapes of a slide or master page. `master`: a master page, whose placeholders only
+    /// show on its slides when the slide fills them, so are not drawn from it.
+    fn slide_shapes(&mut self, node: Node, graphics: &Graphics, master_name: &str, master: bool, out: &mut Vec<Shape>) {
+        for c in node.children().filter(|c| c.is_element()) {
+            if is(c, "draw", "g") {
+                self.slide_shapes(c, graphics, master_name, master, out);
+                continue;
+            }
+            let class = attr(c, "presentation", "class");
+            // A placeholder: on the master, or left empty on a slide ("Click to add text").
+            if (master && class.is_some()) || attr(c, "presentation", "placeholder") == Some("true") {
+                continue;
+            }
+            let style_names = [attr(c, "presentation", "style-name"), attr(c, "draw", "style-name")];
+            let look = graphics.of(&style_names);
+            let kind = local(c);
+            let (rect, geom) = match kind {
+                "line" | "connector" => {
+                    let p = |n: &str| attr(c, "svg", n).and_then(length_pt);
+                    let (Some(x1), Some(y1), Some(x2), Some(y2)) = (p("x1"), p("y1"), p("x2"), p("y2")) else { continue };
+                    ([x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs()], Geom::Line { flip_h: x2 < x1, flip_v: y2 < y1 })
+                }
+                "frame" | "custom-shape" | "rect" | "ellipse" | "circle" | "caption" => {
+                    let Some(rect) = frame_rect(c) else { continue };
+                    let geom = match kind {
+                        "ellipse" | "circle" => Geom::Ellipse,
+                        "custom-shape" => {
+                            let t = c.children().find(|g| is(*g, "draw", "enhanced-geometry")).and_then(|g| attr(g, "draw", "type")).unwrap_or("rectangle");
+                            match t {
+                                "ellipse" | "circle" | "ooxml-ellipse" => Geom::Ellipse,
+                                "round-rectangle" | "ooxml-roundRect" => Geom::RoundRect,
+                                _ => Geom::Rect,
+                            }
+                        }
+                        _ => Geom::Rect,
+                    };
+                    (rect, geom)
+                }
+                _ => continue,
+            };
+            // A frame (a text box, a picture) is unfilled unless its style says; a drawn shape
+            // takes LibreOffice's default, filled and outlined.
+            let drawn = kind != "frame";
+            let fill = if look.fill.unwrap_or(drawn) { look.fill_color } else { None };
+            let line = if look.stroke.unwrap_or(drawn) && !matches!(geom, Geom::Line { .. }) || matches!(geom, Geom::Line { .. }) && look.stroke != Some(false) {
+                Some((look.stroke_color.unwrap_or([0x34, 0x65, 0xA4]), look.stroke_width.unwrap_or(0.0).max(0.75)))
+            } else {
+                None
+            };
+            let content = if kind == "frame" {
+                self.frame_content(c, &look, &style_names, class, master_name)
+            } else {
+                // Text in a drawn shape stands in its middle, both ways.
+                self.text_content(c, &look, &style_names, None, master_name, VAnchor::Middle, true)
+            };
+            if matches!(content, ShapeContent::Empty) && fill.is_none() && line.is_none() {
+                continue;
+            }
+            out.push(Shape { rect, geom, fill, line, content });
+        }
+    }
+
+    fn frame_content(&mut self, f: Node, look: &Graphic, style_names: &[Option<&str>], class: Option<&str>, master_name: &str) -> ShapeContent {
+        for c in f.children().filter(|c| c.is_element()) {
+            if is(c, "draw", "image") {
+                let Some(href) = c.attributes().find(|a| a.name() == "href").map(|a| a.value()) else { continue };
+                if href.starts_with("http") {
+                    continue;
+                }
+                return match self.pictures.get(self.pkg, href.trim_start_matches("./")) {
+                    Ok(idx) => ShapeContent::Image(idx),
+                    Err(what) => ShapeContent::Missing(what),
+                };
+            }
+            if is(c, "draw", "text-box") {
+                return self.text_content(c, look, style_names, class, master_name, VAnchor::Top, false);
+            }
+            if is(c, "table", "table") {
+                return ShapeContent::Table(self.table(c));
+            }
+            if is(c, "draw", "object") || is(c, "draw", "object-ole") {
+                return ShapeContent::Missing(if class == Some("chart") { "chart" } else { "object" }.into());
+            }
+            if is(c, "draw", "plugin") {
+                return ShapeContent::Missing("media".into());
+            }
+        }
+        ShapeContent::Empty
+    }
+
+    /// The text in a text box or a drawn shape, in the shape's style.
+    #[allow(clippy::too_many_arguments)]
+    fn text_content(&mut self, node: Node, look: &Graphic, style_names: &[Option<&str>], class: Option<&str>, master_name: &str, anchor: VAnchor, centered: bool) -> ShapeContent {
+        let mut base = Props::default();
+        if centered {
+            base.align = Some(Align::Center);
+        }
+        for name in style_names.iter().flatten() {
+            base.over(&self.styles.props(Some(name)));
+        }
+        self.base = base;
+        self.outline = (class == Some("outline")).then(|| master_name.to_string());
+        self.counters.clear();
+        let mut blocks = Vec::new();
+        self.body(node, &mut blocks, None, 0);
+        self.base = Props::default();
+        self.outline = None;
+        let blank = blocks.iter().all(|b| matches!(b, Block::Para(p) if p.inlines.iter().all(|i| matches!(i, Inline::Text(s) if s.text.trim().is_empty()))));
+        if blank {
+            return ShapeContent::Empty;
+        }
+        let [l, t, r, b] = look.padding;
+        ShapeContent::Text(TextBox { blocks, anchor: look.valign.unwrap_or(anchor), inset: [l.unwrap_or(7.1), t.unwrap_or(3.5), r.unwrap_or(7.1), b.unwrap_or(3.5)] })
+    }
 }
 
 /// The page of the master page called Standard (the one a document starts on), or of the first.
 fn page_setup(styles: &roxmltree::Document) -> PageSetup {
-    let masters = || styles.descendants().filter(|n| is(*n, "style", "master-page"));
-    let layout_name = masters().find(|m| attr(*m, "style", "name") == Some("Standard")).or_else(|| masters().next()).and_then(|m| attr(m, "style", "page-layout-name"));
-    let layouts = || styles.descendants().filter(|n| is(*n, "style", "page-layout"));
-    let Some(layout) = layouts().find(|l| layout_name.is_some() && attr(*l, "style", "name") == layout_name).or_else(|| layouts().next()) else {
-        return PageSetup::default();
-    };
+    let Some(layout) = page_layout(styles) else { return PageSetup::default() };
     let Some(props) = layout.children().find(|c| is(*c, "style", "page-layout-properties")) else { return PageSetup::default() };
     let mut page = PageSetup::default();
     let len = |name: &str| attr(props, "fo", name).and_then(length_pt);
@@ -273,6 +585,26 @@ fn page_setup(styles: &roxmltree::Document) -> PageSetup {
 }
 
 impl Reader<'_> {
+    /// The header or footer (`kind`) of a master page, with the first page's own when it has one
+    /// (`style:header-first`). One switched off (`style:display="false"`) is none.
+    fn running(&mut self, master: Node, kind: &str) -> Option<Running> {
+        let shown = |n: &Node| attr(*n, "style", "display") != Some("false");
+        let blocks = master.children().find(|c| is(*c, "style", kind)).filter(shown).map(|n| {
+            let mut out = Vec::new();
+            self.body(n, &mut out, None, 0);
+            out
+        });
+        let first = master.children().find(|c| is(*c, "style", &format!("{kind}-first"))).map(|n| {
+            let mut out = Vec::new();
+            if shown(&n) {
+                self.body(n, &mut out, None, 0);
+            }
+            out
+        });
+        blocks.as_ref()?;
+        Some(Running { blocks: blocks.unwrap_or_default(), first })
+    }
+
     /// Block content. `list` is the list style in effect and `depth` how deep in lists we are.
     fn body(&mut self, node: Node, out: &mut Vec<Block>, list: Option<&str>, depth: u8) {
         for c in node.children().filter(|c| c.is_element()) {
@@ -340,7 +672,11 @@ impl Reader<'_> {
 
     fn paragraph(&mut self, p: Node, out: &mut Vec<Block>, marker: Option<String>, depth: u8) {
         self.blocks += 1;
-        let props = self.styles.props(attr(p, "text", "style-name"));
+        let mut props = self.base.clone();
+        if let Some(master) = self.outline.as_deref().filter(|_| depth > 1) {
+            props.over(&self.styles.props(Some(&format!("{master}-outline{depth}"))));
+        }
+        props.over(&self.styles.props(attr(p, "text", "style-name")));
         let heading = if is(p, "text", "h") {
             Some(attr(p, "text", "outline-level").and_then(|v| v.parse::<u8>().ok()).or(props.outline).unwrap_or(1).clamp(1, 6))
         } else {
@@ -392,7 +728,11 @@ impl Reader<'_> {
                 super::push_text(inlines, "\n", &base.style(normal));
             } else if is(c, "draw", "frame") || is(c, "draw", "a") {
                 self.frame(c, inlines, extra);
-            } else if is(c, "text", "page-number") || is(c, "text", "date") || is(c, "text", "title") || is(c, "text", "sequence") || is(c, "text", "bookmark-ref") || is(c, "text", "reference-ref") {
+            } else if is(c, "text", "page-number") {
+                inlines.push(Inline::Field(Field::Page, base.style(normal)));
+            } else if is(c, "text", "page-count") {
+                inlines.push(Inline::Field(Field::Pages, base.style(normal)));
+            } else if is(c, "text", "date") || is(c, "text", "title") || is(c, "text", "sequence") || is(c, "text", "bookmark-ref") || is(c, "text", "reference-ref") {
                 self.inline(c, base, inlines, extra);
             }
         }
@@ -471,7 +811,7 @@ pub fn sheet(pkg: &mut Package, page: u32) -> Result<RichDoc, String> {
     }
     let names = tables.iter().enumerate().map(|(i, t)| attr(*t, "table", "name").map(str::to_string).unwrap_or_else(|| format!("Sheet{}", i + 1))).collect();
     let t = tables[(page as usize).min(tables.len() - 1)];
-    Ok(RichDoc { blocks: vec![Block::Sheet(calc_sheet(t))], images: Vec::new(), sheets: Some(names), note: None, page: PageSetup::default(), base_pt: 11.0 })
+    Ok(RichDoc { blocks: vec![Block::Sheet(calc_sheet(t))], images: Vec::new(), sheets: Some(names), note: None, page: PageSetup::default(), base_pt: 11.0, header: None, footer: None, slides: None })
 }
 
 fn calc_sheet(t: Node) -> Sheet {

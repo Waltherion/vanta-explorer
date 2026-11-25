@@ -34,8 +34,12 @@ the desktop theme changes, without restarting and without losing your open tabs.
   rest. Drag the slider under the preview to scrub through the file in 1% steps; each stop
   is decoded on demand, in the video's own color space.
 - **Documents.** PDF pages with previous/next; Word and Writer documents (.docx, .odt) read
-  by Explorer itself, with headings, formatting, lists, tables and pictures; Excel and Calc
-  sheets (.xlsx, .ods) as a grid, a sheet at a time. No office suite is needed. SVG is drawn
+  by Explorer itself and shown as their pages, at the document's own page size and margins,
+  with headings, formatting, lists, tables, pictures, headers and footers with page numbers;
+  Excel and Calc sheets (.xlsx, .ods) as a grid, a sheet at a time, numbers in their own
+  formats; PowerPoint and Impress presentations (.pptx, .odp) as their slides, with their
+  backgrounds, shapes, text, pictures and tables. No office suite is needed. On a dark theme, `darkPages` shows pages dark with
+  light text. SVG is drawn
   on a checkerboard so both dark and light artwork read, and source in some fifty text
   formats is syntax-highlighted.
 - **Quick edits in the preview.** Edit (Ctrl+E) turns a text file or a small config into

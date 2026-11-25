@@ -128,7 +128,8 @@ fn main() -> Result<()> {
                         count(|b| matches!(b, office::Block::Para(_))),
                         count(|b| matches!(b, office::Block::Table(_))),
                         doc.images.len(),
-                        doc.sheets.as_ref().map(|s| format!(", sheets {}", s.join(", "))).unwrap_or_default(),
+                        doc.sheets.as_ref().map(|s| format!(", sheets {}", s.join(", "))).unwrap_or_default()
+                            + &doc.slides.as_ref().map(|s| format!(", {} slides", s.len())).unwrap_or_default(),
                         t.elapsed()
                     );
                 }
@@ -198,6 +199,7 @@ fn main() -> Result<()> {
     let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
     fileops::set_keep_dates(prefs.keep_dates);
     model::set_folders_first(prefs.folders_first);
+    office::set_number_locale(&prefs.number_locale);
     let mut app = App {
         probe,
         state: None,
@@ -763,6 +765,10 @@ impl ApplicationHandler for App {
             // A different icon theme means everything drawn from the old one is stale.
             self.icons.set_themes(s.icon_themes.clone());
             fileops::set_keep_dates(s.keep_dates);
+            if office::set_number_locale(&s.number_locale) {
+                // A sheet on screen is read again with the new separators.
+                self.ops_state.refresh_preview = true;
+            }
             if model::set_folders_first(s.folders_first) {
                 for tab in self.ws.panes.iter_mut().flat_map(|p| p.tabs.iter_mut()) {
                     tab.listing.apply_sort();

@@ -1,4 +1,5 @@
-//! Document previews: PDF pages, Word, Writer, Excel and Calc documents read by `office`,
+//! Document previews: PDF pages, Word, Writer, Excel, Calc, PowerPoint and Impress documents
+//! read by `office`,
 //! ODF/OOXML embedded thumbnails for the rest, highlighted text.
 //!
 //! Documents are SDR by nature, so unlike images they do not go through the HDR layer, they
@@ -15,7 +16,7 @@ pub enum DocContent {
     Raster { img: egui::ColorImage, total_pages: u32 },
     Text(LayoutJob),
     /// An office document's own content: text, tables, pictures, or a sheet.
-    Rich(crate::office::RichDoc),
+    Rich(Box<crate::office::RichDoc>),
 }
 
 /// Formats that render to a bitmap rather than to text. Gates BOTH the preview panel and
@@ -115,7 +116,7 @@ pub fn render(path: &Path, max_px: u32, page: u32) -> Result<DocContent, String>
     let e = ext(path);
     if crate::office::handles(&e) {
         return match crate::office::render(path, &e, page) {
-            Ok(doc) => Ok(DocContent::Rich(doc)),
+            Ok(doc) => Ok(DocContent::Rich(Box::new(doc))),
             Err(why) => thumbnail(path, max_px).map_err(|_| why),
         };
     }
