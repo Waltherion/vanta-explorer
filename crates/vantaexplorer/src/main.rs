@@ -27,6 +27,7 @@ mod settings;
 mod sidebar;
 mod text;
 mod thumbs;
+mod views;
 mod vk;
 mod watch;
 
@@ -184,6 +185,15 @@ fn main() -> Result<()> {
     if chooser.is_none() {
         thumbs::clean_cache();
     }
+    // The chooser reads the folders' views and never writes them; what it remembers itself is
+    // its fallback. A first start seeds the views with what the panes show, so nothing changes.
+    let views = match &chooser {
+        Some(_) => views::Views::load(false, chooser_prefs.zoom, &[]),
+        None => {
+            let seed: Vec<_> = ws.panes.iter().map(|p| (p.tab_ref().path().to_path_buf(), p.zoom)).collect();
+            views::Views::load(true, panes::DEFAULT_ZOOM, &seed)
+        }
+    };
     let theme = browser::Theme::from_config(&cfg);
     let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
     fileops::set_keep_dates(prefs.keep_dates);
@@ -220,6 +230,7 @@ fn main() -> Result<()> {
             edit_next: false,
             close_now: false,
             refresh_preview: false,
+            views,
         },
         thumbs: std::cell::RefCell::new(thumbs::Thumbs::new()),
         dir_size: dir_size::DirSize::new(),
@@ -322,6 +333,8 @@ struct OpsState {
     close_now: bool,
     /// A file was saved or reloaded in the editor: the preview reads it again.
     refresh_preview: bool,
+    /// Each folder's view (list or grid, and its size).
+    views: views::Views,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -868,6 +881,7 @@ impl ApplicationHandler for App {
         }
         dirty |= self.thumbs.borrow_mut().poll(&gfx.egui_ctx);
 
+        self.ops_state.views.tick();
         let dark_raster = self.settings.dark_pages.applies(true, self.theme.is_dark()) && !self.preview.show_original.get();
         self.preview.set_dark_raster(dark_raster);
         if let Some(img) = self.preview.poll(&gfx.egui_ctx) {
@@ -1775,6 +1789,15 @@ fn app_ui(
             app_ops.edit_next = true;
         }
     }
+    // Each pane shows its folder's view: applied before the panes are drawn, and once more after,
+    // so a folder opened this frame never shows a frame in the last one's view.
+    let per_folder = settings.view_per == settings::ViewPer::Folder;
+    if per_folder {
+        for pane in &mut ws.panes {
+            app_ops.views.sync(pane, chooser.is_none());
+        }
+    }
+    let views_cell = std::cell::RefCell::new(std::mem::take(&mut app_ops.views));
     let editor_cell = std::cell::RefCell::new(app_ops.editor.take());
     let editor_event = std::cell::Cell::new(None);
 
@@ -1797,6 +1820,7 @@ fn app_ui(
         editor: &editor_cell,
         editor_event: &editor_event,
         edit_key,
+        views: (per_folder && chooser.is_none()).then_some(&views_cell),
     };
 
     // --- preview panel (right, window-level) ---
@@ -1824,6 +1848,12 @@ fn app_ui(
         egui::pos2(work_right, body_bottom),
     );
     browser::show_workspace(root, ws, icons, &view, work_rect);
+    if per_folder {
+        let mut views = views_cell.borrow_mut();
+        for pane in &mut ws.panes {
+            views.sync(pane, chooser.is_none());
+        }
+    }
 
     if can_show {
         let split_x = body_right - preview_w;
@@ -1856,6 +1886,7 @@ fn app_ui(
         browser::show_preview(&mut pui, active, &view);
     }
     app_ops.editor = editor_cell.into_inner();
+    app_ops.views = views_cell.into_inner();
     editor_after_frame(root.ctx(), ws, app_ops, editor_event.take(), want_preview);
 
     // --- Drag overlay ---

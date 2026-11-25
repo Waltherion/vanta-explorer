@@ -259,6 +259,9 @@ pub struct Pane {
     pub zoom: f32,
     /// Folders of the tabs closed in this pane, newest last, for Ctrl+Shift+T. Not saved.
     pub closed_tabs: Vec<PathBuf>,
+    /// The folder whose view was last applied, the zoom it was, and the views' generation then
+    /// (see `views::Views::sync`). Not saved.
+    pub view_for: Option<(PathBuf, f32, u64)>,
 }
 
 impl Pane {
@@ -271,6 +274,7 @@ impl Pane {
             col_size_w: DEFAULT_COL_SIZE_W,
             zoom: DEFAULT_ZOOM,
             closed_tabs: Vec::new(),
+            view_for: None,
         }
     }
 
@@ -713,6 +717,7 @@ pub fn load(fallback: PathBuf) -> Workspace {
                     col_size_w: sp.col_size_w.max(40.0),
                     zoom: sp.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
                     closed_tabs: Vec::new(),
+                    view_for: None,
                 }
             })
             .collect();

@@ -24,6 +24,32 @@ pub struct Settings {
     /// Document pages shown dark on a dark theme.
     #[serde(deserialize_with = "dark_pages")]
     pub dark_pages: DarkPages,
+    /// Whether list or grid and its size belong to the folder or to the pane.
+    #[serde(deserialize_with = "view_per")]
+    pub view_per: ViewPer,
+}
+
+/// What the view (list or grid, and how large) is remembered for.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum ViewPer {
+    /// Each folder keeps its own; see `views`.
+    #[default]
+    Folder,
+    /// The pane keeps one, whatever folder it shows.
+    Pane,
+}
+
+fn view_per<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ViewPer, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v.as_str() {
+        Some("folder") => ViewPer::Folder,
+        Some("pane") => ViewPer::Pane,
+        None if v.is_null() => ViewPer::Folder,
+        _ => {
+            log::warn!("settings: viewPer {v} is not \"folder\" or \"pane\"; folder");
+            ViewPer::Folder
+        }
+    })
 }
 
 /// Which previews of documents are drawn dark, with light text, when the theme is dark.
@@ -69,6 +95,7 @@ impl Default for Settings {
             keep_dates: true,
             folders_first: true,
             dark_pages: DarkPages::Off,
+            view_per: ViewPer::Folder,
         }
     }
 }

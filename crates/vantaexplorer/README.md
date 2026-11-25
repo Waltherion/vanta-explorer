@@ -60,6 +60,10 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 
 - Grid view with **ctrl+scroll zoom**, real thumbnails for images, video first frames and
   documents, through a worker pool with a disk cache.
+- **A view per folder**: list or grid, and its size, is remembered for each folder, so
+  Pictures stays a grid while the rest are lists. A folder can lend its view to its
+  subfolders or be the default for all (right-click, Folder view); `"viewPer": "pane"` keeps
+  one view per pane instead.
 - **Folder previews**: folders show up to four of their own images laid on the folder icon.
 - Decoding waits until you stop scrolling, so a flick through a folder starts no work at
   all, and finished thumbnails upload a few per frame rather than in one hitch.

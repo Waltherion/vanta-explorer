@@ -119,6 +119,36 @@ pub struct View<'a> {
     pub editor_event: &'a std::cell::Cell<Option<crate::editor::Event>>,
     /// Ctrl+E was pressed: edit the selected file.
     pub edit_key: bool,
+    /// The folders' views, when they are kept per folder and may be changed here (not in the
+    /// chooser): for the Folder view menu.
+    pub views: Option<&'a std::cell::RefCell<crate::views::Views>>,
+}
+
+/// "Folder view" in a folder's context menu: its view for its subfolders too, for every folder,
+/// or forgotten.
+fn folder_view_menu(ui: &mut egui::Ui, folder: &std::path::Path, view: &View) {
+    let Some(views) = view.views else { return };
+    if crate::fileops::in_trash(folder) {
+        return;
+    }
+    ui.menu_button("Folder view", |ui| {
+        let mut views = views.borrow_mut();
+        let own = views.own(folder);
+        let mut subfolders = own.is_some_and(|v| v.subfolders);
+        if ui.checkbox(&mut subfolders, "Use this view in subfolders").on_hover_text("Subfolders without a view of their own show this one").changed() {
+            views.set_subfolders(folder, subfolders);
+            ui.close();
+        }
+        if ui.button("Use this view as the default").on_hover_text("For every folder without a view of its own").clicked() {
+            let zoom = views.effective(folder);
+            views.set_default(zoom);
+            ui.close();
+        }
+        if own.is_some() && ui.button("Forget this folder's view").on_hover_text("Show it as its parent or the default says").clicked() {
+            views.forget(folder);
+            ui.close();
+        }
+    });
 }
 
 /// Whether an entry is listed: not hidden (unless asked for), matching what is typed, and let
@@ -1318,6 +1348,7 @@ fn entry_context_menu(
     }
 
     if entry_is_dir && single {
+        folder_view_menu(ui, &paths[0], view);
         add_to_sidebar_menu(ui, &paths[0], view);
     }
     if ui
@@ -1453,6 +1484,7 @@ fn folder_context_menu(ui: &mut egui::Ui, tab: &mut crate::panes::Tab, view: &Vi
         ui.close();
     }
     ui.separator();
+    folder_view_menu(ui, &here, view);
     add_to_sidebar_menu(ui, &here, view);
     if ui
         .button("Copy path")

@@ -91,6 +91,11 @@ pub const DEFAULT_LOCAL: &str = r##"// Vanta Explorer, this machine only: kept w
   // in them are turned as well. "off": pages as they print. "Dark pages" under the preview
   // switches it off for a look at the real thing. A light theme always shows pages as they are.
   // "darkPages": "off",
+
+  // List or grid, and its size, remembered for each folder: Pictures can stay a grid while
+  // everything else is a list. Right-click a folder, Folder view, to use its view in its
+  // subfolders too or for every folder. "pane": each pane keeps one view, whatever it shows.
+  // "viewPer": "folder",
 }
 "##;
 
