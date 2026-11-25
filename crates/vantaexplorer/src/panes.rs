@@ -68,6 +68,8 @@ pub struct Tab {
     /// Needed because the lists are virtualized: an off-screen row is never rendered, so
     /// egui's scroll_to_rect has nothing to scroll to.
     pub scroll_to: Option<usize>,
+    /// A folder was just opened: mark its first entry once it has arrived (browser::mark_first).
+    pub mark_first: bool,
 }
 
 impl Tab {
@@ -92,6 +94,7 @@ impl Tab {
             rename_armed: None,
             scroll_to: None,
             pending_reveal: None,
+            mark_first: false,
         };
         t.reload();
         t
@@ -149,6 +152,7 @@ impl Tab {
         self.select_anchor = None;
         self.path_edit = None;
         self.pending_reveal = None;
+        self.mark_first = true;
         // Latent bug: the filter used to survive navigation, so a new folder could open
         // looking half-empty for no visible reason.
         self.typeahead.clear();

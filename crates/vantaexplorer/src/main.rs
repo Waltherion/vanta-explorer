@@ -11,6 +11,7 @@ mod chooser;
 mod config;
 mod dir_size;
 mod help;
+mod palette;
 mod docs;
 mod drives;
 mod editor;
@@ -223,6 +224,9 @@ fn main() -> Result<()> {
             clipboard: None,
             open_with: None,
             properties: None,
+            palette: None,
+            palette_fire: None,
+            palette_release: None,
             pending_delete: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -314,6 +318,11 @@ struct OpsState {
     open_with: Option<OpenWithState>,
     /// The Properties window, when one is open.
     properties: Option<props::Properties>,
+    /// Ctrl+Shift+P, while it is open.
+    palette: Option<palette::Palette>,
+    /// A command chosen in the palette, pressed at the start of the next frame.
+    palette_fire: Option<palette::Fire>,
+    palette_release: Option<palette::Release>,
     /// Paths awaiting a "really delete permanently?" answer, plus which button the keyboard
     /// has selected (false = Cancel, the deliberate default).
     pending_delete: Option<(Confirm, bool)>,
@@ -1274,6 +1283,15 @@ fn draw(
 ) -> Result<Duration> {
     let mut raw_input = gfx.egui_winit.take_egui_input(&gfx.window);
     feed_incoming_drag(gfx, &mut raw_input);
+    if let Some(r) = app_ops.palette_release.take() {
+        palette::release(r, &mut raw_input);
+    }
+    if let Some(fire) = app_ops.palette_fire.take() {
+        app_ops.palette_release = palette::press(fire, &mut raw_input, &gfx.egui_ctx);
+        if app_ops.palette_release.is_some() {
+            gfx.egui_ctx.request_repaint();
+        }
+    }
     if let Some(text) = gfx.pending_paste.take() {
         raw_input.events.push(egui::Event::Paste(text));
     }
@@ -1600,7 +1618,7 @@ fn app_ui(
     // Any modal up? Computed before anything reads the keyboard, so dialogs and panes cannot
     // both act on the same keystroke.
     help::handle_key(root.ctx());
-    let modal_open = help::is_open(root.ctx())
+    let dialog_open = help::is_open(root.ctx())
         || app_ops.pending_delete.is_some()
         || app_ops.pending_conflict.is_some()
         || app_ops.pending_error.is_some()
@@ -1608,6 +1626,12 @@ fn app_ui(
         || app_ops.properties.is_some()
         || app_ops.editor_prompt.is_some()
         || chooser.as_ref().is_some_and(|c| c.replace.is_some());
+    // The command palette: not over another dialog, and not in the file chooser, which keeps
+    // only some of the commands.
+    if chooser.is_none() && !dialog_open && palette::toggle_pressed(root.ctx()) {
+        app_ops.palette = if app_ops.palette.is_some() { None } else { Some(palette::Palette::default()) };
+    }
+    let modal_open = dialog_open || app_ops.palette.is_some();
 
     // Escape says no to the program that asked, once there is nothing smaller for it to close:
     // a filter being typed, a rename, the path field or a question. Read before the pane, which
@@ -1944,6 +1968,27 @@ fn app_ui(
 
     ops_windows(root.ctx(), app_ops, theme);
     help::show(root.ctx(), theme, &settings.date_format);
+    if let Some(p) = app_ops.palette.as_mut() {
+        let state = palette::State {
+            marked: ws.active_pane().tab_ref().selection.len(),
+            clipboard: clipboard_filled_flag,
+            panes: ws.panes.len(),
+            undo: !app_ops.undo.is_empty(),
+            redo: !app_ops.redo.is_empty(),
+        };
+        let (fire, close) = palette::show(root.ctx(), p, &state);
+        if close {
+            app_ops.palette = None;
+        }
+        match fire {
+            Some(palette::Fire::Split(dir)) => ws.split(ws.active, dir),
+            Some(f) => {
+                app_ops.palette_fire = Some(f);
+                root.ctx().request_repaint();
+            }
+            None => {}
+        }
+    }
     if let Some(c) = chooser.as_mut() {
         c.show_replace(root.ctx(), theme);
     }

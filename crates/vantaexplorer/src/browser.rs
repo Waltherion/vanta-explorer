@@ -1364,7 +1364,7 @@ fn entry_context_menu(
     }
     if ui
         .button("Copy path")
-        .on_hover_text("Absolute path as text (Ctrl+Alt+C, Ctrl+Shift+P)")
+        .on_hover_text("Absolute path as text (Ctrl+Alt+C)")
         .clicked()
     {
         publish_paths(ui.ctx(), &paths);
@@ -1588,11 +1588,8 @@ fn handle_shortcuts(
         }
         (copy, cut, paste)
     });
-    // Ctrl+Shift+P: P is not a clipboard key, so egui-winit passes it through as a normal
-    // key event and there is nothing to disambiguate.
-    let copy_path = copy_path_key || ui.input(|i| {
-        i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::P)
-    });
+    // Ctrl+Shift+P is the command palette (palette.rs).
+    let copy_path = copy_path_key;
     // The Copy event the same keystroke made is not a file copy.
     let copy = copy && !copy_path_key;
     if std::env::var_os("VANTAEXPLORER_KEY_DEBUG").is_some()
@@ -1843,6 +1840,21 @@ fn rubber_band(
     true
 }
 
+/// A folder just opened has its first entry marked once all of it has arrived, so the arrows
+/// and Enter work at once. Not over a folder to reveal (Left marks the one just left), not
+/// once something is marked by hand, and not when the chooser saves: marking a file there
+/// takes its name.
+fn mark_first(tab: &mut crate::panes::Tab, visible: &[usize], view: &View) {
+    if !tab.mark_first || tab.rx.is_some() {
+        return;
+    }
+    tab.mark_first = false;
+    let saving = view.chooser.is_some_and(|c| c.request.mode == crate::chooser::Mode::Save);
+    if tab.pending_reveal.is_none() && tab.selection.is_empty() && !saving {
+        select_index(tab, visible, 0);
+    }
+}
+
 fn select_index(tab: &mut crate::panes::Tab, visible: &[usize], vi: usize) {
     let Some(name) = visible
         .get(vi)
@@ -2044,9 +2056,10 @@ fn show_rows_view(
             tab.pending_reveal = None;
         }
     }
+    mark_first(tab, &visible, view);
     let current_vi = keyboard_position(tab, &visible);
     let page = (ui.available_height() / row_h).floor().max(1.0) as usize;
-    if let Some((vi, shift)) = keyboard_nav(ui, is_active, visible.len(), current_vi, 1, page) {
+    if let Some((vi, shift)) = keyboard_nav(ui, is_active && !view.modal_open, visible.len(), current_vi, 1, page) {
         if shift {
             select_range_to(tab, &visible, vi);
         } else {
@@ -2057,7 +2070,7 @@ fn show_rows_view(
     // In the list Left and Right walk the tree, as in yazi: Right into the marked folder, Left
     // up to the parent with the folder left marked. A file is never opened by an arrow, only by
     // Enter. (The grid's arrows move the selection sideways instead.)
-    if is_active && !ui.ctx().text_edit_focused() {
+    if is_active && !ui.ctx().text_edit_focused() && !view.modal_open {
         let (left, right) = ui.input(|i| (i.modifiers.is_none() && i.key_pressed(egui::Key::ArrowLeft), i.modifiers.is_none() && i.key_pressed(egui::Key::ArrowRight)));
         if right {
             if let Some(entry) = current_vi.and_then(|vi| visible.get(vi)).and_then(|&ei| tab.listing.entries.get(ei)).filter(|e| e.is_dir) {
@@ -2537,9 +2550,10 @@ fn show_grid(
             tab.pending_reveal = None;
         }
     }
+    mark_first(tab, &visible, view);
     let current_vi = keyboard_position(tab, &visible);
     let page = (ui.available_height() / cell_h).floor().max(1.0) as usize;
-    if let Some((vi, shift)) = keyboard_nav(ui, is_active, visible.len(), current_vi, cols, page) {
+    if let Some((vi, shift)) = keyboard_nav(ui, is_active && !view.modal_open, visible.len(), current_vi, cols, page) {
         if shift {
             select_range_to(tab, &visible, vi);
         } else {

@@ -30,7 +30,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
         "Files",
         &[
             ("Ctrl+C, Ctrl+X, Ctrl+V", "Copy, cut, paste (also between windows)"),
-            ("Ctrl+Alt+C, Ctrl+Shift+P", "Copy the path as text"),
+            ("Ctrl+Alt+C", "Copy the path as text"),
             ("Ctrl+A", "Select all"),
             ("F2", "Rename"),
             ("Ctrl+Shift+N", "New folder"),
@@ -63,7 +63,10 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("F3, Shift+F3", "Split side by side, one above the other; again: close the pane"),
         ],
     ),
-    ("Other", &[("F4", "Terminal in this folder"), ("F1", "This window")]),
+    (
+        "Other",
+        &[("Ctrl+Shift+P", "Command palette: every command by name"), ("F4", "Terminal in this folder"), ("F1", "This window")],
+    ),
 ];
 
 const OPEN: &str = "help-open";
@@ -124,5 +127,17 @@ pub fn show(ctx: &egui::Context, theme: &crate::browser::Theme, date_format: &st
     });
     if resp.should_close() {
         ctx.data_mut(|d| d.insert_temp(egui::Id::new(OPEN), false));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every command in the palette is in this window, under the key the palette shows.
+    #[test]
+    fn palette_keys_are_listed() {
+        for c in crate::palette::COMMANDS {
+            let listed = super::GROUPS.iter().flat_map(|(_, rows)| rows.iter()).any(|(keys, _)| keys.split(", ").any(|k| k == c.keys));
+            assert!(listed, "{} ({}) is not in F1", c.label, c.keys);
+        }
     }
 }
