@@ -418,7 +418,7 @@ impl State {
                     decision = Some(false);
                 }
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("←/→ choose · Enter confirm · Esc cancel").small().color(theme.text.gamma_multiply(0.5)));
+                ui.label(egui::RichText::new("Left, Right choose · Enter confirm · Esc cancel").small().color(theme.text.gamma_multiply(0.5)));
             });
         });
         match decision {

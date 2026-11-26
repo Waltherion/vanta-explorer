@@ -2541,7 +2541,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 }
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("←/→ choose · Enter confirm · Esc cancel")
+                    egui::RichText::new("Left, Right choose · Enter confirm · Esc cancel")
                         .small()
                         .color(theme.text.gamma_multiply(0.5)),
                 );
