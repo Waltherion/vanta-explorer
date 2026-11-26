@@ -325,6 +325,8 @@ pub fn show(ctx: &egui::Context, palette: &mut Palette, state: &State) -> (Optio
                 .desired_width(f32::INFINITY),
         );
         edit.request_focus();
+        // New contents, not the keys, moved the marking: it is put in place, not glided.
+        let mut snap = edit.changed();
         if edit.changed() {
             palette.cursor = 0;
         }
@@ -357,6 +359,7 @@ pub fn show(ctx: &egui::Context, palette: &mut Palette, state: &State) -> (Optio
             if let Some(Row { pick: Pick::Go(p), .. }) = rows.get(palette.cursor) {
                 palette.query = format!("{}/", contract(p).trim_end_matches('/'));
                 palette.cursor = 0;
+                snap = true;
                 let end = egui::text::CCursor::new(palette.query.chars().count());
                 if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
                     st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
@@ -370,6 +373,7 @@ pub fn show(ctx: &egui::Context, palette: &mut Palette, state: &State) -> (Optio
         let text = ui.visuals().strong_text_color();
         let font = egui::TextStyle::Body.resolve(ui.style());
         egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+            let mut glider = crate::browser::Glider::begin(ui);
             if rows.is_empty() {
                 let none = if folders { "No folder by that name" } else { "No command by that name" };
                 ui.label(egui::RichText::new(none).color(text.gamma_multiply(0.5)));
@@ -377,11 +381,13 @@ pub fn show(ctx: &egui::Context, palette: &mut Palette, state: &State) -> (Optio
             for (i, row) in rows.iter().enumerate() {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), if row.ok { egui::Sense::click() } else { egui::Sense::hover() });
                 if row.ok && resp.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                    // The mouse moves it: straight there, as the pointer is already.
+                    snap |= palette.cursor != i;
                     palette.cursor = i;
                 }
                 let current = row.ok && i == palette.cursor;
                 if current {
-                    ui.painter().rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+                    glider.chosen(rect);
                     if moved {
                         ui.scroll_to_rect(rect, None);
                     }
@@ -395,6 +401,8 @@ pub fn show(ctx: &egui::Context, palette: &mut Palette, state: &State) -> (Optio
                     pick = Some(row.pick.clone());
                 }
             }
+            let fill = ui.visuals().selection.bg_fill;
+            glider.finish(ui, egui::Id::new("palette-glide"), crate::browser::animations(ui.ctx()), snap, 4.0, fill);
         });
         if enter {
             pick = rows.get(palette.cursor).filter(|r| r.ok).map(|r| r.pick.clone());

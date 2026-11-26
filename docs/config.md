@@ -666,8 +666,9 @@ read a Microsoft calendar.
 
   // Motion that shows where you went: into a folder its list slides in from the right and
   // pushes the old one out to the left, out of it the other way; a jump somewhere else fades
-  // over. Quick, and never in the way: the new folder takes clicks and keys from the first
-  // frame. false: no motion.
+  // over. The marking moved by the keys glides to its new place, in the list, the sidebar,
+  // menus, the palette and dialogs. Quick, and never in the way: what you move to takes clicks
+  // and keys from the first frame. false: no motion.
   // "animations": true,
 }
 ```

@@ -79,11 +79,62 @@ struct KeyMenu {
     path: Vec<usize>,
     /// A submenu was just opened from the keys: step into it once it shows.
     opening: bool,
+    /// The keys have taken it over. One opened by a right-click is the pointer's until an
+    /// arrow, Home or End is pressed; that press marks its first item.
+    woke: bool,
+}
+
+/// The places held under each level of a menu the keys are steering, for the marking that
+/// glides there (`menu_level`).
+const MENU_SLOTS: &str = "vx-menu-slots";
+
+/// The menu state behind each menu level's layer (`menu_level`).
+const MENU_ROOTS: &str = "vx-menu-roots";
+
+/// Closes the submenu open from the menu level on `layer`.
+fn close_submenu_of(ctx: &egui::Context, layer: egui::LayerId) {
+    let root = ctx.data(|d| d.get_temp::<Vec<(egui::LayerId, egui::Id)>>(egui::Id::new(MENU_ROOTS))).and_then(|r| r.iter().find(|(l, _)| *l == layer).map(|(_, id)| *id));
+    if let Some(root) = root {
+        egui::containers::menu::MenuState::from_id(ctx, root, |s| s.open_item = None);
+    }
+}
+
+/// A level's layer, the place held in it, and whether this frame is egui's sizing pass for
+/// it: laid out unseen at full width, its items as wide as the screen.
+type MenuSlot = (egui::LayerId, egui::layers::ShapeIdx, bool);
+
+/// A level of a menu, before its items: while the keys steer it, egui's own fill on the item
+/// with the focus is turned off and a place held under the items for the marking that glides
+/// from item to item instead (`context_popup`).
+fn menu_level(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    // Which menu state this level is, for the keys to close the submenu open from it.
+    let root = egui::containers::menu::find_menu_root(ui).id;
+    let layer = ui.layer_id();
+    ctx.data_mut(|d| {
+        let roots = d.get_temp_mut_or_default::<Vec<(egui::LayerId, egui::Id)>>(egui::Id::new(MENU_ROOTS));
+        roots.retain(|(l, _)| *l != layer);
+        roots.push((layer, root));
+        if roots.len() > 32 {
+            roots.remove(0);
+        }
+    });
+    let Some(slots) = ctx.data(|d| d.get_temp::<Vec<MenuSlot>>(egui::Id::new(MENU_SLOTS))) else { return };
+    let active = &mut ui.visuals_mut().widgets.active;
+    active.weak_bg_fill = egui::Color32::TRANSPARENT;
+    active.bg_fill = egui::Color32::TRANSPARENT;
+    let slot = ui.painter().add(egui::Shape::Noop);
+    let mut slots = slots;
+    slots.push((ui.layer_id(), slot, ui.is_sizing_pass()));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(MENU_SLOTS), slots));
 }
 
 /// `ui.menu_button` in a menu, noted as a submenu for the keys.
 fn submenu<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<Option<R>> {
-    let r = ui.menu_button(label, add);
+    let r = ui.menu_button(label, |ui| {
+        menu_level(ui);
+        add(ui)
+    });
     let id = r.response.id;
     ui.ctx().data_mut(|d| {
         let ids = d.get_temp_mut_or_default::<Vec<egui::Id>>(egui::Id::new(SUBMENUS));
@@ -102,6 +153,14 @@ fn menu_items(ctx: &egui::Context, layer: egui::LayerId) -> Vec<(egui::Id, egui:
     let mut items: Vec<(egui::Id, egui::Rect)> = ctx.viewport(|v| {
         v.prev_pass.widgets.get_layer(layer).filter(|w| w.enabled && w.sense.senses_click()).map(|w| (w.id, w.rect)).collect()
     });
+    // The menu's own area senses clicks too, over all of it; it is no item, and as the topmost
+    // it took the first press of Down.
+    // So does a widget over the whole of it, the only one there in the frame it first shows.
+    let all = items.clone();
+    let area = ctx.memory(|m| m.area_rect(layer.id));
+    items.retain(|(id, r)| {
+        *id != layer.id && !all.iter().any(|(o, q)| o != id && r.contains_rect(*q)) && area.map(|a| a.shrink(2.0)).filter(|a| a.is_positive()).is_none_or(|a| !r.contains_rect(a))
+    });
     items.sort_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y));
     items.dedup_by_key(|i| i.0);
     items
@@ -110,7 +169,8 @@ fn menu_items(ctx: &egui::Context, layer: egui::LayerId) -> Vec<(egui::Id, egui:
 /// The layer of the submenu `item` opens, while it is open.
 fn submenu_layer(ctx: &egui::Context, item: egui::Id) -> Option<egui::LayerId> {
     let id = item.with("submenu");
-    ctx.viewport(|v| v.prev_pass.widgets.layer_ids().find(|l| l.id == id))
+    // A closed one keeps its layer, with nothing on it.
+    ctx.viewport(|v| v.prev_pass.widgets.layer_ids().find(|l| l.id == id && v.prev_pass.widgets.get_layer(*l).next().is_some()))
 }
 
 /// Presses Enter for the widget with the focus: how a submenu opens or closes from the keys.
@@ -124,7 +184,7 @@ fn press_enter(ctx: &egui::Context) {
 /// ring. egui's own arrow focus is turned off here: it goes to whatever lies nearest that
 /// way, outside the menu as readily as in it.
 fn steer_menu(ctx: &egui::Context, root: egui::LayerId, k: &mut KeyMenu) {
-    let (up, down, home, end, right, left, enter) = ctx.input(|i| {
+    let (mut up, mut down, mut home, mut end, mut right, left, enter) = ctx.input(|i| {
         let plain = i.modifiers.is_none();
         (
             plain && i.key_pressed(egui::Key::ArrowUp),
@@ -137,6 +197,21 @@ fn steer_menu(ctx: &egui::Context, root: egui::LayerId, k: &mut KeyMenu) {
         )
     });
     ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+    if up || down || home || end || right || left {
+        // The keys have the menu: the pointer resting on it is forgotten until it moves.
+        // Where it rests, egui closes a submenu the keys opened, the pointer being over
+        // another item, and opens the one under it.
+        ctx.input_mut(|i| i.pointer = Default::default());
+    }
+    if !k.woke {
+        if !(up || down || home || end || right) {
+            return;
+        }
+        // Taken over: the first item marked, and this press spent on that.
+        k.woke = true;
+        k.path = vec![0];
+        (up, down, home, end, right) = (false, false, false, false, false);
+    }
     // The open levels, as far as the path goes and they are still open.
     let mut levels = vec![(root, menu_items(ctx, root))];
     for depth in 0..k.path.len().saturating_sub(1) {
@@ -189,11 +264,13 @@ fn steer_menu(ctx: &egui::Context, root: egui::LayerId, k: &mut KeyMenu) {
     };
     let Some((_, item, _)) = current(&levels, &k.path) else { return };
     if left && d > 0 {
-        // Out: the submenu's own item again, pressed to close it.
+        // Out: the submenu closed, back on its own item. Closed directly: pressing Enter on
+        // the item, as opening does, came before the focus had moved there, and went to the
+        // submenu's item instead.
         k.path.pop();
-        if let Some((_, parent, _)) = current(&levels, &k.path) {
+        if let Some((parent_layer, parent, _)) = current(&levels, &k.path) {
+            close_submenu_of(ctx, parent_layer);
             ctx.memory_mut(|m| m.request_focus(parent));
-            press_enter(ctx);
         }
         return;
     }
@@ -257,15 +334,15 @@ pub(crate) fn context_popup(resp: &egui::Response, open: Option<egui::SetOpenCom
     let id = egui::Popup::default_response_id(resp);
     let mut open = open;
     if let Some(at) = key_at {
-        ctx.data_mut(|d| d.insert_temp(key, KeyMenu { popup: id, at, layer: None, path: vec![0], opening: false }));
+        ctx.data_mut(|d| d.insert_temp(key, KeyMenu { popup: id, at, layer: None, path: vec![0], opening: false, woke: true }));
         open = Some(egui::SetOpenCommand::Bool(true));
+    } else if resp.secondary_clicked() {
+        // Opened at the pointer, for the pointer, until the keys take it over.
+        if let Some(at) = resp.interact_pointer_pos() {
+            ctx.data_mut(|d| d.insert_temp(key, KeyMenu { popup: id, at, layer: None, path: vec![0], opening: false, woke: false }));
+        }
     }
     let mut from_key = ctx.data(|d| d.get_temp::<KeyMenu>(key)).filter(|k| k.popup == id);
-    // A right-click on it opens it at the pointer again, for the pointer.
-    if from_key.is_some() && resp.secondary_clicked() {
-        ctx.data_mut(|d| d.remove::<KeyMenu>(key));
-        from_key = None;
-    }
     if let Some(k) = from_key.as_mut() {
         if let Some(root) = k.layer {
             steer_menu(&ctx, root, k);
@@ -275,16 +352,42 @@ pub(crate) fn context_popup(resp: &egui::Response, open: Option<egui::SetOpenCom
     if let Some(k) = &from_key {
         popup = popup.at_position(k.at);
     }
-    let shown = popup.show(content);
+    // Steered by the keys: each level holds a place for the marking (`menu_level`).
+    let slots_id = egui::Id::new(MENU_SLOTS);
+    let steered = from_key.as_ref().is_some_and(|k| k.woke);
+    if steered {
+        ctx.data_mut(|d| d.insert_temp(slots_id, Vec::<(egui::LayerId, egui::layers::ShapeIdx)>::new()));
+    }
+    // egui's fill for the item with the focus, before `menu_level` turns it off.
+    let mark = ctx.global_style().visuals.widgets.active;
+    let shown = popup.show(|ui| {
+        menu_level(ui);
+        content(ui)
+    });
+    let slots = ctx.data_mut(|d| d.remove_temp::<Vec<MenuSlot>>(slots_id)).unwrap_or_default();
     match (from_key, shown) {
         (Some(mut k), Some(inner)) => {
             k.layer = Some(inner.response.layer_id);
-            // The ring around the item the keys are on, drawn over its own layer.
-            let focused = ctx.memory(|m| m.focused());
-            let ring = focused.and_then(|f| ctx.viewport(|v| v.prev_pass.widgets.get(f).map(|w| (w.layer_id, w.rect))));
+            // The marking on the item the keys are on: filled under it, ringed over it, gliding
+            // from the item it was on. Into or out of a submenu it appears in place, each level
+            // being its own layer.
+            let focused = ctx.memory(|m| m.focused()).filter(|_| k.woke);
+            // Where the item stands this frame. Not while its level is being sized: drawn then,
+            // the marking was as wide as the screen for a frame and glided in to the menu's width.
+            let ring = focused.and_then(|f| ctx.viewport(|v| v.this_pass.widgets.get(f).map(|w| (w.layer_id, w.rect))));
+            let level = ring.and_then(|(layer, _)| slots.iter().find(|s| s.0 == layer).copied());
+            let ring = ring.filter(|_| level.is_none_or(|s| !s.2));
+            // Only on an item: until the items are known the focus can be on the menu's own
+            // area, and the marking covered all of it for a frame before gliding in to the item.
+            let ring = ring.filter(|(layer, _)| focused.is_some_and(|f| menu_items(&ctx, *layer).iter().any(|(id, _)| *id == f)));
             if let Some((layer, rect)) = ring {
+                let at = glide_rect(&ctx, egui::Id::new(("menu-glide", layer.id)), rect, animations(&ctx));
+                let painter = ctx.layer_painter(layer);
+                if let Some((_, slot, _)) = level {
+                    painter.set(slot, egui::Shape::rect_filled(at.expand(mark.expansion), mark.corner_radius, mark.weak_bg_fill));
+                }
                 let color = ctx.global_style().visuals.selection.stroke.color;
-                ctx.layer_painter(layer).rect_stroke(rect, 3.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+                painter.rect_stroke(at, 3.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
             }
             ctx.data_mut(|d| d.insert_temp(key, k));
         }
@@ -382,17 +485,28 @@ pub fn dialog_owns_keys(ctx: &egui::Context) {
     }
 }
 
-/// A button in a question's row. Every one is the same size, the chosen one filled and ringed
-/// with the ring drawn over it, outside the layout: a thicker border made the chosen one grow
-/// and the row shift each time the choice moved.
-pub fn choice_button(ui: &mut egui::Ui, theme: &Theme, text: egui::RichText, chosen: bool) -> egui::Response {
-    let btn = egui::Button::new(text).stroke(egui::Stroke::new(1.0, if chosen { theme.accent } else { theme.text.gamma_multiply(0.3) }));
-    let btn = if chosen { btn.fill(theme.accent.gamma_multiply(0.35)) } else { btn };
+/// A button in a question's row. Every one is the same size and drawn the same; the marking
+/// on the chosen one is the glider's (`choice_marking`), so it glides from button to button. A
+/// thicker border on the chosen one made it grow and the row shift each time the choice moved.
+pub fn choice_button(ui: &mut egui::Ui, glider: &mut Glider, theme: &Theme, text: egui::RichText, chosen: bool) -> egui::Response {
+    let btn = egui::Button::new(text).fill(egui::Color32::TRANSPARENT).stroke(egui::Stroke::new(1.0, theme.text.gamma_multiply(0.3)));
     let r = ui.add(btn);
+    glider.button(ui, &r);
     if chosen {
-        ui.painter().rect_stroke(r.rect.expand(1.0), 4.0, egui::Stroke::new(1.0, theme.accent), egui::StrokeKind::Outside);
+        glider.chosen(r.rect);
     }
     r
+}
+
+/// Paints a question's marking where it has got to: filled under the chosen button, its border
+/// and a ring around it over it, the ring outside the layout.
+pub fn choice_marking(ui: &egui::Ui, glider: Glider, id: &str, theme: &Theme, enabled: bool) {
+    let radius = ui.visuals().widgets.inactive.corner_radius.nw as f32;
+    if let Some(r) = glider.finish(ui, egui::Id::new(("choice-glide", id)), enabled, false, radius, theme.accent.gamma_multiply(0.35)) {
+        let accent = egui::Stroke::new(1.0, theme.accent);
+        ui.painter().rect_stroke(r, radius, accent, egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(r.expand(1.0), 4.0, accent, egui::StrokeKind::Outside);
+    }
 }
 
 pub const DROP_TARGET: &str = "dnd-target";
@@ -1555,6 +1669,164 @@ mod motion_tests {
     }
 }
 
+/// How long a marking takes to glide to its new place: quick enough that a held arrow key
+/// never leaves it trailing far behind.
+const GLIDE: std::time::Duration = std::time::Duration::from_millis(90);
+
+/// How far along a glide begun at `t0` is, eased out like the folder slide; 1 once arrived.
+fn glide_progress(t0: std::time::Instant) -> f32 {
+    let p = (t0.elapsed().as_secs_f32() / GLIDE.as_secs_f32()).min(1.0);
+    1.0 - (1.0 - p).powi(3)
+}
+
+/// The marking in a pane on its way between entries.
+#[derive(Clone)]
+struct Glide {
+    /// The tab, folder and entry it was last on, and that entry's place (column, row).
+    on: (usize, PathBuf, String, egui::Vec2),
+    /// The place it set out from, and when; `None` once it has arrived.
+    moving: Option<(egui::Vec2, std::time::Instant)>,
+}
+
+impl Glide {
+    /// Where its fill stands now.
+    fn shown(&self) -> egui::Vec2 {
+        match self.moving {
+            Some((from, t0)) => from + (self.on.3 - from) * glide_progress(t0),
+            None => self.on.3,
+        }
+    }
+}
+
+/// Where a pane's marking stands this frame, in cells (column, row) of a layout `cols` wide,
+/// and the entry it is heading for: `None` when it is standing still and the entries paint it
+/// themselves. Only a single marked entry glides, and only when the marking moved to another
+/// entry in the same folder; a new sort, filter or width moves the entry under it, which is not
+/// the marking moving.
+fn glide_entry(ctx: &egui::Context, pane_idx: usize, tab_idx: usize, tab: &crate::panes::Tab, visible: &[usize], cols: usize, enabled: bool) -> Option<(egui::Vec2, usize)> {
+    let id = egui::Id::new(("entry-glide", pane_idx));
+    let prev: Option<Glide> = ctx.data(|d| d.get_temp(id));
+    let one = (tab.selection.len() == 1).then(|| tab.selection.iter().next()).flatten();
+    let vi = one.and_then(|name| visible.iter().position(|&ei| tab.listing.entries.get(ei).is_some_and(|e| &e.name == name)));
+    let (Some(name), Some(vi), true) = (one, vi, enabled) else {
+        ctx.data_mut(|d| d.remove::<Glide>(id));
+        return None;
+    };
+    let cols = cols.max(1);
+    let place = egui::vec2((vi % cols) as f32, (vi / cols) as f32);
+    let on = (tab_idx, tab.path().to_path_buf(), name.clone(), place);
+    let mut g = match prev {
+        // From wherever it stood last frame, so a new target halfway never jumps.
+        Some(g) if g.on.0 == on.0 && g.on.1 == on.1 && g.on.2 != on.2 => Glide { moving: Some((g.shown(), std::time::Instant::now())), on },
+        Some(g) if g.on == on => g,
+        _ => Glide { on, moving: None },
+    };
+    let mut out = None;
+    if let Some((_, t0)) = g.moving {
+        if t0.elapsed() >= GLIDE {
+            g.moving = None;
+        } else {
+            out = Some((g.shown(), vi));
+            ctx.request_repaint();
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(id, g));
+    out
+}
+
+/// Whether there is motion this frame (`Settings::animations`), for the parts drawn far from
+/// the settings: put there by `app_ui` every frame.
+pub const ANIMATIONS: &str = "vx-animations";
+
+/// Whether there is motion (`ANIMATIONS`).
+pub fn animations(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(ANIMATIONS))).unwrap_or(true)
+}
+
+/// What `glide_rect` keeps: the target, where it set out from and when, and the pass it was
+/// last drawn in.
+type GlideState = (egui::Rect, Option<(egui::Rect, std::time::Instant)>, u64);
+
+/// A marking that is not tied to a list's cells (the sidebar's, the palette's, a question's
+/// buttons), gliding to `to`. `to` is relative to what it scrolls with, so scrolling never
+/// sets it moving. Returns where to draw it this frame. One not drawn the pass before (a
+/// dialog or palette just opened) appears in place.
+pub(crate) fn glide_rect(ctx: &egui::Context, id: egui::Id, to: egui::Rect, enabled: bool) -> egui::Rect {
+    let pass = ctx.cumulative_pass_nr();
+    let shown = |g: &GlideState| match g.1 {
+        Some((from, t0)) => from.lerp_towards(&g.0, glide_progress(t0)),
+        None => g.0,
+    };
+    let mut g: GlideState = match ctx.data(|d| d.get_temp::<GlideState>(id)) {
+        Some(g) if enabled && g.2 + 1 >= pass && g.0 != to => (to, Some((shown(&g), std::time::Instant::now())), pass),
+        Some(g) if enabled && g.2 + 1 >= pass => (g.0, g.1, pass),
+        _ => (to, None, pass),
+    };
+    if g.1.is_some_and(|(_, t0)| t0.elapsed() >= GLIDE) {
+        g.1 = None;
+    }
+    let at = shown(&g);
+    if g.1.is_some() {
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|d| d.insert_temp(id, g));
+    at
+}
+
+/// Forgets a `glide_rect` marking, so it appears where it next is instead of gliding there.
+pub(crate) fn glide_forget(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.remove::<GlideState>(id));
+}
+
+/// A row or column of choices whose marking glides between them (`glide_rect`). Begun before
+/// the choices are added, it holds a place under them for the marking; the choices are framed
+/// buttons with no fill of their own, their usual one painted in that place too, as the marking
+/// must lie over it and under their text.
+pub(crate) struct Glider {
+    slot: egui::layers::ShapeIdx,
+    origin: egui::Vec2,
+    under: Vec<egui::Shape>,
+    chosen: Option<egui::Rect>,
+}
+
+impl Glider {
+    pub(crate) fn begin(ui: &egui::Ui) -> Self {
+        Glider { slot: ui.painter().add(egui::Shape::Noop), origin: ui.min_rect().min.to_vec2(), under: Vec::new(), chosen: None }
+    }
+
+    /// A button added with `.fill(TRANSPARENT)`: its usual fill, hovered or not, goes under it.
+    pub(crate) fn button(&mut self, ui: &egui::Ui, r: &egui::Response) {
+        let v = ui.style().interact(r);
+        self.under.push(egui::Shape::rect_filled(r.rect, v.corner_radius, v.weak_bg_fill));
+    }
+
+    /// Where the marking belongs.
+    pub(crate) fn chosen(&mut self, rect: egui::Rect) {
+        self.chosen = Some(rect);
+    }
+
+    /// Paints the marking where it has got to: `fill` under the choices, `ring` (if any) over
+    /// them. `snap` puts it in place at once, for a marking moved by the mouse or by new
+    /// contents rather than by the keys. Returns where it was drawn.
+    pub(crate) fn finish(mut self, ui: &egui::Ui, id: egui::Id, enabled: bool, snap: bool, radius: f32, fill: egui::Color32) -> Option<egui::Rect> {
+        if snap {
+            glide_forget(ui.ctx(), id);
+        }
+        let at = match self.chosen {
+            Some(r) => Some(glide_rect(ui.ctx(), id, r.translate(-self.origin), enabled).translate(self.origin)),
+            None => {
+                glide_forget(ui.ctx(), id);
+                None
+            }
+        };
+        if let Some(r) = at {
+            self.under.push(egui::Shape::rect_filled(r, radius, fill));
+        }
+        ui.painter().set(self.slot, egui::Shape::Vec(self.under));
+        at
+    }
+}
+
 /// Arrow-key browsing on the active pane. `columns` is 1 for the list, the cell count per row
 /// for the grid. Returns the visible-index to move to, if any, and whether Shift was held (the
 /// range from the anchor grows or shrinks to it instead of the selection moving).
@@ -2627,7 +2899,12 @@ fn show_rows_view(
             (vi as f32 * stride - viewport_h * 0.5 + row_h * 0.5).clamp(0.0, max_scroll);
         area = area.vertical_scroll_offset(target);
     }
+    // The marking glides to its new row instead of jumping there (`glide_row`).
+    let glide_at = glide_entry(ui.ctx(), pane_idx, tab_idx, tab, &visible, 1, settings.animations);
     let scroll_out = area.show_rows(ui, row_h, visible.len(), |ui, range| {
+            // Held for the gliding marking: painted under the rows once their places are known.
+            let glide_slot = ui.painter().add(egui::Shape::Noop);
+            let mut glide_rows = None;
             // A row senses DRAG only across its Name column. Beyond that, the Size and
             // Modified columns, it senses click alone, so egui hands the drag to the
             // background instead and a rubber band can start there. Without this a folder
@@ -2668,7 +2945,12 @@ fn show_rows_view(
                 // drag-and-drop targets. The drop below reads this same binding, so what is
                 // highlighted and what receives the drop cannot disagree.
                 let hovered = resp.contains_pointer();
-                let bg = match (selected, hovered) {
+                let gliding = glide_at.is_some_and(|(_, to)| to == vi);
+                if glide_at.is_some() && glide_rows.is_none() {
+                    let stride = row_h + ui.spacing().item_spacing.y;
+                    glide_rows = Some((rect.x_range(), rect.min.y - vi as f32 * stride, stride));
+                }
+                let bg = match (selected && !gliding, hovered) {
                     (true, true) => Some(theme.accent.gamma_multiply(0.42)),
                     (true, false) => Some(theme.accent.gamma_multiply(0.30)),
                     (false, true) => Some(theme.accent.gamma_multiply(0.18)),
@@ -2861,6 +3143,11 @@ fn show_rows_view(
                         tab.select_anchor = Some(entry_name.clone());
                     }
                 }
+            }
+            if let (Some((at, _)), Some((x, y0, stride))) = (glide_at, glide_rows) {
+                let y = y0 + at.y * stride;
+                let r = egui::Rect::from_x_y_ranges(x, y..=y + row_h);
+                ui.painter().set(glide_slot, egui::Shape::rect_filled(r, 2.0, theme.accent.gamma_multiply(0.30)));
             }
         });
 
@@ -3093,7 +3380,13 @@ fn show_grid(
             (row * stride - viewport_h * 0.5 + cell_h * 0.5).clamp(0.0, max_scroll);
         area = area.vertical_scroll_offset(target);
     }
+    // The marking glides to its new cell, as in the list.
+    let glide_at = glide_entry(ui.ctx(), pane_idx, tab_idx, tab, &visible, cols, view.settings.animations);
     let scroll_out = area.show_rows(ui, cell_h, rows, |ui, range| {
+            let glide_slot = ui.painter().add(egui::Shape::Noop);
+            // Where cell (0, 0) would stand, and how far apart cells are.
+            let mut glide_cells: Option<(egui::Pos2, egui::Vec2)> = None;
+            let first_row = range.start;
             for row in range {
                 ui.horizontal(|ui| {
                     for col in 0..cols {
@@ -3104,7 +3397,13 @@ fn show_grid(
 
                         let (rect, resp) = ui
                             .allocate_exact_size(egui::vec2(cell_w, cell_h), egui::Sense::click_and_drag());
-                        let bg = match (selected, resp.hovered()) {
+                        let gliding = glide_at.is_some_and(|(_, to)| to == row * cols + col);
+                        if glide_at.is_some() && glide_cells.is_none() && row == first_row && col == 0 {
+                            let gap = ui.spacing().item_spacing;
+                            let stride = egui::vec2(cell_w + gap.x, cell_h + gap.y);
+                            glide_cells = Some((rect.min - egui::vec2(0.0, row as f32 * stride.y), stride));
+                        }
+                        let bg = match (selected && !gliding, resp.hovered()) {
                             (true, true) => Some(theme.accent.gamma_multiply(0.42)),
                             (true, false) => Some(theme.accent.gamma_multiply(0.30)),
                             (false, true) => Some(theme.accent.gamma_multiply(0.18)),
@@ -3322,6 +3621,10 @@ fn show_grid(
                         }
                     }
                 });
+            }
+            if let (Some((at, _)), Some((origin, stride))) = (glide_at, glide_cells) {
+                let r = egui::Rect::from_min_size(origin + at * stride, egui::vec2(cell_w, cell_h));
+                ui.painter().set(glide_slot, egui::Shape::rect_filled(r, 3.0, theme.accent.gamma_multiply(0.30)));
             }
         });
 
@@ -3837,5 +4140,116 @@ mod tests {
         let c = Cols::new(rect(600.0), 420.0, 40.0, need);
         assert!(c.show_size && c.show_modified);
         assert!(c.size_w >= need.size && c.modified_w >= need.modified);
+    }
+}
+
+#[cfg(test)]
+mod menu_marking_tests {
+    /// A menu opened from the keys (F10) is marked on its first item from the first frame the
+    /// marking shows: never over the whole menu, which its own area and a widget over all of
+    /// it are, until the items are known.
+    #[test]
+    fn the_keys_marking_starts_on_the_first_item() {
+        let ctx = egui::Context::default();
+        let ring = ctx.global_style().visuals.selection.stroke.color;
+        let mut first = None;
+        for frame in 0..6 {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), ..Default::default() }, |ui| {
+                let resp = ui.button("target");
+                super::context_popup(&resp, None, (frame == 0).then_some(egui::pos2(100.0, 100.0)), |ui| {
+                    for t in ["Open", "Copy", "Cut", "Rename", "Properties"] {
+                        let _ = ui.button(t);
+                    }
+                    first = ctx_first_item(ui);
+                });
+            });
+            for c in &out.shapes {
+                if let egui::Shape::Rect(r) = &c.shape {
+                    if r.stroke.color == ring && r.stroke.width == 1.5 {
+                        assert!(r.rect.height() < 30.0, "frame {frame}: marking over {:?}", r.rect);
+                        assert_eq!(Some(r.rect.min.y), first.map(|f: egui::Rect| f.min.y), "frame {frame}");
+                    }
+                }
+            }
+            out.textures_delta.clear();
+        }
+    }
+
+    /// The first item's place, as the menu's ui has it after the items.
+    fn ctx_first_item(ui: &egui::Ui) -> Option<egui::Rect> {
+        let layer = ui.layer_id();
+        ui.ctx().viewport(|v| v.this_pass.widgets.get_layer(layer).filter(|w| w.rect.height() < 30.0).map(|w| w.rect).min_by(|a, b| a.min.y.total_cmp(&b.min.y)))
+    }
+}
+
+#[cfg(test)]
+mod submenu_key_tests {
+    fn tap(k: egui::Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE },
+        ]
+    }
+
+    /// Steers a menu with a submenu from the keys, opened by F10 or by a right-click with the
+    /// pointer left resting on another item, checking after each key where the keys are and
+    /// whether the submenu is open.
+    fn steer(mouse: bool) {
+        let ctx = egui::Context::default();
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0)));
+        let target = std::cell::Cell::new(egui::Rect::NOTHING);
+        let frame = |events: Vec<egui::Event>, key_at: Option<egui::Pos2>| {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, events, ..Default::default() }, |ui| {
+                let resp = ui.add(egui::Button::new("target").sense(egui::Sense::click()));
+                target.set(resp.rect);
+                super::context_popup(&resp, super::right_click_opens(&resp), key_at, |ui| {
+                    let _ = ui.button("Open");
+                    super::submenu(ui, "Open with", |ui| {
+                        let _ = ui.button("App A");
+                        let _ = ui.button("App B");
+                    });
+                    let _ = ui.button("Copy");
+                    let _ = ui.button("Rename");
+                });
+            });
+            out.textures_delta.clear();
+        };
+        frame(vec![], None);
+        if mouse {
+            let p = target.get().center();
+            frame(vec![egui::Event::PointerMoved(p)], None);
+            frame(vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() }], None);
+            frame(vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() }], None);
+            // Left resting on "Rename".
+            frame(vec![egui::Event::PointerMoved(p + egui::vec2(30.0, 75.0))], None);
+        } else {
+            frame(vec![], Some(egui::pos2(100.0, 100.0)));
+        }
+        for _ in 0..3 {
+            frame(vec![], None);
+        }
+        // Two levels with items on them: the menu and its submenu.
+        let open = || ctx.viewport(|v| v.prev_pass.widgets.layer_ids().filter(|l| l.order == egui::Order::Foreground && v.prev_pass.widgets.get_layer(*l).next().is_some()).count() == 2);
+        use egui::Key::*;
+        let mut script = vec![(ArrowDown, vec![1], false), (ArrowRight, vec![1, 0], true), (ArrowLeft, vec![1], false), (ArrowRight, vec![1, 0], true), (ArrowDown, vec![1, 1], true), (ArrowLeft, vec![1], false), (ArrowRight, vec![1, 0], true), (ArrowLeft, vec![1], false), (ArrowDown, vec![2], false)];
+        if mouse {
+            // The first key takes the menu over, on its first item.
+            script.insert(0, (ArrowDown, vec![0], false));
+        }
+        for (n, (key, path, sub)) in script.into_iter().enumerate() {
+            frame(tap(key), None);
+            for _ in 0..3 {
+                frame(vec![], None);
+            }
+            let k = ctx.data(|d| d.get_temp::<super::KeyMenu>(egui::Id::new(super::KEY_MENU))).expect("menu open");
+            assert_eq!(k.path, path, "step {n} ({key:?}), mouse {mouse}");
+            assert_eq!(open(), sub, "step {n} ({key:?}), mouse {mouse}: submenu open");
+        }
+    }
+
+    #[test]
+    fn right_and_left_open_and_close_a_submenu_every_time() {
+        steer(false);
+        steer(true);
     }
 }

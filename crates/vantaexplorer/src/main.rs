@@ -1675,6 +1675,7 @@ fn app_ui(
     paste_key_flag: &mut bool,
     chooser: &mut Option<chooser::State>,
 ) {
+    root.ctx().data_mut(|d| d.insert_temp(egui::Id::new(browser::ANIMATIONS), settings.animations));
     // Any modal up? Computed before anything reads the keyboard, so dialogs and panes cannot
     // both act on the same keystroke.
     help::handle_key(root.ctx());
@@ -1892,6 +1893,7 @@ fn app_ui(
     } else if let Some(path) = {
         // The sidebar has the keys while it has the focus and nothing over it does.
         let keys = sidebar.focused && !modal_open && !root.ctx().text_edit_focused() && !egui::Popup::is_any_open(root.ctx());
+        sidebar.animations = settings.animations;
         sidebar.show(&mut side_ui, drives, icons, theme, &current_dir, keys)
     } {
         // Per the spec, the sidebar navigates the ACTIVE pane.
@@ -2558,12 +2560,13 @@ fn choice_row(ui: &mut egui::Ui, theme: &browser::Theme, id: &str, buttons: &[Ch
     ctx.data_mut(|d| d.insert_temp(key, at));
     let mut picked = pick.then_some(at);
     ui.horizontal(|ui| {
+        let mut glider = browser::Glider::begin(ui);
         for (i, b) in buttons.iter().enumerate() {
             let Some((text, hover)) = b else {
                 ui.separator();
                 continue;
             };
-            let mut r = browser::choice_button(ui, theme, text.clone(), i == at);
+            let mut r = browser::choice_button(ui, &mut glider, theme, text.clone(), i == at);
             if !hover.is_empty() {
                 r = r.on_hover_text(*hover);
             }
@@ -2571,6 +2574,7 @@ fn choice_row(ui: &mut egui::Ui, theme: &browser::Theme, id: &str, buttons: &[Ch
                 picked = Some(i);
             }
         }
+        browser::choice_marking(ui, glider, id, theme, browser::animations(ui.ctx()));
     });
     ui.label(egui::RichText::new("Left, Right choose · Enter confirm · Esc cancel").small().color(theme.text.gamma_multiply(0.5)));
     if picked.is_some() {
@@ -2737,7 +2741,8 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             ui.horizontal(|ui| {
                 // The keyboard selection is drawn, not just held: a dialog you can drive with
                 // Enter has to show what Enter would do.
-                let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| browser::choice_button(ui, theme, text, selected).clicked();
+                let mut glider = browser::Glider::begin(ui);
+                let mut button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| browser::choice_button(ui, &mut glider, theme, text, selected).clicked();
                 if button(
                     ui,
                     egui::RichText::new(verb).color(theme.error),
@@ -2748,6 +2753,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 if button(ui, egui::RichText::new("Cancel"), !delete_selected) {
                     decision = Some(false);
                 }
+                browser::choice_marking(ui, glider, "delete", theme, browser::animations(ui.ctx()));
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("Left, Right choose · Enter confirm · Esc cancel")
@@ -2881,11 +2887,13 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             .resizable(true)
             .open(&mut keep)
             .show(ctx, |ui| {
+                let mut searched = false;
                 ui.horizontal(|ui| {
                     ui.label("Search:");
                     let resp = ui.text_edit_singleline(search);
                     if resp.changed() {
                         *cursor = 0;
+                        searched = true;
                     }
                     resp.request_focus();
                 });
@@ -2929,9 +2937,18 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                             }
                             *cursor = (*cursor).min(shown.len() - 1);
                         }
+                        // The marking glides with the arrows; typing a search puts it in place.
+                        let mut glider = browser::Glider::begin(ui);
                         for (i, app) in shown.into_iter().enumerate() {
-                            let resp = ui.add(egui::Button::new(&app.name).selected(i == *cursor));
-                            if i == *cursor && (up || down) {
+                            let here = i == *cursor;
+                            let name = egui::RichText::new(&app.name);
+                            let name = if here { name.color(ui.visuals().selection.stroke.color) } else { name };
+                            let resp = ui.add(egui::Button::new(name).fill(egui::Color32::TRANSPARENT));
+                            glider.button(ui, &resp);
+                            if here {
+                                glider.chosen(resp.rect);
+                            }
+                            if here && (up || down) {
                                 resp.scroll_to_me(None);
                             }
                             if resp.clicked() || (i == *cursor && enter) {
@@ -2945,6 +2962,8 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                                 launched = true;
                             }
                         }
+                        let radius = ui.visuals().widgets.inactive.corner_radius.nw as f32;
+                        glider.finish(ui, egui::Id::new("open-with-glide"), browser::animations(ui.ctx()), searched, radius, ui.visuals().selection.bg_fill);
                     });
                 ui.separator();
                 ui.horizontal(|ui| {

@@ -167,6 +167,8 @@ pub struct Sidebar {
     cursor: Option<usize>,
     /// How many entries the keys could reach last frame.
     reachable: usize,
+    /// The keys' ring glides between entries (`Settings::animations`), set before each frame.
+    pub animations: bool,
 }
 
 /// What the keys do in the sidebar this frame.
@@ -200,6 +202,7 @@ impl Sidebar {
             focused: false,
             cursor: None,
             reachable: 0,
+            animations: true,
         }
     }
 
@@ -285,6 +288,7 @@ impl Sidebar {
         current_dir: &Path,
         keys: bool,
     ) -> Option<PathBuf> {
+        let animations = self.animations;
         // The keys: up and down through the entries, Home and End, Enter to open (staying
         // here, to look through several places), F10 or the Menu key for the entry's menu,
         // Escape back to the pane.
@@ -331,17 +335,21 @@ impl Sidebar {
         let mut seen = 0usize;
         let mut shown_here: Option<usize> = None;
         // Marks the entry the keys are on. Returns whether it is that one.
+        // Where the keys' ring belongs, found as the entries are drawn and painted after them,
+        // gliding there from where it was.
+        let ring_at = std::cell::Cell::new(None);
         let reach = |ui: &egui::Ui, rect: egui::Rect, n: &mut usize| -> bool {
             let here = cursor == Some(*n);
             *n += 1;
             if here {
-                ui.painter().rect_stroke(rect.expand(1.0), 3.0, egui::Stroke::new(1.5, theme.accent), egui::StrokeKind::Inside);
+                ring_at.set(Some(rect.expand(1.0)));
                 if k.moved {
                     ui.scroll_to_rect(rect, None);
                 }
             }
             here
         };
+        let ring_id = egui::Id::new("sidebar-ring");
         if self.rows_cache.as_ref().is_none_or(|(t, _, _)| t.elapsed() >= Duration::from_secs(5)) {
             self.rows_cache = Some((Instant::now(), remote_rows(), special_rows()));
         }
@@ -378,6 +386,8 @@ impl Sidebar {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // What the entries scroll with: the ring is placed relative to it.
+                let origin = ui.min_rect().min.to_vec2();
                 for (pos, &i) in visible.iter().enumerate() {
                     let section = self.config.sections[i].clone();
 
@@ -601,6 +611,14 @@ impl Sidebar {
                         add_section = true;
                     }
                 });
+                // The keys' ring, over the entries, gliding from the one it was on.
+                match ring_at.get() {
+                    Some(r) => {
+                        let at = crate::browser::glide_rect(ui.ctx(), ring_id, r.translate(-origin), animations).translate(origin);
+                        ui.painter().rect_stroke(at, 3.0, egui::Stroke::new(1.5, theme.accent), egui::StrokeKind::Inside);
+                    }
+                    None => crate::browser::glide_forget(ui.ctx(), ring_id),
+                }
             });
 
         self.reachable = seen;
@@ -1103,6 +1121,7 @@ mod tests {
             focused: false,
             cursor: None,
             reachable: 0,
+            animations: true,
         };
         sb.config.sections[0].removed.push("/h/Music".into());
         sb.add(0, Path::new("/h/Music"));

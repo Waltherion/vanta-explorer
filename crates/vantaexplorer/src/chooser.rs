@@ -404,13 +404,15 @@ impl State {
             ui.label(egui::RichText::new("Saving replaces what is in it.").color(theme.error));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| crate::browser::choice_button(ui, theme, text, selected).clicked();
+                let mut glider = crate::browser::Glider::begin(ui);
+                let mut button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| crate::browser::choice_button(ui, &mut glider, theme, text, selected).clicked();
                 if button(ui, egui::RichText::new("Replace").color(theme.error), on_replace) {
                     decision = Some(true);
                 }
                 if button(ui, egui::RichText::new("Cancel"), !on_replace) {
                     decision = Some(false);
                 }
+                crate::browser::choice_marking(ui, glider, "replace", theme, crate::browser::animations(ui.ctx()));
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("Left, Right choose · Enter confirm · Esc cancel").small().color(theme.text.gamma_multiply(0.5)));
             });
