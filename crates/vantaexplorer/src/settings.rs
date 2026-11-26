@@ -29,6 +29,8 @@ pub struct Settings {
     pub view_per: ViewPer,
     /// The locale numbers in sheets are written for (`da_DK`); empty: the system's.
     pub number_locale: String,
+    /// Motion that shows where you went (`browser::slide_list`).
+    pub animations: bool,
 }
 
 /// What the view (list or grid, and how large) is remembered for.
@@ -99,6 +101,7 @@ impl Default for Settings {
             dark_pages: DarkPages::Off,
             view_per: ViewPer::Folder,
             number_locale: String::new(),
+            animations: true,
         }
     }
 }

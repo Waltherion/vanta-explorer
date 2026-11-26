@@ -254,6 +254,7 @@ fn main() -> Result<()> {
         events_since_draw: 0,
         focused: true,
         last_session_save: Instant::now(),
+        session_heir: (session.is_none() && start_folder.is_none() && chooser.is_none()).then(Instant::now),
         session,
         chooser,
         chooser_prefs,
@@ -495,6 +496,9 @@ struct App {
     last_session_save: Instant,
     /// Held by the one window that keeps the session; None: this window saves nothing.
     session: Option<panes::SessionLock>,
+    /// Whether this window may take the session over when the window keeping it closes: one
+    /// started without a folder, not choosing a file. When it last tried.
+    session_heir: Option<Instant>,
     /// How many input events piled up since the last frame, if this climbs, we are behind.
     events_since_draw: u32,
     /// Set when the window is choosing a file for another program (`--choose`).
@@ -1005,6 +1009,22 @@ impl ApplicationHandler for App {
             } else {
                 self.events_since_draw = 0;
                 self.input_at = None;
+            }
+        }
+
+        // The window keeping the session closed: the next one to try takes it, and from now on
+        // its own tabs and panes are what the next start opens, so the window closed last is
+        // the one remembered. Every few seconds: a flock that fails costs next to nothing.
+        if let Some(tried) = self.session_heir {
+            if tried.elapsed() >= Duration::from_secs(3) {
+                self.session_heir = Some(Instant::now());
+                if let Some(lock) = panes::lock_session() {
+                    log::info!("session: the window keeping it closed; this one keeps it now");
+                    self.session = Some(lock);
+                    self.session_heir = None;
+                    self.last_session_save = Instant::now();
+                    panes::save(&self.ws, false);
+                }
             }
         }
 

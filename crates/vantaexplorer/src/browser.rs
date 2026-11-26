@@ -1383,11 +1383,176 @@ fn show_list(
     icons: &mut IconCache,
     view: &View,
 ) -> bool {
-    let zoomed = handle_zoom(ui, pane, ui.available_rect_before_wrap());
-    if pane.is_grid() {
-        return show_grid(ui, pane, pane_idx, is_active, icons, view) || zoomed;
+    slide_list(ui, pane, pane_idx, view.settings.animations, |ui, pane| {
+        let zoomed = handle_zoom(ui, pane, ui.available_rect_before_wrap());
+        if pane.is_grid() {
+            return show_grid(ui, pane, pane_idx, is_active, icons, view) || zoomed;
+        }
+        show_rows_view(ui, pane, pane_idx, is_active, icons, view) || zoomed
+    })
+}
+
+/// How long a folder takes to slide in. Short and fast to start, slowing into place: the
+/// motion is there to show which way you went, not to be watched.
+const SLIDE: std::time::Duration = std::time::Duration::from_millis(170);
+/// How long a jump elsewhere takes to fade over.
+const JUMP: std::time::Duration = std::time::Duration::from_millis(140);
+
+/// How the list changes when its folder does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Motion {
+    /// Along the path: 1 the new folder comes in from the right (into a folder), -1 from the
+    /// left (out to a parent).
+    Slide(f32),
+    /// Somewhere else altogether: the old list fades out shrinking a little, the new one fades
+    /// in from a little larger. Neither sideways, which means along the path, nor up or down,
+    /// which looks like scrolling.
+    Jump,
+}
+
+/// A pane's list as it was last drawn, and the motion under way.
+#[derive(Clone, Default)]
+struct Slide {
+    /// The tab and folder drawn last frame.
+    at: Option<(usize, PathBuf)>,
+    /// What the list painted last frame, to move out when the folder changes.
+    last: std::sync::Arc<Vec<egui::epaint::ClippedShape>>,
+    /// The old list when the motion began, when it began, and which motion.
+    running: Option<(std::sync::Arc<Vec<egui::epaint::ClippedShape>>, std::time::Instant, Motion)>,
+}
+
+/// Down the path slides in from the right, up it from the left, and anything else is a jump.
+/// Back and Forward follow from that: back out of a folder you went into slides left again,
+/// back from a jump jumps.
+fn motion(from: &std::path::Path, to: &std::path::Path) -> Motion {
+    if to.starts_with(from) {
+        Motion::Slide(1.0)
+    } else if from.starts_with(to) {
+        Motion::Slide(-1.0)
+    } else {
+        Motion::Jump
     }
-    show_rows_view(ui, pane, pane_idx, is_active, icons, view) || zoomed
+}
+
+/// Fades a shape to `a` of its opacity.
+fn fade(shape: &mut egui::Shape, a: f32) {
+    use egui::epaint::ColorMode;
+    match shape {
+        egui::Shape::Vec(v) => v.iter_mut().for_each(|s| fade(s, a)),
+        egui::Shape::Circle(c) => {
+            c.fill = c.fill.gamma_multiply(a);
+            c.stroke.color = c.stroke.color.gamma_multiply(a);
+        }
+        egui::Shape::Ellipse(e) => {
+            e.fill = e.fill.gamma_multiply(a);
+            e.stroke.color = e.stroke.color.gamma_multiply(a);
+        }
+        egui::Shape::LineSegment { stroke, .. } => stroke.color = stroke.color.gamma_multiply(a),
+        egui::Shape::Path(p) => {
+            p.fill = p.fill.gamma_multiply(a);
+            if let ColorMode::Solid(c) = &mut p.stroke.color {
+                *c = c.gamma_multiply(a);
+            }
+        }
+        egui::Shape::Rect(r) => {
+            r.fill = r.fill.gamma_multiply(a);
+            r.stroke.color = r.stroke.color.gamma_multiply(a);
+        }
+        egui::Shape::Text(t) => t.opacity_factor *= a,
+        egui::Shape::Mesh(m) => std::sync::Arc::make_mut(m).vertices.iter_mut().for_each(|v| v.color = v.color.gamma_multiply(a)),
+        _ => {}
+    }
+}
+
+/// Draws a pane's list with `draw`, moving it in when the tab's folder has changed: along the
+/// path the new list comes in from one side and pushes a picture of the old one out of the
+/// other; a jump elsewhere fades from the one to the other (`Motion`). Only the picture moves:
+/// the new list takes clicks and keys where it will stand from the first frame, so nothing
+/// waits for the motion. The old picture is what the list painted the frame before, kept every
+/// frame, so it is exactly what was on screen.
+fn slide_list<R>(ui: &mut egui::Ui, pane: &mut Pane, pane_idx: usize, enabled: bool, draw: impl FnOnce(&mut egui::Ui, &mut Pane) -> R) -> R {
+    let ctx = ui.ctx().clone();
+    let id = egui::Id::new(("list-slide", pane_idx));
+    let mut st: Slide = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
+    let here = (pane.active_tab, pane.tab_ref().path().to_path_buf());
+    if let Some((t, from)) = &st.at {
+        if enabled && *t == here.0 && *from != here.1 && !st.last.is_empty() {
+            st.running = Some((st.last.clone(), std::time::Instant::now(), motion(from, &here.1)));
+        }
+    }
+    st.at = Some(here);
+    if !enabled {
+        st.running = None;
+    }
+
+    let area = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let layer = ui.layer_id();
+    let start = ctx.graphics_mut(|g| g.entry(layer).next_idx());
+    let out = draw(ui, pane);
+    let end = ctx.graphics_mut(|g| g.entry(layer).next_idx());
+    // Kept only while it can be needed: the picture costs a copy of the frame's shapes.
+    if enabled {
+        st.last = std::sync::Arc::new(ctx.graphics_mut(|g| g.entry(layer).all_entries().skip(start.0).take(end.0 - start.0).cloned().collect()));
+    }
+
+    if let Some((old, t0, how)) = st.running.clone() {
+        let length = if how == Motion::Jump { JUMP } else { SLIDE };
+        let p = (t0.elapsed().as_secs_f32() / length.as_secs_f32()).min(1.0);
+        if p >= 1.0 {
+            st.running = None;
+        } else {
+            // Ease out: most of the way at once, then settling.
+            let e = 1.0 - (1.0 - p).powi(3);
+            // Where each list is drawn and how strongly: (transform, opacity) for new and old.
+            let (new, was) = match how {
+                Motion::Slide(way) => {
+                    let new_dx = way * area.width() * (1.0 - e);
+                    let at = |dx: f32| egui::emath::TSTransform::from_translation(egui::vec2(dx, 0.0));
+                    ((at(new_dx), 1.0), (at(new_dx - way * area.width()), 1.0))
+                }
+                Motion::Jump => {
+                    let c = area.center().to_vec2();
+                    let scaled = |k: f32| egui::emath::TSTransform::new(c * (1.0 - k), k);
+                    ((scaled(1.04 - 0.04 * e), e), (scaled(1.0 - 0.04 * e), 1.0 - e))
+                }
+            };
+            let place = |c: &mut egui::epaint::ClippedShape, (t, a): (egui::emath::TSTransform, f32)| {
+                c.shape.transform(t);
+                if a < 1.0 {
+                    fade(&mut c.shape, a);
+                }
+                c.clip_rect = t.mul_rect(c.clip_rect).intersect(area);
+            };
+            ctx.graphics_mut(|g| {
+                let list = g.entry(layer);
+                for i in start.0..end.0 {
+                    list.mutate_shape(egui::layers::ShapeIdx(i), |c| place(c, new));
+                }
+                for c in old.iter() {
+                    let mut c = c.clone();
+                    place(&mut c, was);
+                    list.add(c.clip_rect, c.shape);
+                }
+            });
+            ctx.request_repaint();
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(id, st));
+    out
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::{motion, Motion};
+    use std::path::Path;
+
+    #[test]
+    fn along_the_path_slides_and_elsewhere_jumps() {
+        assert_eq!(motion(Path::new("/home/w"), Path::new("/home/w/Documents/Arkiv")), Motion::Slide(1.0));
+        assert_eq!(motion(Path::new("/home/w/Documents/Arkiv"), Path::new("/home/w")), Motion::Slide(-1.0));
+        assert_eq!(motion(Path::new("/home/w/Documents"), Path::new("/home/w/Pictures")), Motion::Jump);
+        assert_eq!(motion(Path::new("/home/w"), Path::new("/etc")), Motion::Jump);
+    }
 }
 
 /// Arrow-key browsing on the active pane. `columns` is 1 for the list, the cell count per row

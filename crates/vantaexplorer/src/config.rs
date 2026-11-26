@@ -101,6 +101,12 @@ pub const DEFAULT_LOCAL: &str = r##"// Vanta Explorer, this machine only: kept w
   // "de_CH". Empty: the system's (LC_NUMERIC). Calc sheets (.ods) keep the text LibreOffice
   // saved them with.
   // "numberLocale": "",
+
+  // Motion that shows where you went: into a folder its list slides in from the right and
+  // pushes the old one out to the left, out of it the other way; a jump somewhere else fades
+  // over. Quick, and never in the way: the new folder takes clicks and keys from the first
+  // frame. false: no motion.
+  // "animations": true,
 }
 "##;
 
