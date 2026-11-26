@@ -91,6 +91,7 @@ pub fn show(ui: &mut egui::Ui, rect: egui::Rect, rich: &Rich, theme: &Theme, dar
     let page = rich.doc.page;
     let mut shown_page = None;
     let out = egui::ScrollArea::vertical().id_salt("preview-doc").auto_shrink([false, false]).show(&mut child, |ui| {
+        crate::browser::take_preview_scroll(ui);
         let width = ui.available_width();
         let s = ((width - 2.0 * PAGE_GAP) / page.width).max(0.05);
         let [mt, mr, mb, ml] = page.margin.map(|m| m * s);
@@ -185,6 +186,7 @@ fn slides_view(ui: &mut egui::Ui, rich: &Rich, slides: &[Slide], theme: &Theme, 
     let page = rich.doc.page;
     let mut shown = None;
     let out = egui::ScrollArea::vertical().id_salt("preview-slides").auto_shrink([false, false]).show(ui, |ui| {
+        crate::browser::take_preview_scroll(ui);
         let width = ui.available_width();
         let s = ((width - 2.0 * PAGE_GAP) / page.width).max(0.02);
         let (pw, ph) = (page.width * s, page.height * s);
@@ -695,6 +697,7 @@ fn sheet_view(ui: &mut egui::Ui, s: &Sheet, theme: &Theme, body: f32) {
     let weak = theme.text.gamma_multiply(0.55);
 
     egui::ScrollArea::both().id_salt("preview-sheet").auto_shrink([false, false]).show_rows(ui, row_h, s.rows.len() + 1, |ui, range| {
+        crate::browser::take_preview_scroll(ui);
         for i in range {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(total, row_h), egui::Sense::hover());
             let p = ui.painter();

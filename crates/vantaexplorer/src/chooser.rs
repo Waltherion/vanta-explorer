@@ -383,9 +383,11 @@ impl State {
     /// Cancel, like every question here whose yes cannot be taken back.
     pub fn show_replace(&mut self, ctx: &egui::Context, theme: &crate::browser::Theme) {
         let Some((path, mut on_replace)) = self.replace.take() else { return };
+        crate::browser::dialog_owns_keys(ctx);
+        let tab = crate::browser::dialog_tab(ctx).is_some();
         let (toggle, activate, escape) = ctx.input(|i| {
             (
-                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::Tab),
+                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowRight) || tab,
                 i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Escape),
             )
@@ -402,15 +404,7 @@ impl State {
             ui.label(egui::RichText::new("Saving replaces what is in it.").color(theme.error));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| {
-                    let btn = egui::Button::new(text);
-                    let btn = if selected {
-                        btn.fill(theme.accent.gamma_multiply(0.35)).stroke(egui::Stroke::new(2.0, theme.accent))
-                    } else {
-                        btn.stroke(egui::Stroke::new(1.0, theme.text.gamma_multiply(0.3)))
-                    };
-                    ui.add(btn).clicked()
-                };
+                let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| crate::browser::choice_button(ui, theme, text, selected).clicked();
                 if button(ui, egui::RichText::new("Replace").color(theme.error), on_replace) {
                     decision = Some(true);
                 }

@@ -38,6 +38,7 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Delete", "Delete for good (asks first)"),
             ("Ctrl+Z, Ctrl+Y", "Undo, redo"),
             ("Alt+Enter", "Properties (of the folder, when nothing is marked)"),
+            ("F10, Menu key", "The right-click menu (of the folder, when nothing is marked)"),
             ("Ctrl+E", "Edit a text file in the preview; Ctrl+S saves, Escape stops"),
             ("Drag", "Move; with Ctrl: copy; with the right button: ask"),
         ],
@@ -59,13 +60,22 @@ const GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+T, Ctrl+W", "New tab, close tab"),
             ("Ctrl+Shift+T", "Reopen the last closed tab"),
             ("Ctrl+Page Down, Ctrl+Page Up", "Next, previous tab"),
-            ("Ctrl+Tab, Ctrl+Shift+Tab, F6", "Next, previous pane"),
-            ("F3, Shift+F3", "Split side by side, one above the other; again: close the pane"),
+            ("Ctrl+Tab, Ctrl+Shift+Tab", "Next, previous pane"),
+            ("Ctrl+arrows", "The pane that way; left of the leftmost: the sidebar"),
+            ("F6", "Into the sidebar and back (there: arrows, Enter, F10, Escape)"),
+            ("Ctrl+Right (rightmost pane)", "Into the preview: arrows and Page Up/Down scroll, Ctrl+Page Up/Down turn pages and sheets, Escape goes back"),
+            ("F3, Shift+F3", "Split the pane side by side, one above the other"),
+            ("Ctrl+Shift+W", "Close the pane"),
         ],
     ),
     (
         "Other",
-        &[("Ctrl+Shift+P", "Command palette: every command by name"), ("F4", "Terminal in this folder"), ("F1", "This window")],
+        &[
+            ("Ctrl+Shift+P", "Command palette: every command by name; / or ~ first: go to a folder (Tab fills it in)"),
+            ("Dialogs", "Left, Right or Tab choose a button, Enter picks, Escape cancels"),
+            ("F4", "Terminal in this folder"),
+            ("F1", "This window"),
+        ],
     ),
 ];
 

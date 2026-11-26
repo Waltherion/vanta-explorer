@@ -160,9 +160,33 @@ pub struct Sidebar {
     /// Whether edits made here are written to the file. Not in the chooser, which borrows the
     /// file manager's places and must not rearrange them behind its back.
     pub persist: bool,
+    /// F6 or Ctrl+Left: the keys move through the sidebar rather than the pane.
+    pub focused: bool,
+    /// The entry the keys are on, counted down the sidebar (headings too). None: not yet
+    /// placed; the next frame puts it on the folder shown, or the top.
+    cursor: Option<usize>,
+    /// How many entries the keys could reach last frame.
+    reachable: usize,
+}
+
+/// What the keys do in the sidebar this frame.
+#[derive(Default)]
+struct Keys {
+    on: bool,
+    moved: bool,
+    enter: bool,
+    menu: bool,
 }
 
 impl Sidebar {
+    /// F6 and Ctrl+arrows take the keys in and out.
+    pub fn focus(&mut self, on: bool) {
+        if on && !self.focused {
+            self.cursor = None;
+        }
+        self.focused = on;
+    }
+
     pub fn new() -> Self {
         Self {
             pending_eject: None,
@@ -173,6 +197,9 @@ impl Sidebar {
             file_mtime: file_mtime(),
             last_check: Instant::now(),
             persist: true,
+            focused: false,
+            cursor: None,
+            reachable: 0,
         }
     }
 
@@ -256,7 +283,65 @@ impl Sidebar {
         icons: &mut IconCache,
         theme: &crate::browser::Theme,
         current_dir: &Path,
+        keys: bool,
     ) -> Option<PathBuf> {
+        // The keys: up and down through the entries, Home and End, Enter to open (staying
+        // here, to look through several places), F10 or the Menu key for the entry's menu,
+        // Escape back to the pane.
+        let mut k = Keys::default();
+        if keys {
+            let menu_key = ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::new(crate::browser::MENU_KEY))).unwrap_or(false);
+            let (up, down, home, end, enter, f10, escape) = ui.input(|i| {
+                let plain = i.modifiers.is_none();
+                (
+                    plain && i.key_pressed(egui::Key::ArrowUp),
+                    plain && i.key_pressed(egui::Key::ArrowDown),
+                    plain && i.key_pressed(egui::Key::Home),
+                    plain && i.key_pressed(egui::Key::End),
+                    plain && i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::F10),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if escape {
+                self.focused = false;
+            } else {
+                let last = self.reachable.saturating_sub(1);
+                if let Some(c) = self.cursor {
+                    let to = if up {
+                        c.saturating_sub(1)
+                    } else if down {
+                        (c + 1).min(last)
+                    } else if home {
+                        0
+                    } else if end {
+                        last
+                    } else {
+                        c
+                    };
+                    k.moved = to != c;
+                    self.cursor = Some(to.min(last));
+                }
+                k = Keys { on: true, enter, menu: f10 || menu_key, ..k };
+            }
+        }
+        let cursor = self.cursor.filter(|_| k.on);
+        // Counted as they are drawn; the first entry showing the folder in view, for a cursor
+        // not yet placed.
+        let mut seen = 0usize;
+        let mut shown_here: Option<usize> = None;
+        // Marks the entry the keys are on. Returns whether it is that one.
+        let reach = |ui: &egui::Ui, rect: egui::Rect, n: &mut usize| -> bool {
+            let here = cursor == Some(*n);
+            *n += 1;
+            if here {
+                ui.painter().rect_stroke(rect.expand(1.0), 3.0, egui::Stroke::new(1.5, theme.accent), egui::StrokeKind::Inside);
+                if k.moved {
+                    ui.scroll_to_rect(rect, None);
+                }
+            }
+            here
+        };
         if self.rows_cache.as_ref().is_none_or(|(t, _, _)| t.elapsed() >= Duration::from_secs(5)) {
             self.rows_cache = Some((Instant::now(), remote_rows(), special_rows()));
         }
@@ -304,10 +389,16 @@ impl Sidebar {
                         if bg_resp.hovered() {
                             ui.painter().rect_filled(rect, 2.0, theme.accent.gamma_multiply(0.18));
                         }
-                        if bg_resp.clicked() {
+                        let entered = reach(ui, rect, &mut seen) && k.enter;
+                        if entered {
+                            self.focused = false;
+                        }
+                        if entered || bg_resp.clicked() {
                             clicked = Some(PathBuf::from("vantaexplorer://recent"));
                         }
                     }
+                    // A heading the keys are on: Enter folds it, F10 opens its menu.
+                    let heading_here = !is_recent && cursor == Some(seen);
 
                     ui.horizontal(|ui| {
                         let renaming_this =
@@ -356,7 +447,7 @@ impl Sidebar {
                                 )
                                 .frame(false),
                             );
-                            if resp.clicked() {
+                            if resp.clicked() || (heading_here && k.enter) {
                                 if is_recent {
                                     clicked = Some(PathBuf::from("vantaexplorer://recent"));
                                 } else {
@@ -369,7 +460,8 @@ impl Sidebar {
                             }
                             // Moving, renaming and removing a section live in its right-click
                             // menu rather than as buttons on every heading.
-                            resp.context_menu(|ui| {
+                            let key_at = (heading_here && k.menu).then(|| resp.rect.left_bottom());
+                            crate::browser::context_popup(&resp, crate::browser::right_click_opens(&resp), key_at, |ui| {
                                 if ui.add_enabled(pos > 0, egui::Button::new("Move up")).clicked() {
                                     move_up = Some(i);
                                     ui.close();
@@ -392,6 +484,10 @@ impl Sidebar {
                             });
                         }
                     });
+                    if !is_recent {
+                        let line = egui::Rect::from_min_size(egui::pos2(ui.min_rect().left(), ui.min_rect().bottom() - 20.0), egui::vec2(ui.available_width(), 20.0));
+                        reach(ui, line, &mut seen);
+                    }
 
                     if section.collapsed || section.id.as_deref() == Some("recent") {
                         continue;
@@ -408,13 +504,40 @@ impl Sidebar {
                             RowAction::Eject => self.pending_eject = row.eject.clone(),
                             RowAction::None => {}
                         }
+                        // Plain labels (Today, Yesterday) are not entries.
+                        let entry = !row.icons.is_empty() && !row.path.as_os_str().is_empty();
+                        let here = entry && {
+                            if shown_here.is_none() && row.path == current_dir {
+                                shown_here = Some(seen);
+                            }
+                            reach(ui, resp.rect, &mut seen)
+                        };
+                        if here && k.enter {
+                            // Opened, and back to the pane to look at it.
+                            clicked = Some(row.path.clone());
+                            self.focused = false;
+                        }
+                        let key_at = (here && k.menu).then(|| resp.rect.left_bottom() + egui::vec2(24.0, 0.0));
                         if !editable {
+                            // A removable drive's menu: its eject button, for the keys.
+                            if row.eject.is_some() {
+                                let mut eject = false;
+                                crate::browser::context_popup(&resp, crate::browser::right_click_opens(&resp), key_at, |ui| {
+                                    if ui.button("Safely remove").clicked() {
+                                        eject = true;
+                                        ui.close();
+                                    }
+                                });
+                                if eject {
+                                    self.pending_eject = row.eject.clone();
+                                }
+                            }
                             continue;
                         }
                         let shown = || rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
                         let trash = self.persist && crate::fileops::in_trash(&row.path);
                         let mut empty_trash = false;
-                        resp.context_menu(|ui| {
+                        crate::browser::context_popup(&resp, crate::browser::right_click_opens(&resp), key_at, |ui| {
                             // What the Trash entry is for, above the arranging every entry has.
                             if trash {
                                 if ui.button(egui::RichText::new("Empty Trash").color(theme.error)).clicked() {
@@ -480,6 +603,10 @@ impl Sidebar {
                 });
             });
 
+        self.reachable = seen;
+        if self.focused && self.cursor.is_none() && seen > 0 {
+            self.cursor = Some(shown_here.unwrap_or(0));
+        }
         if let Some(i) = toggle {
             self.config.sections[i].collapsed = !self.config.sections[i].collapsed;
             dirty = true;
@@ -973,6 +1100,9 @@ mod tests {
             file_mtime: None,
             last_check: Instant::now(),
             persist: false,
+            focused: false,
+            cursor: None,
+            reachable: 0,
         };
         sb.config.sections[0].removed.push("/h/Music".into());
         sb.add(0, Path::new("/h/Music"));

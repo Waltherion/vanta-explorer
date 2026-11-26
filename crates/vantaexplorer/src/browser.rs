@@ -62,6 +62,339 @@ fn dragging(ui: &egui::Ui) -> bool {
 /// whatever is under the pointer this frame; read and cleared by the overlay.
 /// Set by main.rs for one Ctrl+Alt+C (copy path), read by the shortcuts below.
 pub const COPY_PATH_KEY: &str = "vx-copy-path-key";
+/// Set by main.rs for one press of the Menu key, which egui has no key for.
+pub const MENU_KEY: &str = "vx-menu-key";
+/// A menu opened from the keyboard: which, where, and where in it the keys are.
+const KEY_MENU: &str = "vx-key-menu";
+/// The menu items that open a submenu (`submenu`), so Right knows which ones do.
+const SUBMENUS: &str = "vx-submenus";
+
+#[derive(Clone)]
+struct KeyMenu {
+    popup: egui::Id,
+    at: egui::Pos2,
+    /// The menu's own layer, known once it has been drawn.
+    layer: Option<egui::LayerId>,
+    /// The item the keys are on in each open level: the menu, then its open submenus.
+    path: Vec<usize>,
+    /// A submenu was just opened from the keys: step into it once it shows.
+    opening: bool,
+}
+
+/// `ui.menu_button` in a menu, noted as a submenu for the keys.
+fn submenu<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<Option<R>> {
+    let r = ui.menu_button(label, add);
+    let id = r.response.id;
+    ui.ctx().data_mut(|d| {
+        let ids = d.get_temp_mut_or_default::<Vec<egui::Id>>(egui::Id::new(SUBMENUS));
+        if !ids.contains(&id) {
+            ids.push(id);
+            if ids.len() > 256 {
+                ids.remove(0);
+            }
+        }
+    });
+    r
+}
+
+/// The items of a menu layer that can be clicked, top to bottom, as drawn last frame.
+fn menu_items(ctx: &egui::Context, layer: egui::LayerId) -> Vec<(egui::Id, egui::Rect)> {
+    let mut items: Vec<(egui::Id, egui::Rect)> = ctx.viewport(|v| {
+        v.prev_pass.widgets.get_layer(layer).filter(|w| w.enabled && w.sense.senses_click()).map(|w| (w.id, w.rect)).collect()
+    });
+    items.sort_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y));
+    items.dedup_by_key(|i| i.0);
+    items
+}
+
+/// The layer of the submenu `item` opens, while it is open.
+fn submenu_layer(ctx: &egui::Context, item: egui::Id) -> Option<egui::LayerId> {
+    let id = item.with("submenu");
+    ctx.viewport(|v| v.prev_pass.widgets.layer_ids().find(|l| l.id == id))
+}
+
+/// Presses Enter for the widget with the focus: how a submenu opens or closes from the keys.
+fn press_enter(ctx: &egui::Context) {
+    ctx.input_mut(|i| i.events.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }));
+}
+
+/// The keys in a menu opened from the keyboard, before it is drawn: Up and Down (Home, End)
+/// through its items and never out of it, Right into a submenu, Left out of one. The item
+/// they are on has the focus, so Enter picks it the way egui clicks a focused widget, and a
+/// ring. egui's own arrow focus is turned off here: it goes to whatever lies nearest that
+/// way, outside the menu as readily as in it.
+fn steer_menu(ctx: &egui::Context, root: egui::LayerId, k: &mut KeyMenu) {
+    let (up, down, home, end, right, left, enter) = ctx.input(|i| {
+        let plain = i.modifiers.is_none();
+        (
+            plain && i.key_pressed(egui::Key::ArrowUp),
+            plain && i.key_pressed(egui::Key::ArrowDown),
+            plain && i.key_pressed(egui::Key::Home),
+            plain && i.key_pressed(egui::Key::End),
+            plain && i.key_pressed(egui::Key::ArrowRight),
+            plain && i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
+        )
+    });
+    ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+    // The open levels, as far as the path goes and they are still open.
+    let mut levels = vec![(root, menu_items(ctx, root))];
+    for depth in 0..k.path.len().saturating_sub(1) {
+        let Some(&(item, _)) = levels[depth].1.get(k.path[depth]) else { break };
+        match submenu_layer(ctx, item) {
+            Some(l) => levels.push((l, menu_items(ctx, l))),
+            None => break,
+        }
+    }
+    k.path.truncate(levels.len());
+    if k.path.is_empty() {
+        k.path.push(0);
+    }
+    let submenus = ctx.data(|d| d.get_temp::<Vec<egui::Id>>(egui::Id::new(SUBMENUS))).unwrap_or_default();
+    let current = |levels: &[(egui::LayerId, Vec<(egui::Id, egui::Rect)>)], path: &[usize]| {
+        let d = path.len() - 1;
+        levels.get(d).and_then(|(l, items)| items.get(path[d]).map(|&(id, r)| (*l, id, r)))
+    };
+    // A submenu opened from the keys: into it, once it is there.
+    if k.opening {
+        if let Some((_, item, _)) = current(&levels, &k.path) {
+            if let Some(l) = submenu_layer(ctx, item) {
+                let items = menu_items(ctx, l);
+                if !items.is_empty() {
+                    levels.push((l, items));
+                    k.path.push(0);
+                    k.opening = false;
+                }
+            } else if !submenus.contains(&item) {
+                k.opening = false;
+            }
+        }
+    }
+    let d = k.path.len() - 1;
+    let n = levels.get(d).map_or(0, |l| l.1.len());
+    if n == 0 {
+        return;
+    }
+    let c = k.path[d].min(n - 1);
+    k.path[d] = if down {
+        (c + 1).min(n - 1)
+    } else if up {
+        c.saturating_sub(1)
+    } else if home {
+        0
+    } else if end {
+        n - 1
+    } else {
+        c
+    };
+    let Some((_, item, _)) = current(&levels, &k.path) else { return };
+    if left && d > 0 {
+        // Out: the submenu's own item again, pressed to close it.
+        k.path.pop();
+        if let Some((_, parent, _)) = current(&levels, &k.path) {
+            ctx.memory_mut(|m| m.request_focus(parent));
+            press_enter(ctx);
+        }
+        return;
+    }
+    if submenus.contains(&item) && (right || enter) {
+        match submenu_layer(ctx, item) {
+            // Already open (the pointer opened it): just step in.
+            Some(l) if right => {
+                levels.push((l, menu_items(ctx, l)));
+                k.path.push(0);
+            }
+            Some(_) => {}
+            None => {
+                if right {
+                    press_enter(ctx);
+                }
+                k.opening = true;
+            }
+        }
+    }
+    if let Some((_, id, _)) = current(&levels, &k.path) {
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+}
+
+/// F10 or the Menu key: the menu a right-click would open, where the keyboard is. With
+/// something marked, that entry's (its row opens it as it is drawn, `menu_for`); with nothing
+/// marked, the folder's. Returns whether the folder's is to open.
+fn menu_key(ui: &egui::Ui, tab: &mut crate::panes::Tab, visible: &[usize], view: &View) -> bool {
+    let menu = ui.ctx().data_mut(|d| d.remove_temp::<bool>(egui::Id::new(MENU_KEY))).unwrap_or(false);
+    let f10 = ui.input(|i| i.key_pressed(egui::Key::F10));
+    if !(menu || f10) || ui.ctx().text_edit_focused() || view.modal_open {
+        return false;
+    }
+    match keyboard_position(tab, visible).filter(|_| !tab.selection.is_empty()) {
+        Some(vi) => {
+            tab.menu_for = visible.get(vi).and_then(|&ei| tab.listing.entries.get(ei)).map(|e| e.name.clone());
+            tab.scroll_to = Some(vi);
+            false
+        }
+        None => true,
+    }
+}
+
+/// What a right-click does to a context menu, as `Popup::context_menu` decides it.
+pub(crate) fn right_click_opens(resp: &egui::Response) -> Option<egui::SetOpenCommand> {
+    if resp.secondary_clicked() {
+        Some(egui::SetOpenCommand::Bool(true))
+    } else if resp.clicked() {
+        Some(egui::SetOpenCommand::Bool(false))
+    } else {
+        None
+    }
+}
+
+/// A context menu on `resp`: opened by `open` at the pointer, or from the keyboard at `key_at`.
+/// One opened from the keyboard stays where it opened and is steered by the keys
+/// (`steer_menu`).
+pub(crate) fn context_popup(resp: &egui::Response, open: Option<egui::SetOpenCommand>, key_at: Option<egui::Pos2>, content: impl FnOnce(&mut egui::Ui)) {
+    let ctx = resp.ctx.clone();
+    let key = egui::Id::new(KEY_MENU);
+    let id = egui::Popup::default_response_id(resp);
+    let mut open = open;
+    if let Some(at) = key_at {
+        ctx.data_mut(|d| d.insert_temp(key, KeyMenu { popup: id, at, layer: None, path: vec![0], opening: false }));
+        open = Some(egui::SetOpenCommand::Bool(true));
+    }
+    let mut from_key = ctx.data(|d| d.get_temp::<KeyMenu>(key)).filter(|k| k.popup == id);
+    // A right-click on it opens it at the pointer again, for the pointer.
+    if from_key.is_some() && resp.secondary_clicked() {
+        ctx.data_mut(|d| d.remove::<KeyMenu>(key));
+        from_key = None;
+    }
+    if let Some(k) = from_key.as_mut() {
+        if let Some(root) = k.layer {
+            steer_menu(&ctx, root, k);
+        }
+    }
+    let mut popup = egui::Popup::context_menu(resp).open_memory(open);
+    if let Some(k) = &from_key {
+        popup = popup.at_position(k.at);
+    }
+    let shown = popup.show(content);
+    match (from_key, shown) {
+        (Some(mut k), Some(inner)) => {
+            k.layer = Some(inner.response.layer_id);
+            // The ring around the item the keys are on, drawn over its own layer.
+            let focused = ctx.memory(|m| m.focused());
+            let ring = focused.and_then(|f| ctx.viewport(|v| v.prev_pass.widgets.get(f).map(|w| (w.layer_id, w.rect))));
+            if let Some((layer, rect)) = ring {
+                let color = ctx.global_style().visuals.selection.stroke.color;
+                ctx.layer_painter(layer).rect_stroke(rect, 3.0, egui::Stroke::new(1.5, color), egui::StrokeKind::Inside);
+            }
+            ctx.data_mut(|d| d.insert_temp(key, k));
+        }
+        (Some(_), None) => ctx.data_mut(|d| d.remove::<KeyMenu>(key)),
+        _ => {}
+    }
+}
+/// How far the keys scroll the preview this frame, taken by whichever scroll area shows it
+/// (`take_preview_scroll`).
+const PREVIEW_SCROLL: &str = "vx-preview-scroll";
+
+#[derive(Clone, Copy)]
+enum PreviewScroll {
+    Lines(f32),
+    Pages(f32),
+    Top,
+    Bottom,
+}
+
+/// Called inside each of the preview's scroll areas: scrolls it as the keys asked.
+pub fn take_preview_scroll(ui: &egui::Ui) {
+    let key = egui::Id::new(PREVIEW_SCROLL);
+    let Some(s) = ui.ctx().data(|d| d.get_temp::<PreviewScroll>(key)) else { return };
+    ui.ctx().data_mut(|d| d.remove::<PreviewScroll>(key));
+    let page = ui.clip_rect().height() * 0.9;
+    let down = match s {
+        PreviewScroll::Lines(n) => n * 40.0,
+        PreviewScroll::Pages(n) => n * page,
+        PreviewScroll::Top => -1.0e7,
+        PreviewScroll::Bottom => 1.0e7,
+    };
+    // A positive delta moves the content down, which is scrolling up.
+    ui.scroll_with_delta(egui::vec2(0.0, -down));
+}
+
+/// The keys while the preview has them: the arrows, Page Up and Down, Home and End scroll it;
+/// with the pages of a PDF shown one at a time, Page Up and Down turn them, as Ctrl+Page Up
+/// and Down do for every document with pages or sheets. Returns the page step, if any.
+fn preview_keys(ui: &egui::Ui, one_at_a_time: bool) -> i64 {
+    let (up, down, pg_up, pg_down, home, end, ctrl) = ui.input(|i| {
+        let plain = !i.modifiers.alt && !i.modifiers.shift;
+        (
+            plain && !i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
+            plain && !i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
+            plain && i.key_pressed(egui::Key::PageUp),
+            plain && i.key_pressed(egui::Key::PageDown),
+            plain && !i.modifiers.ctrl && i.key_pressed(egui::Key::Home),
+            plain && !i.modifiers.ctrl && i.key_pressed(egui::Key::End),
+            i.modifiers.ctrl,
+        )
+    });
+    let scroll = if up {
+        Some(PreviewScroll::Lines(-1.0))
+    } else if down {
+        Some(PreviewScroll::Lines(1.0))
+    } else if pg_up && !ctrl && !one_at_a_time {
+        Some(PreviewScroll::Pages(-1.0))
+    } else if pg_down && !ctrl && !one_at_a_time {
+        Some(PreviewScroll::Pages(1.0))
+    } else if home {
+        Some(PreviewScroll::Top)
+    } else if end {
+        Some(PreviewScroll::Bottom)
+    } else {
+        None
+    };
+    if let Some(s) = scroll {
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(PREVIEW_SCROLL), s));
+    }
+    let turn = ctrl || one_at_a_time;
+    if turn && pg_up {
+        -1
+    } else if turn && pg_down {
+        1
+    } else {
+        0
+    }
+}
+
+/// The Tab pressed this frame while a question is up, taken out before egui saw it (main.rs),
+/// with whether Shift came with it. egui would move its own focus with it, out of the dialog
+/// and onto whatever is next on screen, and then Enter or Space would click that.
+pub const DIALOG_TAB: &str = "vx-dialog-tab";
+
+/// The Tab a question gets this frame: `Some(shift)`.
+pub fn dialog_tab(ctx: &egui::Context) -> Option<bool> {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(DIALOG_TAB)))
+}
+
+/// A question's keys are its own: nothing else keeps egui's focus, which Enter and Space would
+/// click as well as the button chosen.
+pub fn dialog_owns_keys(ctx: &egui::Context) {
+    if let Some(f) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(f));
+    }
+}
+
+/// A button in a question's row. Every one is the same size, the chosen one filled and ringed
+/// with the ring drawn over it, outside the layout: a thicker border made the chosen one grow
+/// and the row shift each time the choice moved.
+pub fn choice_button(ui: &mut egui::Ui, theme: &Theme, text: egui::RichText, chosen: bool) -> egui::Response {
+    let btn = egui::Button::new(text).stroke(egui::Stroke::new(1.0, if chosen { theme.accent } else { theme.text.gamma_multiply(0.3) }));
+    let btn = if chosen { btn.fill(theme.accent.gamma_multiply(0.35)) } else { btn };
+    let r = ui.add(btn);
+    if chosen {
+        ui.painter().rect_stroke(r.rect.expand(1.0), 4.0, egui::Stroke::new(1.0, theme.accent), egui::StrokeKind::Outside);
+    }
+    r
+}
+
 pub const DROP_TARGET: &str = "dnd-target";
 
 fn mark_drop_target(ui: &egui::Ui, dest: &std::path::Path) {
@@ -82,6 +415,8 @@ fn drop_into(ui: &egui::Ui, view: &View, dest: &std::path::Path) {
 
 /// Read-only presentation context handed down the pane tree.
 pub struct View<'a> {
+    /// Ctrl+Right from the rightmost pane put the keys in the preview (`preview_keys`).
+    pub preview_focused: bool,
     pub theme: &'a Theme,
     pub settings: &'a Settings,
     pub preview: &'a crate::preview::Preview,
@@ -131,7 +466,7 @@ fn folder_view_menu(ui: &mut egui::Ui, folder: &std::path::Path, view: &View) {
     if crate::fileops::in_trash(folder) {
         return;
     }
-    ui.menu_button("Folder view", |ui| {
+    submenu(ui, "Folder view", |ui| {
         let mut views = views.borrow_mut();
         let own = views.own(folder);
         let mut subfolders = own.is_some_and(|v| v.subfolders);
@@ -307,6 +642,7 @@ pub fn show_workspace(
         .iter()
         .map(|(i, r)| (*i, r.min.x, r.min.y))
         .collect();
+    ws.pane_boxes = pane_rects.clone();
 
     // The sidebar's button is in the pane that stands against it, the top left one. The chooser
     // has no sidebar toggle (F9 does nothing there either).
@@ -461,7 +797,7 @@ fn show_pane(
         if is_active {
             let (new_tab, close_tab, next_tab, prev_tab, reopen_tab) = ui.input(|i| (
                 i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::T),
-                i.modifiers.ctrl && i.key_pressed(egui::Key::W),
+                i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::W),
                 (i.modifiers.ctrl && i.key_pressed(egui::Key::PageDown)) || (i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Tab)),
                 (i.modifiers.ctrl && i.key_pressed(egui::Key::PageUp)) || (i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Tab)),
                 i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::T),
@@ -1235,7 +1571,7 @@ fn entry_context_menu(
     let files_only = if single { !entry_is_dir } else { paths.iter().all(|p| tab.listing.entries.iter().find(|e| e.path == *p).is_some_and(|e| !e.is_dir)) };
     if !paths.is_empty() && files_only {
         let targets = paths.clone();
-        ui.menu_button("Open with", |ui| {
+        submenu(ui, "Open with", |ui| {
             // Looked up once for the files the menu is open on, not on every frame it stays
             // open: it runs xdg-mime and reads the desktop files.
             thread_local! {
@@ -1282,7 +1618,7 @@ fn entry_context_menu(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| tab.path().to_path_buf());
-        ui.menu_button("Compress to", |ui| {
+        submenu(ui, "Compress to", |ui| {
             // zstd first: it is the one worth reaching for by default. zip and 7z are here
             // because other people's machines expect them.
             for (label, suffix) in [
@@ -1439,7 +1775,7 @@ fn add_to_sidebar_menu(ui: &mut egui::Ui, folder: &std::path::Path, view: &View)
     if view.sidebar_targets.is_empty() {
         return;
     }
-    ui.menu_button("Add to sidebar", |ui| {
+    submenu(ui, "Add to sidebar", |ui| {
         for t in view.sidebar_targets {
             let there = t.paths.iter().any(|p| p == folder);
             let resp = ui.add_enabled(!there, egui::Button::new(&t.title));
@@ -2057,6 +2393,7 @@ fn show_rows_view(
         }
     }
     mark_first(tab, &visible, view);
+    let folder_menu_key = is_active && menu_key(ui, tab, &visible, view);
     let current_vi = keyboard_position(tab, &visible);
     let page = (ui.available_height() / row_h).floor().max(1.0) as usize;
     if let Some((vi, shift)) = keyboard_nav(ui, is_active && !view.modal_open, visible.len(), current_vi, 1, page) {
@@ -2313,9 +2650,11 @@ fn show_rows_view(
                 } else {
                     None
                 };
-                egui::Popup::context_menu(&resp)
-                    .open_memory(entry_menu)
-                    .show(|ui| entry_context_menu(ui, tab, &entry_name, entry_is_dir, view));
+                let key_at = (tab.menu_for.as_deref() == Some(entry_name.as_str())).then(|| {
+                    tab.menu_for = None;
+                    egui::pos2(resp.rect.left() + 28.0, resp.rect.bottom())
+                });
+                context_popup(&resp, entry_menu, key_at, |ui| entry_context_menu(ui, tab, &entry_name, entry_is_dir, view));
 
                 if resp.double_clicked() {
                     // Cancels the rename the first press of this double-click armed.
@@ -2372,9 +2711,8 @@ fn show_rows_view(
     } else {
         None
     };
-    egui::Popup::context_menu(&bg)
-        .open_memory(folder_menu)
-        .show(|ui| folder_context_menu(ui, tab, view));
+    let key_at = folder_menu_key.then(|| scroll_out.inner_rect.left_top() + egui::vec2(28.0, 28.0));
+    context_popup(&bg, folder_menu, key_at, |ui| folder_context_menu(ui, tab, view));
 
     {
         let viewport = scroll_out.inner_rect;
@@ -2551,6 +2889,7 @@ fn show_grid(
         }
     }
     mark_first(tab, &visible, view);
+    let folder_menu_key = is_active && menu_key(ui, tab, &visible, view);
     let current_vi = keyboard_position(tab, &visible);
     let page = (ui.available_height() / cell_h).floor().max(1.0) as usize;
     if let Some((vi, shift)) = keyboard_nav(ui, is_active && !view.modal_open, visible.len(), current_vi, cols, page) {
@@ -2570,7 +2909,8 @@ fn show_grid(
         // Drag as well as click: empty space is where rubber-band selection starts.
         egui::Sense::click_and_drag(),
     );
-    bg.context_menu(|ui| folder_context_menu(ui, tab, view));
+    let key_at = folder_menu_key.then(|| bg.rect.left_top() + egui::vec2(28.0, 28.0));
+    context_popup(&bg, right_click_opens(&bg), key_at, |ui| folder_context_menu(ui, tab, view));
 
     let mut area = egui::ScrollArea::vertical()
         .id_salt(("grid", pane_idx, tab_idx))
@@ -2770,9 +3110,11 @@ fn show_grid(
                             fix_selection_for_context(tab, &entry_name);
                             interacted = true;
                         }
-                        resp.context_menu(|ui| {
-                            entry_context_menu(ui, tab, &entry_name, entry_is_dir, view);
+                        let key_at = (tab.menu_for.as_deref() == Some(entry_name.as_str())).then(|| {
+                            tab.menu_for = None;
+                            resp.rect.center()
                         });
+                        context_popup(&resp, right_click_opens(&resp), key_at, |ui| entry_context_menu(ui, tab, &entry_name, entry_is_dir, view));
 
                         if resp.double_clicked() {
                             // Cancels the rename the first press of this double-click armed.
@@ -2901,6 +3243,10 @@ fn show_grid(
 pub fn show_preview(ui: &mut egui::Ui, pane: &Pane, view: &View) {
     let theme = view.theme;
     let settings = view.settings;
+    if view.preview_focused {
+        // Where the keys are, as the sidebar marks its entry.
+        ui.painter().rect_stroke(ui.max_rect().shrink(1.0), 3.0, egui::Stroke::new(1.5, theme.accent), egui::StrokeKind::Inside);
+    }
     ui.separator();
     ui.heading(egui::RichText::new("Preview").color(theme.accent_text).size(14.0));
 
@@ -3088,6 +3434,7 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                     .id_salt("preview-text")
                     .auto_shrink([false, false])
                     .show(&mut child, |ui| {
+                        take_preview_scroll(ui);
                         ui.horizontal_top(|ui| {
                             line_numbers(ui, &job.text, view.theme);
                             ui.label(egui::text::LayoutJob::clone(job));
@@ -3156,6 +3503,17 @@ fn image_area(ui: &mut egui::Ui, view: &View, path: &std::path::Path) {
                 crate::preview::Shown::Rich(r) if r.doc.sheets.is_some() => Some(r.clone()),
                 _ => None,
             };
+            if view.preview_focused {
+                // A PDF's pages are shown one at a time, so Page Up and Down turn them; a video's
+                // hundred "pages" are its seek steps, and stay with Ctrl.
+                let one_at_a_time = matches!(view.preview.shown, crate::preview::Shown::Raster(_)) && *total_pages > 1 && *total_pages != 100;
+                let step = preview_keys(ui, one_at_a_time);
+                let to = asked_page as i64 + step;
+                if step != 0 && to >= 0 && to < *total_pages as i64 {
+                    view.want_preview.set(Some((p.clone(), to as u32)));
+                    ui.ctx().request_repaint();
+                }
+            }
             if *total_pages > 1 {
                 if let Some(book) = sheet {
                     // A workbook: the pages are its sheets, by name.

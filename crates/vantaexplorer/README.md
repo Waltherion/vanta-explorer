@@ -76,10 +76,15 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
 
 - **Unlimited splits** in a binary tree, tabs per pane, draggable dividers. Splitting across
   a pure row or column of panes escalates to the root, so the new pane spans the window.
-- `F3` splits side by side and `Shift+F3` one above the other; either joins again. `F9`
-  hides the sidebar, as does the button in front of Back.
+- `F3` splits the pane you are in side by side and `Shift+F3` one above the other, and
+  `Ctrl+Shift+W` closes it. `F9` hides the sidebar, as does the button in front of Back.
 - `Ctrl+T` / `Ctrl+W` for tabs, `Ctrl+PgUp` / `Ctrl+PgDn` between them, middle-click a folder
-  to open it in a new tab, `Ctrl+Tab` or `F6` to cycle panes.
+  to open it in a new tab, `Ctrl+Tab` to cycle panes.
+- **Ctrl+arrows** go to the pane that lies that way on screen, and left of the leftmost into
+  the sidebar. `F6` goes into the sidebar and back: the arrows move through it, Enter opens
+  a place and goes back to the pane, and F10 opens an entry's menu. Ctrl+Right from the
+  rightmost pane goes into the preview, where the arrows and Page Up/Down scroll and
+  Ctrl+Page Up/Down turn the pages of a PDF and the sheets of a workbook.
 - A breadcrumb that **drops leading components** when the path is long, so the tail stays
   readable; click past it to edit the path as text.
 - **The session** (panes, tabs, history) is kept by the first window started without a
@@ -122,6 +127,14 @@ half a second at every idle-to-input transition. Video decoding itself is CPU-si
   and what you may do with it, dates, the drive it is on, and the application that opens it.
 - **Command palette** (`Ctrl+Shift+P`): every command by name, with its key beside it. A few
   letters find it ("spl" for the splits), and what cannot run right now is grayed out.
+  Start with `/` or `~` to go to a folder instead: the one typed, its subfolders as you type
+  them (Tab fills one in), and the open tabs, the sidebar's places and the folders visited.
+- **Dialogs from the keyboard**: Left, Right or Tab choose a button, Enter picks it and Escape
+  cancels, in every question Explorer asks. In Open with, Up and Down choose the application
+  and Ctrl+D makes it the default.
+- **F10**, or the Menu key, opens the right-click menu where the keyboard is: the marked
+  entry's, or the folder's with nothing marked. The arrows move through it and into its
+  submenus, Enter picks and Escape closes.
 - **F1** lists every keyboard shortcut, and shows which commit this build is and when it was
   built.
 

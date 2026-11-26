@@ -70,6 +70,8 @@ pub struct Tab {
     pub scroll_to: Option<usize>,
     /// A folder was just opened: mark its first entry once it has arrived (browser::mark_first).
     pub mark_first: bool,
+    /// F10 or the Menu key: open this entry's menu once its row is drawn (browser::menu_key).
+    pub menu_for: Option<String>,
 }
 
 impl Tab {
@@ -95,6 +97,7 @@ impl Tab {
             scroll_to: None,
             pending_reveal: None,
             mark_first: false,
+            menu_for: None,
         };
         t.reload();
         t
@@ -153,6 +156,7 @@ impl Tab {
         self.path_edit = None;
         self.pending_reveal = None;
         self.mark_first = true;
+        self.menu_for = None;
         // Latent bug: the filter used to survive navigation, so a new folder could open
         // looking half-empty for no visible reason.
         self.typeahead.clear();
@@ -328,6 +332,17 @@ pub struct Workspace {
     /// Last frame's pane geometry (index, left, top), written by the layout pass.
     /// Runtime-only; used to cycle panes in VISUAL reading order (see visual_order).
     pub visual_rects: Vec<(usize, f32, f32)>,
+    /// Last frame's pane rectangles, for Ctrl+arrows (`neighbor`). Runtime-only.
+    pub pane_boxes: Vec<(usize, egui::Rect)>,
+}
+
+/// Which way Ctrl+arrow goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 impl Workspace {
@@ -341,7 +356,29 @@ impl Workspace {
             preview_w: DEFAULT_PREVIEW_W,
             sidebar_hidden: false,
             visual_rects: Vec::new(),
+            pane_boxes: Vec::new(),
         }
+    }
+
+    /// The pane that lies `dir` of the active one on screen: of those beside it on that side,
+    /// the nearest, and of those the one most level with it. None at the edge.
+    pub fn neighbor(&self, dir: Dir) -> Option<usize> {
+        let from = self.pane_boxes.iter().find(|(i, _)| *i == self.active)?.1;
+        let overlap = |a: egui::Rangef, b: egui::Rangef| a.max.min(b.max) - a.min.max(b.min);
+        self.pane_boxes
+            .iter()
+            .filter(|(i, _)| *i != self.active && *i < self.panes.len())
+            .filter_map(|&(i, r)| {
+                let (gap, side_by_side, offset) = match dir {
+                    Dir::Right => (r.min.x - from.max.x, overlap(from.y_range(), r.y_range()), (r.center().y - from.center().y).abs()),
+                    Dir::Left => (from.min.x - r.max.x, overlap(from.y_range(), r.y_range()), (r.center().y - from.center().y).abs()),
+                    Dir::Down => (r.min.y - from.max.y, overlap(from.x_range(), r.x_range()), (r.center().x - from.center().x).abs()),
+                    Dir::Up => (from.min.y - r.max.y, overlap(from.x_range(), r.x_range()), (r.center().x - from.center().x).abs()),
+                };
+                (gap >= -1.0 && side_by_side > 1.0).then_some((i, gap.round(), offset))
+            })
+            .min_by(|a, b| (a.1, a.2).partial_cmp(&(b.1, b.2)).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, ..)| i)
     }
 
     pub fn active_pane(&mut self) -> &mut Pane {
@@ -744,6 +781,7 @@ pub fn load(fallback: PathBuf) -> Workspace {
             preview_w: s.preview_w.max(MIN_PREVIEW_W),
             sidebar_hidden: s.sidebar_hidden,
             visual_rects: Vec::new(),
+            pane_boxes: Vec::new(),
         })
     };
     restore().unwrap_or_else(|| Workspace::single(fallback))
@@ -790,6 +828,37 @@ mod tests {
         ws.panes.push(super::Pane::new(std::env::temp_dir()));
         ws.visual_rects = vec![(0, 500.0, 0.5), (1, 0.0, 0.0)]; // same row, 0.5px apart
         assert_eq!(ws.visual_order(), vec![1, 0]);
+    }
+
+    fn boxed(rects: &[(f32, f32, f32, f32)]) -> super::Workspace {
+        let mut ws = super::Workspace::single(std::env::temp_dir());
+        for _ in 1..rects.len() {
+            ws.panes.push(super::Pane::new(std::env::temp_dir()));
+        }
+        ws.pane_boxes = rects.iter().enumerate().map(|(i, &(x0, y0, x1, y1))| (i, egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)))).collect();
+        ws
+    }
+
+    #[test]
+    fn ctrl_arrows_go_where_the_panes_are() {
+        use super::Dir::*;
+        // 0 1
+        // 2 3
+        let mut ws = boxed(&[(0.0, 0.0, 498.0, 298.0), (502.0, 0.0, 1000.0, 298.0), (0.0, 302.0, 498.0, 600.0), (502.0, 302.0, 1000.0, 600.0)]);
+        assert_eq!(ws.neighbor(Right), Some(1));
+        assert_eq!(ws.neighbor(Down), Some(2));
+        assert_eq!(ws.neighbor(Left), None);
+        assert_eq!(ws.neighbor(Up), None);
+        ws.active = 3;
+        assert_eq!(ws.neighbor(Left), Some(2));
+        assert_eq!(ws.neighbor(Up), Some(1));
+        // A tall one on the left, two on the right: from the lower right, Left is the tall one;
+        // from the tall one, Right is the one most level with it, the upper on a tie.
+        let mut ws = boxed(&[(0.0, 0.0, 498.0, 600.0), (502.0, 0.0, 1000.0, 298.0), (502.0, 302.0, 1000.0, 600.0)]);
+        ws.active = 2;
+        assert_eq!(ws.neighbor(Left), Some(0));
+        ws.active = 0;
+        assert_eq!(ws.neighbor(Right), Some(1));
     }
 
     use super::*;

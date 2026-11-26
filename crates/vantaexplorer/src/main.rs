@@ -227,6 +227,8 @@ fn main() -> Result<()> {
             palette: None,
             palette_fire: None,
             palette_release: None,
+            preview_focused: false,
+            preview_rect: None,
             pending_delete: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -323,6 +325,10 @@ struct OpsState {
     /// A command chosen in the palette, pressed at the start of the next frame.
     palette_fire: Option<palette::Fire>,
     palette_release: Option<palette::Release>,
+    /// Ctrl+Right from the rightmost pane: the keys scroll the preview and turn its pages.
+    preview_focused: bool,
+    /// Where the preview was drawn last frame, if it was.
+    preview_rect: Option<egui::Rect>,
     /// Paths awaiting a "really delete permanently?" answer, plus which button the keyboard
     /// has selected (false = Cancel, the deliberate default).
     pending_delete: Option<(Confirm, bool)>,
@@ -382,6 +388,8 @@ struct OpenWithState {
     mime: String,
     /// Make the application picked the default for the type, as well as opening the file in it.
     make_default: bool,
+    /// The application the keys are on, among those shown.
+    cursor: usize,
 }
 
 /// Which stack an in-flight reversal's result belongs on.
@@ -546,6 +554,14 @@ impl ApplicationHandler for App {
                         || key.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC)) =>
             {
                 gfx.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new(browser::COPY_PATH_KEY), true));
+                self.needs_draw = true;
+            }
+            // The Menu key, which egui has no key for: the context menu, as F10 opens it.
+            WindowEvent::KeyboardInput { event: key, .. }
+                if key.state == winit::event::ElementState::Pressed
+                    && key.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::ContextMenu) =>
+            {
+                gfx.egui_ctx.data_mut(|d| d.insert_temp(egui::Id::new(browser::MENU_KEY), true));
                 self.needs_draw = true;
             }
             WindowEvent::KeyboardInput { event: key, .. }
@@ -1286,6 +1302,30 @@ fn draw(
     if let Some(r) = app_ops.palette_release.take() {
         palette::release(r, &mut raw_input);
     }
+    // A question up: its Tab is taken here, before egui moves its focus with it.
+    let asking = app_ops.pending_delete.is_some()
+        || app_ops.pending_conflict.is_some()
+        || app_ops.pending_error.is_some()
+        || app_ops.editor_prompt.is_some()
+        || chooser.as_ref().is_some_and(|c| c.replace.is_some());
+    let mut dialog_tab = None;
+    if asking {
+        raw_input.events.retain(|e| match e {
+            egui::Event::Key { key: egui::Key::Tab, pressed, modifiers, .. } => {
+                if *pressed {
+                    dialog_tab = Some(modifiers.shift);
+                }
+                false
+            }
+            _ => true,
+        });
+    }
+    gfx.egui_ctx.data_mut(|d| match dialog_tab {
+        Some(shift) => {
+            d.insert_temp(egui::Id::new(browser::DIALOG_TAB), shift);
+        }
+        None => d.remove::<bool>(egui::Id::new(browser::DIALOG_TAB)),
+    });
     if let Some(fire) = app_ops.palette_fire.take() {
         app_ops.palette_release = palette::press(fire, &mut raw_input, &gfx.egui_ctx);
         if app_ops.palette_release.is_some() {
@@ -1639,7 +1679,7 @@ fn app_ui(
     if let Some(c) = chooser.as_mut() {
         let tab = ws.active_pane().tab_ref();
         let idle = tab.typeahead.is_empty() && !tab.search_open && tab.renaming.is_none() && tab.path_edit.is_none();
-        if idle && !modal_open && !root.ctx().text_edit_focused() && root.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if idle && !modal_open && !sidebar.focused && !app_ops.preview_focused && !root.ctx().text_edit_focused() && root.input(|i| i.key_pressed(egui::Key::Escape)) {
             c.cancel();
         }
     }
@@ -1684,28 +1724,80 @@ fn app_ui(
     // focus. Tabs cycle on Ctrl+PgUp/PgDn, so Ctrl+Tab is free for panes here.
     let (cycle_next, cycle_prev) = root.input_mut(|i| {
         let tab = i.key_pressed(egui::Key::Tab) && i.modifiers.ctrl && !i.modifiers.alt;
-        let f6 = i.key_pressed(egui::Key::F6);
-        let next = (tab && !i.modifiers.shift) || (f6 && !i.modifiers.shift);
-        let prev = (tab && i.modifiers.shift) || (f6 && i.modifiers.shift);
+        let next = tab && !i.modifiers.shift;
+        let prev = tab && i.modifiers.shift;
         if next || prev {
-            i.events.retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. } | egui::Event::Key { key: egui::Key::F6, .. }));
+            i.events.retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }));
         }
         (next, prev)
     });
-    // F3 splits the pane side by side, Shift+F3 one above the other, and either joins it again:
-    // with more than one pane it closes the one you are in, which after a split is the new one.
-    // F9 hides and shows the sidebar.
+    // Ctrl+arrows: the pane that lies that way on screen; left of the leftmost, the sidebar,
+    // and right of the sidebar, the pane again. F6: into the sidebar and back. Not while a
+    // text field has the keys, where Ctrl+arrows go by word.
+    let keys_free = !modal_open && !root.ctx().text_edit_focused() && !egui::Popup::is_any_open(root.ctx());
+    let (to, f6) = root.input_mut(|i| {
+        let ctrl = i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift;
+        let to = [
+            (egui::Key::ArrowLeft, panes::Dir::Left),
+            (egui::Key::ArrowRight, panes::Dir::Right),
+            (egui::Key::ArrowUp, panes::Dir::Up),
+            (egui::Key::ArrowDown, panes::Dir::Down),
+        ]
+        .into_iter()
+        .find(|(k, _)| ctrl && keys_free && i.key_pressed(*k))
+        .map(|(k, d)| {
+            i.events.retain(|e| !matches!(e, egui::Event::Key { key, .. } if *key == k));
+            d
+        });
+        (to, keys_free && i.modifiers.is_none() && i.key_pressed(egui::Key::F6))
+    });
+    let sidebar_there = !ws.sidebar_hidden;
+    if f6 && (sidebar_there || sidebar.focused) {
+        sidebar.focus(!sidebar.focused);
+        app_ops.preview_focused = false;
+    }
+    // The preview is right of the rightmost pane, as the sidebar is left of the leftmost.
+    let preview_there = app_ops.preview_rect.is_some();
+    match to {
+        Some(panes::Dir::Left) if app_ops.preview_focused => app_ops.preview_focused = false,
+        Some(_) if app_ops.preview_focused => {}
+        Some(panes::Dir::Right) if sidebar.focused => sidebar.focus(false),
+        Some(_) if sidebar.focused => {}
+        Some(d) => match ws.neighbor(d) {
+            Some(i) => ws.active = i,
+            None if d == panes::Dir::Left && sidebar_there => sidebar.focus(true),
+            None if d == panes::Dir::Right && preview_there => app_ops.preview_focused = true,
+            None => {}
+        },
+        None => {}
+    }
+    if app_ops.preview_focused && keys_free && root.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app_ops.preview_focused = false;
+    }
+    if cycle_next || cycle_prev {
+        sidebar.focus(false);
+        app_ops.preview_focused = false;
+    }
+    // F3 splits the pane you are in side by side, Shift+F3 one above the other, however many
+    // there are, as the buttons do; Ctrl+Shift+W closes it. F9 hides and shows the sidebar.
     if !modal_open && chooser.is_none() {
-        let (f3, shift, f9) = root.input(|i| (i.key_pressed(egui::Key::F3), i.modifiers.shift, i.key_pressed(egui::Key::F9)));
+        let (f3, shift, close, f9) = root.input(|i| {
+            (
+                i.key_pressed(egui::Key::F3),
+                i.modifiers.shift,
+                i.modifiers.ctrl && i.modifiers.shift && !i.modifiers.alt && i.key_pressed(egui::Key::W),
+                i.key_pressed(egui::Key::F9),
+            )
+        });
         if f3 {
-            if ws.panes.len() > 1 {
-                ws.close(ws.active);
-            } else {
-                ws.split(ws.active, if shift { panes::SplitDir::Vertical } else { panes::SplitDir::Horizontal });
-            }
+            ws.split(ws.active, if shift { panes::SplitDir::Vertical } else { panes::SplitDir::Horizontal });
+        }
+        if close && ws.panes.len() > 1 {
+            ws.close(ws.active);
         }
         if f9 {
             ws.sidebar_hidden = !ws.sidebar_hidden;
+            sidebar.focus(false);
         }
     }
     if (cycle_next || cycle_prev) && ws.panes.len() > 1 {
@@ -1777,7 +1869,11 @@ fn app_ui(
     let current_dir = ws.active_pane().tab_ref().path().to_path_buf();
     if ws.sidebar_hidden {
         // Nothing drawn, nothing to drag; F9 brings it back at the width it had.
-    } else if let Some(path) = sidebar.show(&mut side_ui, drives, icons, theme, &current_dir) {
+    } else if let Some(path) = {
+        // The sidebar has the keys while it has the focus and nothing over it does.
+        let keys = sidebar.focused && !modal_open && !root.ctx().text_edit_focused() && !egui::Popup::is_any_open(root.ctx());
+        sidebar.show(&mut side_ui, drives, icons, theme, &current_dir, keys)
+    } {
         // Per the spec, the sidebar navigates the ACTIVE pane.
         ws.active_pane().tab().navigate(path);
     }
@@ -1788,6 +1884,9 @@ fn app_ui(
     if let Some(device) = sidebar.take_eject_request() {
         app_ops.toast = Some((format!("Ejecting {device}..."), std::time::Instant::now()));
         drives.eject(device);
+    }
+    if sidebar.focused && root.input(|i| i.pointer.any_pressed()) && root.ctx().pointer_interact_pos().is_some_and(|p| !side_rect.contains(p)) {
+        sidebar.focus(false);
     }
     // Draggable divider between sidebar and workspace.
     let grip = egui::Rect::from_min_max(
@@ -1851,7 +1950,10 @@ fn app_ui(
         clipboard_filled: clipboard_filled_flag,
         cut: cut_paths,
         dir_size,
-        modal_open,
+        // An open menu has the keyboard too: its arrows and Enter are not the list's. So does
+        // the sidebar while it has the focus.
+        modal_open: modal_open || egui::Popup::is_any_open(root.ctx()) || sidebar.focused || app_ops.preview_focused,
+        preview_focused: app_ops.preview_focused && !modal_open && !egui::Popup::is_any_open(root.ctx()),
         paste_key,
         chooser: chooser.as_ref(),
         sidebar_targets: &sidebar_targets,
@@ -1922,10 +2024,21 @@ fn app_ui(
         );
         let active = &ws.panes[ws.active.min(ws.panes.len() - 1)];
         browser::show_preview(&mut pui, active, &view);
+        app_ops.preview_rect = Some(prect);
+    } else {
+        app_ops.preview_rect = None;
+        app_ops.preview_focused = false;
+    }
+    if let Some(prect) = app_ops.preview_rect {
+        if root.input(|i| i.pointer.any_pressed()) && !modal_open {
+            if let Some(p) = root.ctx().pointer_interact_pos() {
+                app_ops.preview_focused = prect.contains(p);
+            }
+        }
     }
     app_ops.editor = editor_cell.into_inner();
     app_ops.views = views_cell.into_inner();
-    editor_after_frame(root.ctx(), ws, app_ops, editor_event.take(), want_preview);
+    editor_after_frame(root.ctx(), ws, app_ops, editor_event.take(), want_preview, theme);
 
     // --- Drag overlay ---
     if root.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1975,17 +2088,40 @@ fn app_ui(
             panes: ws.panes.len(),
             undo: !app_ops.undo.is_empty(),
             redo: !app_ops.redo.is_empty(),
+            places: {
+                // The open tabs, the sidebar's places, then every folder visited, latest first.
+                let mut places = Vec::new();
+                for pane in &ws.panes {
+                    for t in &pane.tabs {
+                        places.push((t.path().to_path_buf(), "tab"));
+                    }
+                }
+                for target in sidebar.targets() {
+                    places.extend(target.paths.into_iter().map(|p| (p, "sidebar")));
+                }
+                for pane in &ws.panes {
+                    for t in &pane.tabs {
+                        places.extend(t.history.iter().rev().map(|p| (p.clone(), "visited")));
+                    }
+                }
+                places
+            },
         };
-        let (fire, close) = palette::show(root.ctx(), p, &state);
+        let (pick, close) = palette::show(root.ctx(), p, &state);
         if close {
             app_ops.palette = None;
         }
-        match fire {
-            Some(palette::Fire::Split(dir)) => ws.split(ws.active, dir),
-            Some(f) => {
+        if pick.is_some() {
+            sidebar.focus(false);
+            app_ops.preview_focused = false;
+        }
+        match pick {
+            Some(palette::Pick::Fire(palette::Fire::Split(dir))) => ws.split(ws.active, dir),
+            Some(palette::Pick::Fire(f)) => {
                 app_ops.palette_fire = Some(f);
                 root.ctx().request_repaint();
             }
+            Some(palette::Pick::Go(path)) => ws.active_pane().tab().navigate(path),
             None => {}
         }
     }
@@ -2223,6 +2359,7 @@ fn open_with_state(paths: Vec<std::path::PathBuf>) -> OpenWithState {
         major,
         mime,
         make_default: false,
+        cursor: 0,
     }
 }
 
@@ -2235,6 +2372,7 @@ fn editor_after_frame(
     app_ops: &mut OpsState,
     event: Option<editor::Event>,
     want_preview: &std::cell::Cell<Option<(std::path::PathBuf, u32)>>,
+    theme: &browser::Theme,
 ) {
     let toast = |app_ops: &mut OpsState, msg: String| app_ops.toast = Some((msg, std::time::Instant::now()));
     match event {
@@ -2290,25 +2428,26 @@ fn editor_after_frame(
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         answer = Some(Answer::Cancel);
     }
+    // The editor's text keeps the focus behind the question otherwise, and would take its keys.
+    if let Some(f) = ctx.memory(|m| m.focused()) {
+        ctx.memory_mut(|m| m.surrender_focus(f));
+    }
     egui::Modal::new(egui::Id::new("editor-question")).show(ctx, |ui| {
-        let (heading, text, first, second) = match prompt.ask {
-            EditorAsk::Unsaved => ("Unsaved changes", format!("'{name}' has changes that are not saved."), "Save", "Discard"),
-            EditorAsk::Conflict => ("Changed on disk", format!("'{name}' was changed by something else since you opened it."), "Overwrite", "Reload"),
+        let (heading, text, first, second, default) = match prompt.ask {
+            EditorAsk::Unsaved => ("Unsaved changes", format!("'{name}' has changes that are not saved."), "Save", "Discard", 0),
+            // Neither overwriting nor throwing the edits away is the one to fall into.
+            EditorAsk::Conflict => ("Changed on disk", format!("'{name}' was changed by something else since you opened it."), "Overwrite", "Reload", 2),
         };
         ui.heading(heading);
         ui.label(text);
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button(first).clicked() {
-                answer = Some(Answer::First);
-            }
-            if ui.button(second).clicked() {
-                answer = Some(Answer::Second);
-            }
-            if ui.button("Cancel").clicked() {
-                answer = Some(Answer::Cancel);
-            }
-        });
+        let buttons = [Some((egui::RichText::new(first), "")), Some((egui::RichText::new(second), "")), Some((egui::RichText::new("Cancel"), ""))];
+        match choice_row(ui, theme, "editor-question", &buttons, default) {
+            Some(0) => answer = Some(Answer::First),
+            Some(1) => answer = Some(Answer::Second),
+            Some(_) => answer = Some(Answer::Cancel),
+            None => {}
+        }
     });
     let Some(answer) = answer else { return };
     app_ops.editor_prompt = None;
@@ -2361,6 +2500,63 @@ fn editor_after_frame(
         }
     }
     ctx.request_repaint();
+}
+
+/// A button for `choice_row`: its text and what hovering it says; `None` is a separator.
+type Choice<'a> = Option<(egui::RichText, &'a str)>;
+
+/// A dialog's row of buttons, driven from the keys as the delete question is: Left and Right
+/// (Tab, Shift+Tab) choose, Enter or Space picks, and the chosen one is drawn so. `None` in
+/// `buttons` is a separator; a button is its text and what hovering it says. Returns the
+/// index of the one picked. Escape is the caller's, which knows what cancelling means.
+fn choice_row(ui: &mut egui::Ui, theme: &browser::Theme, id: &str, buttons: &[Choice], default: usize) -> Option<usize> {
+    let ctx = ui.ctx().clone();
+    let key = egui::Id::new(("choice-row", id));
+    let real: Vec<usize> = (0..buttons.len()).filter(|&i| buttons[i].is_some()).collect();
+    if real.is_empty() {
+        return None;
+    }
+    let at = ctx.data(|d| d.get_temp::<usize>(key)).unwrap_or(default);
+    let pos = real.iter().position(|&i| i == at).unwrap_or(0);
+    let taken = browser::dialog_tab(&ctx);
+    let (left, right, pick) = ctx.input(|i| {
+        // Shift as the Tab came with it, not as it is held at the end of the frame.
+        let tab = |shift: bool| {
+            taken == Some(shift) || i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. } if modifiers.shift == shift))
+        };
+        (
+            i.key_pressed(egui::Key::ArrowLeft) || tab(true),
+            i.key_pressed(egui::Key::ArrowRight) || tab(false),
+            i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
+        )
+    });
+    // egui's own Tab and arrow focus would wander off to whatever lies nearest.
+    ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+    browser::dialog_owns_keys(&ctx);
+    let pos = if right { (pos + 1).min(real.len() - 1) } else if left { pos.saturating_sub(1) } else { pos };
+    let at = real[pos];
+    ctx.data_mut(|d| d.insert_temp(key, at));
+    let mut picked = pick.then_some(at);
+    ui.horizontal(|ui| {
+        for (i, b) in buttons.iter().enumerate() {
+            let Some((text, hover)) = b else {
+                ui.separator();
+                continue;
+            };
+            let mut r = browser::choice_button(ui, theme, text.clone(), i == at);
+            if !hover.is_empty() {
+                r = r.on_hover_text(*hover);
+            }
+            if r.clicked() {
+                picked = Some(i);
+            }
+        }
+    });
+    ui.label(egui::RichText::new("Left, Right choose · Enter confirm · Esc cancel").small().color(theme.text.gamma_multiply(0.5)));
+    if picked.is_some() {
+        ctx.data_mut(|d| d.remove::<usize>(key));
+    }
+    picked
 }
 
 fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::Theme) {
@@ -2474,9 +2670,11 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
     // `modal_open` above blocks the keyboard, so the pane behind cannot act on the same keys.
     if let Some((what, mut delete_selected)) = app_ops.pending_delete.take() {
         // Read the keys BEFORE drawing, so a button cannot also consume them.
+        browser::dialog_owns_keys(ctx);
+        let tab = browser::dialog_tab(ctx).is_some();
         let (left, right, activate, escape) = ctx.input(|i| {
             (
-                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::Tab),
+                i.key_pressed(egui::Key::ArrowLeft) || tab,
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Escape),
@@ -2519,16 +2717,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             ui.horizontal(|ui| {
                 // The keyboard selection is drawn, not just held: a dialog you can drive with
                 // Enter has to show what Enter would do.
-                let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| {
-                    let btn = egui::Button::new(text);
-                    let btn = if selected {
-                        btn.fill(theme.accent.gamma_multiply(0.35))
-                            .stroke(egui::Stroke::new(2.0, theme.accent))
-                    } else {
-                        btn.stroke(egui::Stroke::new(1.0, theme.text.gamma_multiply(0.3)))
-                    };
-                    ui.add(btn).clicked()
-                };
+                let button = |ui: &mut egui::Ui, text: egui::RichText, selected: bool| browser::choice_button(ui, theme, text, selected).clicked();
                 if button(
                     ui,
                     egui::RichText::new(verb).color(theme.error),
@@ -2574,54 +2763,34 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
             .show(ctx, |ui| {
                 ui.label(format!("'{name}' already exists in the destination."));
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if folders
-                        && ui
-                            .button("Merge")
-                            .on_hover_text("Put the contents in the folder that is there; a file in both is asked about")
-                            .clicked()
-                    {
-                        answer = Some(fileops::ConflictAnswer::Merge);
-                    }
-                    if ui
-                        .button(if folders { "Replace" } else { "Overwrite" })
-                        .on_hover_text("What is there goes to the trash first")
-                        .clicked()
-                    {
-                        answer = Some(fileops::ConflictAnswer::Overwrite);
-                    }
-                    if ui.button("Skip").clicked() {
-                        answer = Some(fileops::ConflictAnswer::Skip);
-                    }
-                    if ui
-                        .button("Keep both")
-                        .on_hover_text("The new one is written as 'name (1)'; the existing one is untouched")
-                        .clicked()
-                    {
-                        answer = Some(fileops::ConflictAnswer::Rename);
-                    }
-                    ui.separator();
-                    if folders && ui.button("Merge all").on_hover_text("Every folder that is there already").clicked() {
-                        answer = Some(fileops::ConflictAnswer::MergeAll);
-                    }
-                    if ui.button(if folders { "Replace all" } else { "Overwrite all" }).clicked() {
-                        answer = Some(fileops::ConflictAnswer::OverwriteAll);
-                    }
-                    if ui.button("Skip all").clicked() {
-                        answer = Some(fileops::ConflictAnswer::SkipAll);
-                    }
-                    if ui.button("Keep both, all").clicked() {
-                        answer = Some(fileops::ConflictAnswer::RenameAll);
-                    }
-                    ui.separator();
-                    if ui
-                        .button(egui::RichText::new("Cancel").color(theme.error))
-                        .clicked()
-                    {
-                        answer = Some(fileops::ConflictAnswer::Cancel);
-                    }
-                });
+                use fileops::ConflictAnswer as A;
+                let t = egui::RichText::new;
+                let mut row: Vec<(Choice, Option<A>)> = Vec::new();
+                if folders {
+                    row.push((Some((t("Merge"), "Put the contents in the folder that is there; a file in both is asked about")), Some(A::Merge)));
+                }
+                row.push((Some((t(if folders { "Replace" } else { "Overwrite" }), "What is there goes to the trash first")), Some(A::Overwrite)));
+                row.push((Some((t("Skip"), "")), Some(A::Skip)));
+                row.push((Some((t("Keep both"), "The new one is written as 'name (1)'; the existing one is untouched")), Some(A::Rename)));
+                row.push((None, None));
+                if folders {
+                    row.push((Some((t("Merge all"), "Every folder that is there already")), Some(A::MergeAll)));
+                }
+                row.push((Some((t(if folders { "Replace all" } else { "Overwrite all" }), "")), Some(A::OverwriteAll)));
+                row.push((Some((t("Skip all"), "")), Some(A::SkipAll)));
+                row.push((Some((t("Keep both, all"), "")), Some(A::RenameAll)));
+                row.push((None, None));
+                row.push((Some((t("Cancel").color(theme.error), "")), Some(A::Cancel)));
+                let buttons: Vec<_> = row.iter().map(|r| r.0.clone()).collect();
+                // Skip is the one that changes nothing.
+                let skip = row.iter().position(|r| matches!(r.1, Some(A::Skip))).unwrap_or(0);
+                if let Some(i) = choice_row(ui, theme, "conflict", &buttons, skip) {
+                    answer = row[i].1;
+                }
             });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(fileops::ConflictAnswer::Cancel);
+        }
     }
     if let Some(a) = answer {
         if let Some((.., reply)) = app_ops.pending_conflict.take() {
@@ -2641,26 +2810,23 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 ui.label(format!("'{name}'"));
                 ui.colored_label(theme.error, error);
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Try again").clicked() {
-                        answer = Some(fileops::ErrorAnswer::Retry);
-                    }
-                    if ui.button("Skip").clicked() {
-                        answer = Some(fileops::ErrorAnswer::Skip);
-                    }
-                    if ui.button("Skip all").on_hover_text("Leave out every item that fails from here on").clicked() {
-                        answer = Some(fileops::ErrorAnswer::SkipAll);
-                    }
-                    ui.separator();
-                    if ui
-                        .button(egui::RichText::new("Stop").color(theme.error))
-                        .on_hover_text("What is done so far stays, and undo can reverse it")
-                        .clicked()
-                    {
-                        answer = Some(fileops::ErrorAnswer::Cancel);
-                    }
-                });
+                use fileops::ErrorAnswer as A;
+                let t = egui::RichText::new;
+                let row = [
+                    (Some((t("Try again"), "")), Some(A::Retry)),
+                    (Some((t("Skip"), "")), Some(A::Skip)),
+                    (Some((t("Skip all"), "Leave out every item that fails from here on")), Some(A::SkipAll)),
+                    (None, None),
+                    (Some((t("Stop").color(theme.error), "What is done so far stays, and undo can reverse it")), Some(A::Cancel)),
+                ];
+                let buttons: Vec<_> = row.iter().map(|r| r.0.clone()).collect();
+                if let Some(i) = choice_row(ui, theme, "op-error", &buttons, 0) {
+                    answer = row[i].1;
+                }
             });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(fileops::ErrorAnswer::Cancel);
+        }
     }
     if let Some(a) = answer {
         if let Some((.., reply)) = app_ops.pending_error.take() {
@@ -2669,9 +2835,27 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
     }
 
     if let Some(mut ow) = app_ops.open_with.take() {
-        let OpenWithState { paths, search, apps, relevant_only, major, mime, make_default } = &mut ow;
+        let OpenWithState { paths, search, apps, relevant_only, major, mime, make_default, cursor } = &mut ow;
         let mut keep = true;
         let mut launched = false;
+        // The keys: Up and Down through the applications shown, Enter opens in the one
+        // marked, Ctrl+D ticks "Set as default", Escape closes. Taken before the search field,
+        // which would lose its focus to Enter.
+        let (down, up, enter, escape, ctrl_d) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                i.consume_key(egui::Modifiers::COMMAND, egui::Key::D),
+            )
+        });
+        if escape {
+            keep = false;
+        }
+        if ctrl_d && !mime.is_empty() && mime.as_str() != apps::UNKNOWN {
+            *make_default = !*make_default;
+        }
         egui::Window::new("Open with...")
             .collapsible(false)
             .resizable(true)
@@ -2680,6 +2864,9 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                 ui.horizontal(|ui| {
                     ui.label("Search:");
                     let resp = ui.text_edit_singleline(search);
+                    if resp.changed() {
+                        *cursor = 0;
+                    }
                     resp.request_focus();
                 });
                 if let Some(m) = &major {
@@ -2709,18 +2896,25 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                     .max_height(400.0)
                     .show(ui, |ui| {
                         let q = search.to_lowercase();
-                        for app in apps.iter() {
-                            if !q.is_empty() && !app.name.to_lowercase().contains(&q) {
-                                continue;
+                        let shown: Vec<&apps::AppEntry> = apps
+                            .iter()
+                            .filter(|app| q.is_empty() || app.name.to_lowercase().contains(&q))
+                            .filter(|app| !*relevant_only || major.as_ref().is_none_or(|m| app.mimes.iter().any(|mime| mime.starts_with(m))))
+                            .collect();
+                        if !shown.is_empty() {
+                            if down {
+                                *cursor = (*cursor + 1).min(shown.len() - 1);
+                            } else if up {
+                                *cursor = cursor.saturating_sub(1);
                             }
-                            if *relevant_only {
-                                if let Some(m) = major.as_ref() {
-                                    if !app.mimes.iter().any(|mime| mime.starts_with(m)) {
-                                        continue;
-                                    }
-                                }
+                            *cursor = (*cursor).min(shown.len() - 1);
+                        }
+                        for (i, app) in shown.into_iter().enumerate() {
+                            let resp = ui.add(egui::Button::new(&app.name).selected(i == *cursor));
+                            if i == *cursor && (up || down) {
+                                resp.scroll_to_me(None);
                             }
-                            if ui.button(&app.name).clicked() {
+                            if resp.clicked() || (i == *cursor && enter) {
                                 if *make_default {
                                     apps::set_default(app, &paths[0]);
                                 }
@@ -2737,6 +2931,7 @@ fn ops_windows(ctx: &egui::Context, app_ops: &mut OpsState, theme: &browser::The
                     if ui.button("Cancel").clicked() {
                         launched = true; // reusing to close dialog
                     }
+                    ui.label(egui::RichText::new("Up, Down choose · Enter open · Ctrl+D default · Esc cancel").small().color(theme.text.gamma_multiply(0.5)));
                 });
             });
         if keep && !launched {
@@ -2759,4 +2954,48 @@ fn wayland_handles(window: &Window) -> Result<(*mut std::ffi::c_void, *mut std::
         other => return Err(anyhow!("vantaexplorer requires a Wayland surface, got {other:?}")),
     };
     Ok((display, surface))
+}
+
+#[cfg(test)]
+mod choice_tests {
+    /// A key pressed and let go, with the modifiers held for it.
+    fn tap(k: egui::Key, shift: bool) -> Vec<egui::Event> {
+        let modifiers = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+        vec![
+            egui::Event::ModifiersChanged(modifiers),
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers },
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+        ]
+    }
+
+    /// The row in a window, as the conflict question draws it, steered by the keys.
+    #[test]
+    fn the_keys_move_through_a_row_of_buttons() {
+        let ctx = egui::Context::default();
+        let theme = super::browser::Theme::from_config(&super::config::Config::default());
+        let buttons: Vec<super::Choice> = vec![Some((egui::RichText::new("A"), "")), None, Some((egui::RichText::new("B"), "")), Some((egui::RichText::new("C"), ""))];
+        let frame = |events: Vec<egui::Event>| {
+            let mut picked = None;
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                egui::Window::new("q").show(ui.ctx(), |ui| {
+                    picked = super::choice_row(ui, &theme, "test", &buttons, 2);
+                });
+            });
+            out.textures_delta.clear();
+            picked
+        };
+        use egui::Key::*;
+        assert_eq!(frame(vec![]), None);
+        // Right from B is C, and no further; the separator is passed over on the way back.
+        assert_eq!(frame(tap(ArrowRight, false)), None);
+        assert_eq!(frame(tap(ArrowRight, false)), None);
+        assert_eq!(frame(tap(Enter, false)), Some(3));
+        // A new question starts on its default again.
+        assert_eq!(frame(tap(ArrowLeft, false)), None);
+        assert_eq!(frame(tap(Enter, false)), Some(0));
+        assert_eq!(frame(tap(Tab, false)), None);
+        assert_eq!(frame(tap(Tab, true)), None);
+        assert_eq!(frame(tap(Space, false)), Some(2));
+    }
 }
