@@ -56,9 +56,9 @@ fn desktop_themes() -> Vec<String> {
 const DESKTOP_THEME_CHECK: Duration = Duration::from_secs(2);
 
 pub struct IconCache {
-    /// Keyed by (icon name, pixel size, canonical-lookup). The flag belongs in the key:
-    /// the same name at the same size resolves to DIFFERENT files depending on it.
-    textures: HashMap<(String, u32, bool), Option<egui::TextureHandle>>,
+    /// Keyed by (icon name, pixel size, size looked up). The last belongs in the key: the same
+    /// name at the same size resolves to DIFFERENT files depending on it.
+    textures: HashMap<(String, u32, Option<u16>), Option<egui::TextureHandle>>,
     mime_db: xdg_mime::SharedMimeInfo,
     /// Per-item icon-name overrides, keyed by canonical path. Consulted before MIME.
     overrides: HashMap<PathBuf, String>,
@@ -74,6 +74,8 @@ pub struct IconCache {
     setting: Vec<String>,
     /// What the folders in Explorer's own icons are painted, as "#rrggbb".
     folder_color: String,
+    /// Folders in the file view drawn as the small outline folder, scaled up (`OUTLINE_SIZE`).
+    outline_folders: bool,
 }
 
 impl IconCache {
@@ -90,6 +92,15 @@ impl IconCache {
             last_desktop_check: Instant::now(),
             setting,
             folder_color: hex(folder_color),
+            outline_folders: false,
+        }
+    }
+
+    /// Outline folders in the file view, or the full ones.
+    pub fn set_outline_folders(&mut self, on: bool) {
+        if on != self.outline_folders {
+            self.outline_folders = on;
+            self.clear();
         }
     }
 
@@ -187,7 +198,7 @@ impl IconCache {
         ppp: f32,
         tint: [u8; 3],
     ) -> Option<egui::TextureId> {
-        self.get_sized(ctx, name, logical, ppp, tint, false)
+        self.get_sized(ctx, name, logical, ppp, tint, None)
     }
 
     fn get_sized(
@@ -197,15 +208,15 @@ impl IconCache {
         logical: f32,
         ppp: f32,
         tint: [u8; 3],
-        canonical: bool,
+        bucket: Option<u16>,
     ) -> Option<egui::TextureId> {
         let px = (logical * ppp).round().max(1.0) as u32;
-        let key = (name.to_string(), px, canonical);
+        let key = (name.to_string(), px, bucket);
         if let Some(cached) = self.textures.get(&key) {
             return cached.as_ref().map(|h| h.id());
         }
 
-        let handle = rasterize(&self.themes, name, px, tint, &self.folder_color, canonical).map(|img| {
+        let handle = rasterize(&self.themes, name, px, tint, &self.folder_color, bucket).map(|img| {
             ctx.load_texture(
                 format!("icon:{name}:{px}"),
                 img,
@@ -229,22 +240,23 @@ impl IconCache {
         tint: [u8; 3],
     ) -> Option<egui::TextureId> {
         let name = self.icon_name_for(path, is_dir);
-        if let Some(id) = self.get_sized(ctx, &name, logical, ppp, tint, true) {
+        let bucket = Some(if is_dir && self.outline_folders { OUTLINE_SIZE } else { LOOKUP_SIZE });
+        if let Some(id) = self.get_sized(ctx, &name, logical, ppp, tint, bucket) {
             return Some(id);
         }
         // Some themes name a folder only `folder`, not `inode-directory`.
         if name == "inode-directory" {
-            if let Some(id) = self.get_sized(ctx, "folder", logical, ppp, tint, true) {
+            if let Some(id) = self.get_sized(ctx, "folder", logical, ppp, tint, bucket) {
                 return Some(id);
             }
         }
         if let Some(major) = name.split('-').next() {
             let generic = format!("{major}-x-generic");
-            if let Some(id) = self.get_sized(ctx, &generic, logical, ppp, tint, true) {
+            if let Some(id) = self.get_sized(ctx, &generic, logical, ppp, tint, bucket) {
                 return Some(id);
             }
         }
-        self.get_sized(ctx, "text-x-generic", logical, ppp, tint, true)
+        self.get_sized(ctx, "text-x-generic", logical, ppp, tint, bucket)
     }
 }
 
@@ -278,8 +290,8 @@ fn icon_theme_stamp(themes: &[String]) -> Option<SystemTime> {
         .max()
 }
 
-fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], folder: &str, canonical: bool) -> Option<egui::ColorImage> {
-    let path = lookup(themes, name, px, canonical)?;
+fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], folder: &str, bucket: Option<u16>) -> Option<egui::ColorImage> {
+    let path = lookup(themes, name, px, bucket)?;
     if is_png(&path) {
         return bitmap(themes, name, &path, px);
     }
@@ -323,11 +335,15 @@ fn rasterize(themes: &[String], name: &str, px: u32, tint: [u8; 3], folder: &str
 /// larger zoom steps.
 const LOOKUP_SIZE: u16 = 96;
 
-/// `canonical` pins the bucket for the FILE VIEW, where an icon must not change shape as the
-/// grid zooms. Chrome drawn at a fixed size (the sidebar) passes false and gets the
+/// The size folders are looked up at with `outlineFolders`: Breeze's small folder, an outline in
+/// one color (the folder color, in Explorer's own icons), drawn at whatever size is shown.
+const OUTLINE_SIZE: u16 = 24;
+
+/// `bucket` pins the size looked up for the FILE VIEW, where an icon must not change shape as
+/// the grid zooms. Chrome drawn at a fixed size (the sidebar) passes None and gets the
 /// size-appropriate artwork the theme intends, pinning it too made sidebar folders change.
-fn lookup(themes: &[String], name: &str, px: u32, canonical: bool) -> Option<PathBuf> {
-    let want = if canonical { LOOKUP_SIZE } else { px.min(u16::MAX as u32) as u16 };
+fn lookup(themes: &[String], name: &str, px: u32, bucket: Option<u16>) -> Option<PathBuf> {
+    let want = bucket.unwrap_or(px.min(u16::MAX as u32) as u16);
     for theme in themes {
         let found = freedesktop_icons::lookup(name)
             .with_theme(theme)
@@ -423,7 +439,7 @@ fn is_png(p: &Path) -> bool {
 fn bitmap(themes: &[String], name: &str, path: &Path, px: u32) -> Option<egui::ColorImage> {
     let mut img = image::open(path).ok()?.to_rgba8();
     if img.width().max(img.height()) < px {
-        let larger = lookup(themes, name, 256, false)
+        let larger = lookup(themes, name, 256, None)
             .filter(|p| is_png(p))
             .and_then(|p| image::open(p).ok())
             .map(|i| i.to_rgba8())
@@ -465,22 +481,28 @@ mod tests {
         std::fs::create_dir_all(&theme).unwrap();
         std::fs::write(
             theme.join("index.theme"),
-            "[Icon Theme]\nName=PngOnly\nDirectories=48x48/places,256x256/places\n\n\
+            "[Icon Theme]\nName=PngOnly\nDirectories=22x22/places,48x48/places,256x256/places\n\n\
+             [22x22/places]\nSize=22\nType=Fixed\n\n\
              [48x48/places]\nSize=48\nType=Fixed\n\n[256x256/places]\nSize=256\nType=Fixed\n",
         )
         .unwrap();
+        png(&theme.join("22x22/places/folder.png"), 22, [0, 255, 0, 255]);
         png(&theme.join("48x48/places/folder.png"), 48, [255, 0, 0, 255]);
         png(&theme.join("256x256/places/folder.png"), 256, [0, 0, 255, 255]);
         // Read once, by the first lookup in this process; nothing else in these tests looks icons up.
         std::env::set_var("XDG_DATA_HOME", &data);
 
         let themes = vec!["PngOnly".to_string()];
-        let small = rasterize(&themes, "folder", 24, [255, 255, 255], "#ffffff", false).expect("a PNG icon is used");
+        let small = rasterize(&themes, "folder", 24, [255, 255, 255], "#ffffff", None).expect("a PNG icon is used");
         assert_eq!(small.size, [24, 24]);
-        let large = rasterize(&themes, "folder", 128, [255, 255, 255], "#ffffff", false).expect("a PNG icon is used");
+        let large = rasterize(&themes, "folder", 128, [255, 255, 255], "#ffffff", None).expect("a PNG icon is used");
         assert_eq!(large.size, [128, 128]);
         let mid = large.pixels[64 * 128 + 64];
         assert_eq!((mid.r(), mid.b()), (0, 255), "the 256 artwork scaled down, not the 48 scaled up");
+        // The file view: the full folder, or with outlineFolders the small one at any size.
+        let file = |bucket| lookup(&themes, "folder", 128, Some(bucket)).unwrap();
+        assert!(file(LOOKUP_SIZE).ends_with("48x48/places/folder.png"));
+        assert!(file(OUTLINE_SIZE).ends_with("22x22/places/folder.png"));
         let _ = std::fs::remove_dir_all(&data);
     }
 

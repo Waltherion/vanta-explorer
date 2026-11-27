@@ -198,7 +198,8 @@ fn main() -> Result<()> {
     };
     let theme = browser::Theme::from_config(&cfg);
     docs::set_text_color(theme.text);
-    let icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
+    let mut icons = icons::IconCache::new(prefs.icon_themes.clone(), theme.folder);
+    icons.set_outline_folders(prefs.outline_folders);
     fileops::set_keep_dates(prefs.keep_dates);
     model::set_folders_first(prefs.folders_first);
     office::set_number_locale(&prefs.number_locale);
@@ -801,6 +802,7 @@ impl ApplicationHandler for App {
             self.cfg = cfg;
             // A different icon theme means everything drawn from the old one is stale.
             self.icons.set_themes(s.icon_themes.clone());
+            self.icons.set_outline_folders(s.outline_folders);
             fileops::set_keep_dates(s.keep_dates);
             if office::set_number_locale(&s.number_locale) {
                 // A sheet on screen is read again with the new separators.

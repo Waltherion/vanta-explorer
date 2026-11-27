@@ -76,6 +76,10 @@ pub const DEFAULT_LOCAL: &str = r##"// Vanta Explorer, this machine only: kept w
   // desktops recolor their icons when the look changes) is picked up live.
   // "iconThemes": [],
 
+  // Folders drawn as an outline, Breeze's small one-color folder, at every size. false: the
+  // full folder.
+  // "outlineFolders": false,
+
   // A copy keeps the original's modification date, as cp -a, Dolphin and Nautilus do, so
   // sorting by date still says when a photo was taken. false: a copy is dated when it was
   // made. A move always keeps the date.

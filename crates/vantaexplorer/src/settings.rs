@@ -16,6 +16,8 @@ pub struct Settings {
     pub terminal_args: Vec<String>,
     /// Icon themes to look in, best first.
     pub icon_themes: Vec<String>,
+    /// Folders in the file view as the small outline folder instead of the full one.
+    pub outline_folders: bool,
     /// A copy keeps the original's modification time (as `cp -a`, Dolphin and Nautilus do);
     /// false: a copy is dated when it was made.
     pub keep_dates: bool,
@@ -96,6 +98,7 @@ impl Default for Settings {
             terminal: String::new(),
             terminal_args: Vec::new(),
             icon_themes: Vec::new(),
+            outline_folders: false,
             keep_dates: true,
             folders_first: true,
             dark_pages: DarkPages::Off,
